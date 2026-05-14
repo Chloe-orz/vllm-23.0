@@ -181,6 +181,22 @@ class ParallelConfig:
     enable_elastic_ep: bool = False
     """Enable elastic expert parallelism with stateless NCCL groups for DP/EP."""
 
+    enable_edge_cloud: bool = False
+    """Enable edge-cloud collaboration mode for Ascend NPU.
+    When enabled, the system consists of edge and cloud devices,
+    where edge TP group and cloud TP group are separate, and
+    PP group connects edge NPU0 with cloud NPU0."""
+    edge_npu_count: int = 0
+    """Number of NPUs on the edge device. Used when enable_edge_cloud is True.
+    Edge NPU count must be less than cloud NPU count."""
+    cloud_npu_count: int = 0
+    """Number of NPUs on the cloud device. Used when enable_edge_cloud is True.
+    Cloud NPU count must be greater than edge NPU count."""
+    is_edge_node: bool = False
+    """Whether this node is the edge node. Set automatically based on
+    headless mode: False for edge (with API server), True for cloud (headless).
+    Used when enable_edge_cloud is True."""
+
     enable_dbo: bool = False
     """Enable dual batch overlap for the model executor."""
     ubatch_size: int = 0
@@ -614,6 +630,8 @@ class ParallelConfig:
 
     @property
     def local_world_size(self) -> int:
+        if self.enable_edge_cloud:
+            return self.edge_npu_count if self.is_edge_node else self.cloud_npu_count
         return self.world_size // self.nnodes_within_dp
 
     @staticmethod
@@ -691,6 +709,44 @@ class ParallelConfig:
             * self.tensor_parallel_size
             * self.prefill_context_parallel_size
         )
+
+        if self.enable_edge_cloud:
+            # In edge-cloud collaboration mode, world_size is the total NPU count
+            # across both edge and cloud devices
+            if self.edge_npu_count <= 0 or self.cloud_npu_count <= 0:
+                raise ValueError(
+                    "edge_npu_count and cloud_npu_count must be positive "
+                    "when enable_edge_cloud is True."
+                )
+            if self.edge_npu_count >= self.cloud_npu_count:
+                raise ValueError(
+                    f"edge_npu_count ({self.edge_npu_count}) must be less than "
+                    f"cloud_npu_count ({self.cloud_npu_count}) for edge-cloud "
+                    "collaboration."
+                )
+            if self.pipeline_parallel_size != 1 or self.tensor_parallel_size != 1:
+                raise ValueError(
+                    "pipeline_parallel_size and tensor_parallel_size must be 1 "
+                    "in edge-cloud collaboration mode. TP is formed within "
+                    "edge/cloud separately, and PP connects edge NPU0 with "
+                    "cloud NPU0."
+                )
+            if self.data_parallel_size != 1:
+                raise ValueError(
+                    "data_parallel_size must be 1 in edge-cloud collaboration mode."
+                )
+            self.world_size = self.edge_npu_count + self.cloud_npu_count
+            # In edge-cloud mode, PP connects edge NPU0 with cloud NPU0,
+            # so the effective pipeline parallel size is 2.
+            # We override pipeline_parallel_size here so that the model runner
+            # correctly enters PP code path (use_pp=True) and sets is_first_pp_rank,
+            # is_last_pp_rank correctly based on the PP group we create.
+            self.pipeline_parallel_size = 2
+            # Set actual tensor_parallel_size based on node type
+            # since TP is formed within edge/cloud separately
+            self.tensor_parallel_size = (
+                self.edge_npu_count if self.is_edge_node else self.cloud_npu_count
+            )
 
         if self.distributed_executor_backend == "external_launcher":
             logger.info("Using external launcher for distributed inference.")
