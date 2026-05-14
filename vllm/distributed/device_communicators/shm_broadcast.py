@@ -793,6 +793,7 @@ class MessageQueue:
         max_chunks,
         reader_rank: int = 0,
         blocking: bool = False,
+        vllm_config=None,
     ) -> tuple["MessageQueue", list[Handle]]:
         """
         Creates a MessageQueue for a process group with a single reader.
@@ -810,15 +811,33 @@ class MessageQueue:
                 Defaults to 0.
             blocking (bool, optional): If True, blocks until all processes are ready.
                 Defaults to False.
+            vllm_config (VllmConfig, optional): vLLM config for edge-cloud mode.
+                If None or edge-cloud is disabled, uses default node detection.
 
         Returns:
             tuple[MessageQueue, list[Handle]]:
             The MessageQueue instance for the calling process,
             and a list of handles (only non-empty for the reader process).
         """
-        local_size = current_platform.device_count()
         rank = dist.get_rank()
-        same_node = rank // local_size == reader_rank // local_size
+        ranks = dist.get_process_group_ranks(pg)
+        # Find reader's index in the group and caller's index
+        reader_rank_in_group = ranks.index(reader_rank)
+        rank_in_group = ranks.index(rank)
+
+        # Determine if same node as reader
+        if (vllm_config is not None
+                and vllm_config.parallel_config.enable_edge_cloud):
+            from vllm.distributed.parallel_state import in_the_same_node_as_edge_cloud
+            same_node_status = in_the_same_node_as_edge_cloud(
+                pg, source_rank=reader_rank_in_group, vllm_config=vllm_config
+            )
+            same_node = same_node_status[rank_in_group]
+        else:
+            # Default: use local_size based detection
+            local_size = current_platform.device_count()
+            same_node = rank // local_size == reader_rank // local_size
+
         buffer_io = MessageQueue(
             n_reader=1,
             n_local_reader=1 if same_node else 0,
