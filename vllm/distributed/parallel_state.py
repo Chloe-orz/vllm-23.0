@@ -410,7 +410,7 @@ class GroupCoordinator:
         )
 
     def create_single_reader_mq_broadcasters(
-        self, reader_rank_in_group=0, blocking=False
+        self, reader_rank_in_group=0, blocking=False, vllm_config=None
     ):
         from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 
@@ -420,6 +420,7 @@ class GroupCoordinator:
             6,
             reader_rank=self.ranks[reader_rank_in_group],
             blocking=blocking,
+            vllm_config=vllm_config,
         )
 
     @property
@@ -435,11 +436,18 @@ class GroupCoordinator:
     @property
     def is_first_rank(self):
         """Return whether the caller is the first process in the group"""
+        # In edge-cloud PP mode, only edge ranks are first rank
+        if _IS_EDGE_DEVICE is not None and self.unique_name.startswith("pp"):
+            return not is_cloud_device()
         return self.rank == self.first_rank
 
     @property
     def is_last_rank(self):
         """Return whether the caller is the last process in the group"""
+        # In edge-cloud PP mode, edge side handles first and last layers,
+        # so only edge ranks return True. All cloud ranks return False.
+        if _IS_EDGE_DEVICE is not None and self.unique_name.startswith("pp"):
+            return not is_cloud_device()
         return self.rank == self.last_rank
 
     @property
@@ -1211,7 +1219,43 @@ def _replace_active_groups(
 
 
 _TP: GroupCoordinator | None = None
+_IS_EDGE_DEVICE: bool | None = None
 
+def is_edge_device() -> bool:
+    """Return True if the current process is on the edge device.
+
+    Returns False if edge-cloud collaboration mode is not enabled
+    or if the distributed groups are not yet initialized.
+    """
+    return _IS_EDGE_DEVICE is True
+
+
+def is_cloud_device() -> bool:
+    """Return True if the current process is on the cloud device.
+
+    Returns False if edge-cloud collaboration mode is not enabled
+    or if the distributed groups are not yet initialized.
+    """
+    return _IS_EDGE_DEVICE is False
+
+
+def is_edge_cloud_pp_mode() -> bool:
+    """Return True if edge-cloud collaboration mode with pipeline parallelism is enabled.
+
+    This is true when edge-cloud mode is initialized (_IS_EDGE_DEVICE is not None).
+    Note: PP group size can be 1 (non-NPU0 ranks) or 2 (NPU0 ranks).
+    """
+    return _IS_EDGE_DEVICE is not None
+
+
+def is_edge_cloud_first_stage(intermediate_tensors) -> bool:
+    """Return True if currently in the first stage of edge-cloud PP mode.
+
+    The first stage is when edge-cloud mode is enabled and no intermediate
+    tensors have been computed yet (i.e., we are processing the first stage
+    and need to return IntermediateTensors for sending to the next PP rank).
+    """
+    return is_edge_cloud_pp_mode() and intermediate_tensors is None
 
 def get_tp_group() -> GroupCoordinator:
     assert _TP is not None, "tensor model parallel group is not initialized"
@@ -1510,9 +1554,100 @@ def initialize_model_parallel(
 
     from vllm.config import get_current_vllm_config
 
+    # Declare globals upfront to avoid "used prior to global declaration" errors
+    global _IS_EDGE_DEVICE, _TP, _PP, _DCP, _PCP, _DP, _EP, _EPLB
+
     config = get_current_vllm_config()
     data_parallel_size = config.parallel_config.data_parallel_size
     enable_elastic_ep = config.parallel_config.enable_elastic_ep
+    enable_edge_cloud = config.parallel_config.enable_edge_cloud
+
+    # Edge-Cloud collaboration mode
+    if enable_edge_cloud:
+        world_size = torch.distributed.get_world_size()
+        rank = torch.distributed.get_rank()
+        backend = backend or torch.distributed.get_backend(
+            get_world_group().device_group
+        )
+
+        edge_npu_count = config.parallel_config.edge_npu_count
+        cloud_npu_count = config.parallel_config.cloud_npu_count
+        is_edge = rank < edge_npu_count
+        _IS_EDGE_DEVICE = is_edge
+
+        # Build TP group: each side forms its own TP group
+        # All ranks must call new_group together, so all ranks include all subgroups
+        assert _TP is None, "tensor model parallel group is already initialized"
+        tp_edge_ranks = list(range(edge_npu_count))
+        tp_cloud_ranks = list(range(edge_npu_count, world_size))
+        _TP = init_model_parallel_group(
+            [tp_edge_ranks, tp_cloud_ranks],
+            get_world_group().local_rank,
+            backend,
+            use_message_queue_broadcaster=True,
+            group_name="tp",
+        )
+
+        # Build PP group: only NPU0 on each side participates
+        # Edge NPU0 (rank=0) and Cloud NPU0 (rank=edge_npu_count) form PP pair
+        # Other ranks have PP group containing only themselves
+        # All ranks must call new_group together, so all ranks include all subgroups
+        assert _PP is None, "pipeline model parallel group is already initialized"
+        pp_group_ranks = [0, edge_npu_count]  # NPU0 PP pair
+        pp_other_ranks = [[r] for r in range(world_size) if r != 0 and r != edge_npu_count]
+        _PP = init_model_parallel_group(
+            [pp_group_ranks] + pp_other_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="pp",
+        )
+
+        # In edge-cloud mode, other parallel groups (DCP, PCP, DP, EP) are not used
+        # Each rank forms its own group for these dimensions
+        # All ranks must call new_group together, so include all ranks in group_ranks
+        all_ranks = list(range(world_size))
+        assert _DCP is None, "decode context model parallel group is already initialized"
+        _DCP = init_model_parallel_group(
+            [[r] for r in all_ranks],
+            get_world_group().local_rank,
+            backend,
+            group_name="dcp",
+        )
+        assert _PCP is None, "prefill context parallel group is already initialized"
+        _PCP = init_model_parallel_group(
+            [[r] for r in all_ranks],
+            get_world_group().local_rank,
+            backend,
+            group_name="pcp",
+        )
+        assert _DP is None, "data parallel group is already initialized"
+        _DP = init_model_parallel_group(
+            [[r] for r in all_ranks],
+            get_world_group().local_rank,
+            backend,
+            group_name="dp",
+        )
+        assert _EP is None, "expert parallel group is already initialized"
+        _EP = init_model_parallel_group(
+            [[r] for r in all_ranks],
+            get_world_group().local_rank,
+            backend,
+            group_name="ep",
+        )
+
+        logger.info_once(
+            "Edge-Cloud collaboration mode initialized: "
+            "rank %s, is_edge=%s, edge_npu_count=%s, cloud_npu_count=%s, "
+            "TP group ranks=%s, PP group ranks=%s",
+            rank,
+            is_edge,
+            edge_npu_count,
+            cloud_npu_count,
+            tuple(tp_group_ranks),
+            tuple(pp_group_ranks),
+        )
+        return
+
     if enable_elastic_ep:
         # Use stateless world group for global information
         world_size = get_world_group().world_size
@@ -1553,7 +1688,6 @@ def initialize_model_parallel(
     )  # noqa
 
     # Build the tensor model-parallel groups.
-    global _TP
     assert _TP is None, "tensor model parallel group is already initialized"
     group_ranks = all_ranks.view(-1, tensor_model_parallel_size).unbind(0)
     group_ranks = [x.tolist() for x in group_ranks]
@@ -1570,7 +1704,6 @@ def initialize_model_parallel(
     )
 
     # Build the DCP model-parallel groups.
-    global _DCP
     assert _DCP is None, "decode context model parallel group is already initialized"
     # Note(hc): In the current implementation of decode context parallel,
     # dcp_size must not exceed tp_size, because the world size does not
@@ -1591,7 +1724,6 @@ def initialize_model_parallel(
         group_name="dcp",
     )
 
-    global _PCP
     assert _PCP is None, "prefill context parallel group is already initialized"
     group_ranks = (
         all_ranks.transpose(3, 4)
@@ -1611,7 +1743,6 @@ def initialize_model_parallel(
     )
 
     # Build the pipeline model-parallel groups.
-    global _PP
     assert _PP is None, "pipeline model parallel group is already initialized"
     group_ranks = (
         all_ranks.transpose(2, 4).reshape(-1, pipeline_model_parallel_size).unbind(0)
@@ -1628,7 +1759,6 @@ def initialize_model_parallel(
         group_ranks, get_world_group().local_rank, backend, group_name="pp"
     )
 
-    global _DP
     assert _DP is None, "data parallel group is already initialized"
     group_ranks = all_ranks.transpose(1, 4).reshape(-1, data_parallel_size).unbind(0)
     group_ranks = [x.tolist() for x in group_ranks]
@@ -1649,7 +1779,6 @@ def initialize_model_parallel(
             group_ranks, get_world_group().local_rank, backend, group_name="dp"
         )
 
-    global _EP
     assert _EP is None, "expert parallel group is already initialized"
     # Don't create EP group for dense models.
     if config.model_config is None or config.model_config.is_moe:
@@ -1685,7 +1814,6 @@ def initialize_model_parallel(
         # This is a separate process group to isolate EPLB communications
         # from MoE forward pass collectives and prevent deadlocks when
         # using torch.distributed in execution with torch.distributed in EPLB.
-        global _EPLB
         assert _EPLB is None, "EPLB group is already initialized"
         if (
             config is not None
@@ -1856,11 +1984,13 @@ def get_node_count() -> int:
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
-    global _TP
+    global _TP, _IS_EDGE_DEVICE
 
     if _TP:
         _TP.destroy()
     _TP = None
+
+    _IS_EDGE_DEVICE = None
 
     global _DCP
     if _DCP:
@@ -1927,6 +2057,33 @@ def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
                 "torch._C._host_emptyCache() only available in Pytorch >=2.5"
             )
 
+def in_the_same_node_as_edge_cloud(
+    pg: ProcessGroup | StatelessProcessGroup,
+    source_rank: int,
+    vllm_config,
+) -> list[bool]:
+    """
+    Fast path for edge-cloud mode: determine node membership without communication.
+
+    In edge-cloud mode, edge ranks are [0, edge_npu_count) and cloud ranks are
+    [edge_npu_count, world_size). Since edge and cloud are on different physical
+    nodes, we can determine node membership directly from rank values.
+    """
+    if isinstance(pg, ProcessGroup):
+        ranks = torch.distributed.get_process_group_ranks(pg)
+    else:
+        world_size = pg.world_size
+        ranks = list(range(world_size))
+
+    edge_npu_count = vllm_config.parallel_config.edge_npu_count
+
+    # Determine if source_rank is on edge or cloud
+    # ranks list contains global ranks, so we check ranks[source_rank]
+    source_global_rank = ranks[source_rank]
+    source_is_edge = source_global_rank < edge_npu_count
+
+    # All ranks on the same side (edge/cloud) as source are in the same node
+    return [r < edge_npu_count if source_is_edge else r >= edge_npu_count for r in ranks]
 
 def in_the_same_node_as(
     pg: ProcessGroup | StatelessProcessGroup, source_rank: int = 0
