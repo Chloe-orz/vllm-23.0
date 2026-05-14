@@ -1638,12 +1638,13 @@ def initialize_model_parallel(
         logger.info_once(
             "Edge-Cloud collaboration mode initialized: "
             "rank %s, is_edge=%s, edge_npu_count=%s, cloud_npu_count=%s, "
-            "TP group ranks=%s, PP group ranks=%s",
+            "TP edge ranks=%s, TP cloud ranks=%s, PP group ranks=%s",
             rank,
             is_edge,
             edge_npu_count,
             cloud_npu_count,
-            tuple(tp_group_ranks),
+            tuple(tp_edge_ranks),
+            tuple(tp_cloud_ranks),
             tuple(pp_group_ranks),
         )
         return
