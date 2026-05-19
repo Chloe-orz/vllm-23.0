@@ -42,6 +42,8 @@ from vllm.distributed.parallel_state import (
     get_pp_group,
     get_tp_group,
     graph_capture,
+    is_edge_cloud_first_stage,
+    is_edge_device,
     is_global_first_rank,
     prepare_communication_buffer_for_model,
 )
@@ -3057,7 +3059,7 @@ class GPUModelRunner(
         else:
             positions = self.positions.gpu[:num_input_tokens]
 
-        if is_first_rank:
+        if is_first_rank and (not is_edge_device() or intermediate_tensors is None):
             intermediate_tensors = None
         else:
             assert intermediate_tensors is not None
@@ -3803,7 +3805,7 @@ class GPUModelRunner(
 
             if not self.broadcast_pp_output:
                 # Common case.
-                if not get_pp_group().is_last_rank:
+                if not get_pp_group().is_last_rank or is_edge_cloud_first_stage(intermediate_tensors):
                     # Return the intermediate tensors.
                     assert isinstance(hidden_states, IntermediateTensors)
                     hidden_states.kv_connector_output = kv_connector_output
