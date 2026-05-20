@@ -484,6 +484,9 @@ class EngineArgs:
     linear_backend: LinearBackend = KernelConfig.linear_backend
     all2all_backend: All2AllBackend = ParallelConfig.all2all_backend
     enable_elastic_ep: bool = ParallelConfig.enable_elastic_ep
+    enable_edge_cloud: bool = ParallelConfig.enable_edge_cloud
+    edge_npu_count: int = ParallelConfig.edge_npu_count
+    cloud_npu_count: int = ParallelConfig.cloud_npu_count
     enable_dbo: bool = ParallelConfig.enable_dbo
     ubatch_size: int = ParallelConfig.ubatch_size
     dbo_decode_token_threshold: int = ParallelConfig.dbo_decode_token_threshold
@@ -1077,6 +1080,15 @@ class EngineArgs:
         )
         parallel_group.add_argument(
             "--enable-elastic-ep", **parallel_kwargs["enable_elastic_ep"]
+        )
+        parallel_group.add_argument(
+            "--enable-edge-cloud", **parallel_kwargs["enable_edge_cloud"]
+        )
+        parallel_group.add_argument(
+            "--edge-npu-count", **parallel_kwargs["edge_npu_count"]
+        )
+        parallel_group.add_argument(
+            "--cloud-npu-count", **parallel_kwargs["cloud_npu_count"]
         )
         parallel_group.add_argument(
             "--dbo-decode-token-threshold",
@@ -1825,7 +1837,7 @@ class EngineArgs:
             "nnodes > 1 is only supported with data_parallel_backend=mp"
         )
         inferred_data_parallel_rank = 0
-        if self.nnodes > 1:
+        if self.nnodes > 1 and not self.enable_edge_cloud:
             world_size = (
                 self.data_parallel_size
                 * self.pipeline_parallel_size
@@ -1982,6 +1994,10 @@ class EngineArgs:
             enable_ep_weight_filter=self.enable_ep_weight_filter,
             all2all_backend=self.all2all_backend,
             enable_elastic_ep=self.enable_elastic_ep,
+            enable_edge_cloud=self.enable_edge_cloud,
+            edge_npu_count=self.edge_npu_count,
+            cloud_npu_count=self.cloud_npu_count,
+            is_edge_node=not headless if self.enable_edge_cloud else False,
             enable_dbo=self.enable_dbo,
             ubatch_size=self.ubatch_size,
             dbo_decode_token_threshold=self.dbo_decode_token_threshold,
