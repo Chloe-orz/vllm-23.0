@@ -129,6 +129,10 @@ def maybe_make_prepare_finalize(
 
     all2all_manager = get_ep_group().device_communicator.all2all_manager
     assert all2all_manager is not None
+    print(f"[EP-All2All] world_size={all2all_manager.world_size}, rank={all2all_manager.rank}, "
+          f"dp_world_size={all2all_manager.dp_world_size}, use_deepep_ht={moe.use_deepep_ht_kernels}, "
+          f"use_deepep_ll={moe.use_deepep_ll_kernels}, use_mori={moe.use_mori_kernels}, "
+          f"use_naive={moe.use_naive_all2all_kernels}")
 
     prepare_finalize: FusedMoEPrepareAndFinalize | None = None
 
