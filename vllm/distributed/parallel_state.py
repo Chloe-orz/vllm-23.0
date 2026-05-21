@@ -1628,8 +1628,10 @@ def initialize_model_parallel(
             group_name="dp",
         )
         assert _EP is None, "expert parallel group is already initialized"
+        ep_edge_ranks = list(range(edge_npu_count))
+        ep_cloud_ranks = list(range(edge_npu_count, world_size))
         _EP = init_model_parallel_group(
-            [[r] for r in all_ranks],
+            [ep_edge_ranks, ep_cloud_ranks],
             get_world_group().local_rank,
             backend,
             group_name="ep",
