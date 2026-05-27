@@ -2015,8 +2015,15 @@ def get_kv_cache_configs(
     # If original_max_model_len was -1, automatically
     # determine the maximum model length that fits in available GPU memory.
     # We use per-worker projected groups to account for PP sharding.
+    # When edge-cloud is enabled, a worker (especially the embedding-only
+    # edge side) may report an empty spec because static_forward_context
+    # was cleaned after sharding. Fall back to the merged full-model spec
+    # so that projected groups remain non-empty and the scheduler can work.
     projected_groups_per_worker = [
-        _project_kv_cache_groups_to_worker(global_kv_cache_groups, worker_spec)
+        _project_kv_cache_groups_to_worker(
+            global_kv_cache_groups,
+            worker_spec if worker_spec else merged_kv_cache_specs,
+        )
         for worker_spec in kv_cache_specs
     ]
 
