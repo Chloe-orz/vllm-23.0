@@ -2071,9 +2071,14 @@ def get_kv_cache_configs(
     for projected_groups, kv_cache_spec_one_worker, available_memory_one_worker in zip(
         projected_groups_per_worker, kv_cache_specs, available_memory
     ):
-        assert sum(len(group.layer_names) for group in projected_groups) == len(
-            kv_cache_spec_one_worker
-        ), "Some layers are not assigned to any group."
+        # In edge-cloud embedding_only mode, the edge worker has no local
+        # attention layers and reports an empty spec. Its projected_groups
+        # is built from the merged full-model spec, so the assertion would
+        # fail. Skip the assertion when the worker spec is empty.
+        if kv_cache_spec_one_worker:
+            assert sum(len(group.layer_names) for group in projected_groups) == len(
+                kv_cache_spec_one_worker
+            ), "Some layers are not assigned to any group."
         kv_cache_configs.append(
             get_kv_cache_config_from_groups(
                 vllm_config, projected_groups, available_memory_one_worker
