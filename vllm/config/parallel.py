@@ -756,10 +756,6 @@ class ParallelConfig:
                     "pipeline_parallel_size and tensor_parallel_size must be 1 "
                     "in edge-cloud collaboration mode."
                 )
-            if self.data_parallel_size != 1:
-                raise ValueError(
-                    "data_parallel_size must be 1 in edge-cloud collaboration mode."
-                )
             self.world_size = self.edge_npu_count + self.cloud_npu_count
             self.pipeline_parallel_size = 2
             self.tensor_parallel_size = (
