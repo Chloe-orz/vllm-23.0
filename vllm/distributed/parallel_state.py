@@ -1711,6 +1711,84 @@ def initialize_model_parallel(
     enable_elastic_ep = config.parallel_config.enable_elastic_ep
     parallel_config = config.parallel_config
     coord_store: Store | None = None
+    if parallel_config.enable_edge_cloud:
+        world_size = torch.distributed.get_world_size()
+        rank = torch.distributed.get_rank()
+        backend = backend or torch.distributed.get_backend(
+            get_world_group().device_group
+        )
+        edge_npu_count = parallel_config.edge_npu_count
+        is_edge = rank < edge_npu_count
+        _IS_EDGE_DEVICE = is_edge
+
+        tp_edge_ranks = list(range(edge_npu_count))
+        tp_cloud_ranks = list(range(edge_npu_count, world_size))
+        assert _TP is None, "tensor model parallel group is already initialized"
+        _TP = init_model_parallel_group(
+            [tp_edge_ranks, tp_cloud_ranks],
+            get_world_group().local_rank,
+            backend,
+            use_message_queue_broadcaster=True,
+            group_name="tp",
+        )
+
+        pp_group_ranks = [0, edge_npu_count]
+        pp_other_ranks = [
+            [r] for r in range(world_size) if r not in (0, edge_npu_count)
+        ]
+        assert _PP is None, "pipeline model parallel group is already initialized"
+        _PP = init_model_parallel_group(
+            [pp_group_ranks] + pp_other_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="pp",
+        )
+
+        all_ranks = list(range(world_size))
+        assert _DCP is None, "decode context model parallel group is already initialized"
+        _DCP = init_model_parallel_group(
+            [[r] for r in all_ranks],
+            get_world_group().local_rank,
+            backend,
+            use_message_queue_broadcaster=True,
+            group_name="dcp",
+        )
+        assert _PCP is None, "prefill context parallel group is already initialized"
+        _PCP = init_model_parallel_group(
+            [[r] for r in all_ranks],
+            get_world_group().local_rank,
+            backend,
+            group_name="pcp",
+        )
+        assert _DP is None, "data parallel group is already initialized"
+        _DP = init_model_parallel_group(
+            [[r] for r in all_ranks],
+            get_world_group().local_rank,
+            backend,
+            group_name="dp",
+        )
+        assert _EP is None, "expert parallel group is already initialized"
+        _EP = init_model_parallel_group(
+            [tp_edge_ranks, tp_cloud_ranks],
+            get_world_group().local_rank,
+            backend,
+            group_name="ep",
+        )
+
+        logger.info_once(
+            "Edge-cloud collaboration mode initialized: rank=%s, is_edge=%s, "
+            "edge_npu_count=%s, cloud_npu_count=%s, TP edge ranks=%s, "
+            "TP cloud ranks=%s, PP group ranks=%s",
+            rank,
+            is_edge,
+            edge_npu_count,
+            parallel_config.cloud_npu_count,
+            tuple(tp_edge_ranks),
+            tuple(tp_cloud_ranks),
+            tuple(pp_group_ranks),
+        )
+        return
+
     if enable_elastic_ep:
         coord_store = get_cached_tcp_store_client(
             parallel_config.data_parallel_master_ip,
