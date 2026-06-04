@@ -297,6 +297,9 @@ class AsyncLLM(EngineClient):
     ) -> RequestOutputCollector:
         """Add new request to the AsyncLLM."""
 
+        if os.environ.get("PP_TIMING_ENABLE", "0") == "1":
+            print(f"[PP_TIMING][api][req_arrive_api] {time.perf_counter()}")
+
         if self.errored:
             raise EngineDeadError()
 
@@ -409,6 +412,8 @@ class AsyncLLM(EngineClient):
         self.output_processor.add_request(request, prompt, parent_req, index, queue)
 
         # Add the EngineCoreRequest to EngineCore (separate process).
+        if os.environ.get("PP_TIMING_ENABLE", "0") == "1":
+            print(f"[PP_TIMING][api][req_send_engine] {time.perf_counter()}")
         await self.engine_core.add_request_async(request)
 
         if self.log_requests:

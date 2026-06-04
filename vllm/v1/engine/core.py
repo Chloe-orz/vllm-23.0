@@ -377,6 +377,9 @@ class EngineCore:
             # to free any pre-admission KV-transfer resources.
             self.abort_requests([request.request_id])
 
+        if os.environ.get("PP_TIMING_ENABLE", "0") == "1":
+            print(f"[PP_TIMING][engine][req_enqueue] {time.perf_counter()}")
+
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""
 
@@ -443,6 +446,12 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule()
+
+        if os.environ.get("PP_TIMING_ENABLE", "0") == "1":
+            print(f"[PP_TIMING][engine][schedule_done] {time.perf_counter()}")
+
+        if os.environ.get("PP_TIMING_ENABLE", "0") == "1":
+            print(f"[PP_TIMING][engine][dispatch_worker] {time.perf_counter()}")
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
