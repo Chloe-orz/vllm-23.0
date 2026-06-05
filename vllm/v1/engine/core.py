@@ -377,9 +377,6 @@ class EngineCore:
             # to free any pre-admission KV-transfer resources.
             self.abort_requests([request.request_id])
 
-        if os.environ.get("PP_TIMING_ENABLE", "0") == "1":
-            print(f"[PP_TIMING][engine][req_enqueue] {time.perf_counter()}")
-
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""
 
