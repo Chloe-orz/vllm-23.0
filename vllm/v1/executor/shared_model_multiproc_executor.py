@@ -221,6 +221,17 @@ class SharedModelWorkerProc:
         # _init_message_queues is not used.
         self._init_message_queues(input_shm_handle, vllm_config)
 
+        # Pending ``AsyncModelRunnerOutput`` markers (i.e. the
+        # ``DeferredExecutePostprocess`` instances returned by
+        # :meth:`SharedModelEdgeWorker.execute_model` for the
+        # tail recv + tail forward) keyed by dp_rank. Populated
+        # by ``_dispatch`` and drained by ``worker_busy_loop``
+        # at the end of each round, so per-dp_rank tail
+        # processing happens in lockstep. The dict is ordered
+        # by insertion (Python 3.7+) so the round's tail
+        # processing happens in dispatch order.
+        self._pending_deferred: dict[int, AsyncModelRunnerOutput] = {}
+
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
         enable_envs_cache()
@@ -309,6 +320,32 @@ class SharedModelWorkerProc:
           (e.g. ``add_lora``) queued behind a SYNC method on
           the same MQ will not be dequeued while the dp_rank
           is paused. They are picked up on the next round.
+
+        Batch postprocess of ``execute_model`` results
+        ----------------------------------------------
+        ``SharedModelEdgeWorker.execute_model`` does the head
+        forward + PP send synchronously and returns the tail
+        recv + tail forward wrapped in a
+        :class:`DeferredExecutePostprocess` marker — an
+        :class:`AsyncModelRunnerOutput` subclass that is also
+        callable. ``_dispatch`` detects the marker via
+        ``isinstance(output, AsyncModelRunnerOutput)`` and
+        stores it in ``self._pending_deferred``; when the
+        round barrier is reached at the end of the pass, the
+        busy loop calls each marker first (the call invokes
+        ``__call__``, which runs the deferred tail processing
+        and returns the raw postprocess result — no extra
+        type check), then routes the result to the matching
+        response MQ via ``handle_output`` →
+        ``enqueue_output``. The downstream
+        ``enqueue_output`` does its own
+        ``isinstance(output, AsyncModelRunnerOutput)`` /
+        ``get_output()`` unwrap, in case the postprocess
+        itself returned an async output. The
+        ``DeferredExecutePostprocess.get_output`` method (an
+        alternative entry point that does one more type
+        check) is reserved for direct callers that bypass
+        ``enqueue_output``.
         """
         assert self.rpc_broadcast_mqs, (
             "rpc_broadcast_mqs must be initialised before busy loop")
@@ -341,13 +378,72 @@ class SharedModelWorkerProc:
                 # ``bytes``-method (cloudpickled callable) just
                 # does not match — only the standard engine-
                 # driven methods gate the barrier.
-                if method in self.SYNC_METHODS:
+                #
+                # Exception: an ``execute_model`` call with
+                # ``num_scheduled_tokens == 0`` is an "empty"
+                # scheduler step — the model runner returns
+                # without doing a real forward, no PP send /
+                # tail recv happens, and the result is sent
+                # back immediately (no ``DeferredExecutePostprocess``
+                # marker either). Such a call does not need to
+                # gate the round barrier, so we let the dp_rank
+                # keep dispatching instead of pausing it. The
+                # first positional arg is the
+                # ``SchedulerOutput``; the engine still calls
+                # ``execute_model`` once per scheduler step
+                # regardless of the batch size, so this just
+                # means the pause is only triggered by the
+                # "real" forward calls.
+                is_empty_execute = (
+                    method == "execute_model"
+                    and args
+                    and getattr(args[0],
+                                "total_num_scheduled_tokens", 0) == 0)
+                if (method in self.SYNC_METHODS
+                        and not is_empty_execute):
                     paused[k] = True
             # End-of-round: if every dp_rank has paused at least
-            # once in this round, the round is complete and we
-            # unpause everyone for the next round.
+            # once in this round, the round is complete. Unpause
+            # everyone for the next round AND — crucially — drain
+            # the pending ``AsyncModelRunnerOutput`` markers that
+            # ``_dispatch`` accumulated during the round. For each
+            # marker: if it is *callable* (i.e. a
+            # ``DeferredExecutePostprocess``), call it first to
+            # run the deferred tail recv + tail forward and get
+            # the raw postprocess result; the result is then
+            # routed to the matching response MQ via
+            # ``handle_output`` (which goes through
+            # ``enqueue_output`` and unwraps the result via
+            # ``isinstance(output, AsyncModelRunnerOutput)`` /
+            # ``get_output()`` if the postprocess itself
+            # returned an async output). Exceptions raised by
+            # the postprocess are caught and converted to a
+            # FAILURE response on the matching response MQ so
+            # the engine sees the failure rather than the busy
+            # loop crashing. The insertion-ordered iteration
+            # over ``self._pending_deferred`` preserves
+            # dispatch order.
             if all(paused):
                 paused = [False] * dp_size
+                if self._pending_deferred:
+                    pending, self._pending_deferred = (
+                        self._pending_deferred, {})
+                    for dp_rank, deferred in pending.items():
+                        try:
+                            if callable(deferred):
+                                output = deferred()
+                            else:
+                                output = deferred
+                        except Exception as e:
+                            if hasattr(e, "add_note"):
+                                e.add_note(traceback.format_exc())
+                            logger.exception(
+                                "SharedModelWorkerProc hit an exception "
+                                "running deferred execute_model "
+                                "postprocess on dp_rank=%d.", dp_rank)
+                            output = e
+                        self.handle_output(dp_rank, output)
+                    dispatched = True
             if not dispatched:
                 # No MQ had a message in this pass; yield to let
                 # the death-pipe monitor and signal handlers run.
@@ -387,7 +483,24 @@ class SharedModelWorkerProc:
             return
 
         if output_rank is None or self.rank == output_rank:
-            self.handle_output(dp_rank, output)
+            # Batch postprocess: any ``execute_model`` result
+            # that comes back as an :class:`AsyncModelRunnerOutput`
+            # — including the ``DeferredExecutePostprocess``
+            # marker (which is also callable, for direct use) —
+            # is held back. The ``worker_busy_loop`` invokes
+            # ``get_output()`` on each marker at the end of the
+            # current round (via :meth:`handle_output` →
+            # :meth:`enqueue_output`), which runs the deferred
+            # tail recv + tail forward. The marker's
+            # ``get_output()`` does one more type check on the
+            # postprocess return value (so a nested async
+            # output is unwrapped), while the direct-call path
+            # (``__call__``) skips that check.
+            if (method == "execute_model"
+                    and isinstance(output, AsyncModelRunnerOutput)):
+                self._pending_deferred[dp_rank] = output
+            else:
+                self.handle_output(dp_rank, output)
 
     def handle_output(self, dp_rank: int, output: Any) -> None:
         """Route a worker output to the matching dp_rank response
