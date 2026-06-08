@@ -114,6 +114,32 @@ class SharedModelWorkerProc:
 
     READY_STR = "READY"
 
+    # Methods whose dispatch gates a per-dp_rank round barrier in
+    # the busy loop. When a dp_rank dispatches one of these, the
+    # busy loop pauses that dp_rank's MQ intake until every
+    # dp_rank has dispatched one of them in the current "round";
+    # at the end of a pass in which every dp_rank has paused, the
+    # round resets and all dp_ranks resume.
+    #
+    # ``execute_model`` and ``execute_dummy_batch`` are the only
+    # engine-driven per-step methods that need to stay in lockstep
+    # across dp_ranks: the engine dispatches them once per
+    # scheduler step, and the shared model runner cannot start the
+    # next scheduling round until every dp_rank has finished the
+    # current one (their KV-cache heads, in-flight samples, etc.
+    # are not safe to mix across ranks). Without the barrier, a
+    # fast dp_rank could keep the worker busy with its own
+    # ``execute_model`` calls while the others starve.
+    #
+    # Note that the pause is *global* per dp_rank — i.e. while a
+    # dp_rank is paused, the busy loop will not dequeue ANY rpc
+    # (including non-SYNC methods such as ``add_lora``) from that
+    # MQ. This is intentional: the engine drives the per-dp_rank
+    # streams in lockstep and any non-SYNC work queued behind a
+    # SYNC method will be picked up on the next round.
+    SYNC_METHODS: frozenset[str] = frozenset(
+        {"execute_model", "execute_dummy_batch"})
+
     # ------------------------------------------------------------------ init
     @instrument(span_name="Worker init")
     def __init__(
@@ -256,13 +282,45 @@ class SharedModelWorkerProc:
         ``self.rpc_broadcast_mq.dequeue(indefinite=True)``; the
         shared model design needs a multi-MQ round-robin because
         :class:`MessageQueue` has no multi-MQ select primitive.
+
+        Cross-dp_rank pacing
+        --------------------
+        The shared model runner assumes the per-dp_rank
+        ``execute_model`` / ``execute_dummy_batch`` calls are
+        driven in lockstep — i.e. all dp_ranks finish the current
+        scheduler step before any of them starts the next. To
+        enforce that invariant on the dispatch side, the busy
+        loop runs a "round barrier" over :attr:`SYNC_METHODS`:
+
+        * On every dispatch whose method is in
+          :attr:`SYNC_METHODS`, the dispatching dp_rank is
+          marked *paused* and the busy loop will not dequeue
+          from its MQ for the rest of the current round.
+        * At the end of each pass over the MQs, if every
+          dp_rank is paused the round is complete and all
+          dp_ranks are unpaused — a new round begins.
+        * If only a subset of dp_ranks are paused, the round
+          is still in progress; the busy loop simply continues
+          to the next pass. The remaining unpaused dp_ranks
+          will get their chance to dispatch (and pause) in
+          subsequent passes; once every dp_rank is paused,
+          the round resets.
+        * The pause is *global* per dp_rank — non-SYNC methods
+          (e.g. ``add_lora``) queued behind a SYNC method on
+          the same MQ will not be dequeued while the dp_rank
+          is paused. They are picked up on the next round.
         """
         assert self.rpc_broadcast_mqs, (
             "rpc_broadcast_mqs must be initialised before busy loop")
 
+        dp_size = len(self.rpc_broadcast_mqs)
+        paused = [False] * dp_size
+
         while True:
             dispatched = False
             for k, mq in enumerate(self.rpc_broadcast_mqs):
+                if paused[k]:
+                    continue
                 try:
                     # ``dequeue`` is the upstream high-level API
                     # used by the standard ``MultiprocExecutor``
@@ -277,6 +335,19 @@ class SharedModelWorkerProc:
                 # outer enumerate index k is the dp_rank
                 self._dispatch(k, method, args, kwargs, output_rank)
                 dispatched = True
+                # Round barrier: pause this dp_rank's MQ intake
+                # for the rest of the current round. The check
+                # uses ``in`` on a ``frozenset[str]`` so a
+                # ``bytes``-method (cloudpickled callable) just
+                # does not match — only the standard engine-
+                # driven methods gate the barrier.
+                if method in self.SYNC_METHODS:
+                    paused[k] = True
+            # End-of-round: if every dp_rank has paused at least
+            # once in this round, the round is complete and we
+            # unpause everyone for the next round.
+            if all(paused):
+                paused = [False] * dp_size
             if not dispatched:
                 # No MQ had a message in this pass; yield to let
                 # the death-pipe monitor and signal handlers run.
