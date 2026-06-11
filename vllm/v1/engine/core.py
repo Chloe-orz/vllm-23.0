@@ -495,6 +495,9 @@ class EngineCore:
             self.log_iteration_details(scheduler_output),
         ):
             model_output = future.result()
+            import os
+            if os.environ.get("PP_TIMING_ENABLE", "0") == "1":
+                print(f"[PP_TIMING][future-result] {time.perf_counter()}")
             if model_output is None:
                 # None from sample_tokens() implies that the original execute_model()
                 # call failed - raise that exception.
