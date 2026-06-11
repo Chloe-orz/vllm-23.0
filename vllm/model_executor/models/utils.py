@@ -625,6 +625,16 @@ def make_layers(
     """Make a list of layers with the given layer function, taking
     pipeline parallelism into account.
 
+    In edge-cloud collaborative inference mode, the edge side owns
+    non-contiguous layer ranges (head + tail), while the cloud side
+    owns the middle range.  The head / tail counts are stored via
+    :func:`set_edge_cloud_layer_range` before model initialisation.
+    ``make_layers`` reads them through :func:`get_edge_cloud_layer_range`
+    and creates real layers only for the locally-owned indices (and
+    ``PPMissingLayer`` placeholders for the rest), so that model
+    initialisation and weight loading happen **directly on the target
+    device** — no CPU→NPU transfer step is needed.
+
     Args:
         num_hidden_layers: Total number of hidden layers in the model.
         layer_fn: Function to create a layer given its index.
@@ -633,9 +643,30 @@ def make_layers(
     Returns:
         Tuple of (start_layer, end_layer, modules).
     """
-    from vllm.distributed.parallel_state import get_pp_group
+    from vllm.distributed.parallel_state import (
+        get_pp_group,
+        is_edge_cloud_pp_mode,
+    )
     from vllm.distributed.utils import get_pp_indices
     from vllm.model_executor.offloader import get_offloader
+
+    # Edge-cloud mode: use the stored head_k / tail_k to build
+    # non-contiguous layer ranges (edge = head [0,k) + tail [N-k, N)).
+    if is_edge_cloud_pp_mode():
+        local_indices = _get_edge_cloud_local_indices(num_hidden_layers)
+        if local_indices is not None:
+            sorted_idx = sorted(local_indices)
+            offloader = get_offloader()
+            modules = torch.nn.ModuleList(
+                offloader.wrap_modules(
+                    layer_fn(prefix=f"{prefix}.{idx}")
+                ) if idx in local_indices else PPMissingLayer()
+                for idx in range(num_hidden_layers)
+            )
+            start_layer = sorted_idx[0]
+            end_layer = sorted_idx[-1] + 1
+            return start_layer, end_layer, modules
+        # Fall through: range not set — use standard contiguous PP split
 
     start_layer, end_layer = get_pp_indices(
         num_hidden_layers, get_pp_group().rank_in_group, get_pp_group().world_size
@@ -650,6 +681,43 @@ def make_layers(
     )
 
     return start_layer, end_layer, modules
+
+
+def _get_edge_cloud_local_indices(
+    num_hidden_layers: int,
+) -> set[int] | None:
+    """Compute local layer indices for the current process from the
+    edge-cloud head / tail layer counts.
+
+    The counts are stored via :func:`set_edge_cloud_layer_range` before
+    model initialisation and read through :func:`get_edge_cloud_layer_range`.
+
+    * Edge processes  get ``[0, head_k) ∪ [N-tail_k, N)``
+    * Cloud processes get ``[head_k, N-tail_k)``
+
+    Returns ``None`` if the range has not been set (e.g. not in
+    edge-cloud mode), signalling the caller to fall back to the
+    standard contiguous PP behaviour.
+    """
+    from vllm.distributed.parallel_state import (
+        get_edge_cloud_layer_range,
+        is_edge_device,
+    )
+
+    layer_range = get_edge_cloud_layer_range()
+    if layer_range is None:
+        return None
+
+    head_k, tail_k = layer_range
+    if head_k == 0 and tail_k == 0:
+        return None
+
+    if is_edge_device():
+        return set(range(head_k)) | set(
+            range(num_hidden_layers - tail_k, num_hidden_layers)
+        )
+    else:
+        return set(range(head_k, num_hidden_layers - tail_k))
 
 
 # NOTE: don't use lru_cache here because it can prevent garbage collection
