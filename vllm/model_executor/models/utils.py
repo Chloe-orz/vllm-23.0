@@ -657,13 +657,16 @@ def make_layers(
         if local_indices is not None:
             sorted_idx = sorted(local_indices)
             offloader = get_offloader()
-            # Batch-create all real layers through the offloader (same
-            # as standard PP), then interleave with PPMissingLayer at
-            # the correct positions.
-            real_layers = offloader.wrap_modules(
-                layer_fn(prefix=f"{prefix}.{idx}") for idx in sorted_idx
-            )
-            real_iter = iter(zip(sorted_idx, real_layers))
+            # Batch-create all real layers through the offloader
+            # (same as standard PP), then interleave with
+            # PPMissingLayer at the correct positions.
+            if sorted_idx:
+                real_layers = offloader.wrap_modules(
+                    layer_fn(prefix=f"{prefix}.{idx}") for idx in sorted_idx
+                )
+                real_iter = iter(zip(sorted_idx, real_layers))
+            else:
+                real_iter = iter([])
             next_idx, next_layer = next(real_iter, (None, None))
             modules_list: list[torch.nn.Module] = []
             for idx in range(num_hidden_layers):
@@ -672,8 +675,12 @@ def make_layers(
                     next_idx, next_layer = next(real_iter, (None, None))
                 else:
                     modules_list.append(PPMissingLayer())
-            start_layer = sorted_idx[0]
-            end_layer = sorted_idx[-1] + 1
+            if sorted_idx:
+                start_layer = sorted_idx[0]
+                end_layer = sorted_idx[-1] + 1
+            else:
+                start_layer = 0
+                end_layer = 0
             return start_layer, end_layer, torch.nn.ModuleList(modules_list)
         # Fall through: range not set — use standard contiguous PP split
 
@@ -719,7 +726,11 @@ def _get_edge_cloud_local_indices(
 
     head_k, tail_k = layer_range
     if head_k == 0 and tail_k == 0:
-        return None
+        # embedding_only mode: edge owns no transformer layers,
+        # cloud owns all of them.
+        if is_edge_device():
+            return set()  # type: ignore[return-value]
+        return set(range(num_hidden_layers))
 
     if is_edge_device():
         return set(range(head_k)) | set(
