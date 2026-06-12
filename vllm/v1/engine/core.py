@@ -495,10 +495,6 @@ class EngineCore:
             self.log_iteration_details(scheduler_output),
         ):
             model_output = future.result()
-            from vllm.v1.utils import pp_timing_enabled_v1, pp_timing_sync_v1
-            if pp_timing_enabled_v1():
-                pp_timing_sync_v1()
-                print(f"[PP_TIMING][future-result] {time.perf_counter()}")
             if model_output is None:
                 # None from sample_tokens() implies that the original execute_model()
                 # call failed - raise that exception.
