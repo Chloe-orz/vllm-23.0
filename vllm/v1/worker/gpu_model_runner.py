@@ -261,9 +261,9 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         """
         max_gen_len = self.sampled_token_ids_cpu.shape[-1]
         self.async_copy_ready_event.synchronize()
-        # [PP_TIMING] async 路径: GPU→CPU copy 完成, token_ids 就绪
-        import os
-        if os.environ.get("PP_TIMING_ENABLE", "0") == "1":
+        from vllm.v1.utils import pp_timing_enabled_v1, pp_timing_sync_v1
+        if pp_timing_enabled_v1():
+            pp_timing_sync_v1()
             print(f"[PP_TIMING][async_output_thread][get_output_done] {time.perf_counter()}")
 
         # Release the device tensors once the copy has completed.

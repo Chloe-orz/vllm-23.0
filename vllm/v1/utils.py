@@ -470,3 +470,51 @@ def compute_iteration_details(scheduler_output: SchedulerOutput) -> IterationDet
         num_generation_requests,
         num_generation_tokens,
     )
+
+
+# ── PP Timing helpers ────────────────────────────────────────────────────
+# Runtime file-based toggle for timing annotations. No dependency on
+# vllm_ascend. Each call site caches for 1s to avoid excessive I/O.
+#   echo 1 > /tmp/vllm_pp_timing_enable   → enable timing
+#   echo 1 > /tmp/vllm_pp_timing_sync     → enable NPU/CUDA sync
+#   rm  /tmp/vllm_pp_timing_*             → fallback to env vars
+import os as _os
+import time as _time
+
+_pp_enable_file = "/tmp/vllm_pp_timing_enable"
+_pp_sync_file = "/tmp/vllm_pp_timing_sync"
+_pp_cache = {"ts": 0.0, "enable": None, "sync": None}
+
+
+def _pp_refresh() -> None:
+    """Refresh cached timing flags (called max once per second)."""
+    now = _time.monotonic()
+    if now - _pp_cache["ts"] < 1.0:
+        return
+    _pp_cache["ts"] = now
+    for key, filepath, env_var in [
+        ("enable", _pp_enable_file, "PP_TIMING_ENABLE"),
+        ("sync", _pp_sync_file, "PP_TIMING_SYNC"),
+    ]:
+        if _os.path.exists(filepath):
+            with open(filepath) as f:
+                _pp_cache[key] = f.read().strip() == "1"
+        else:
+            _pp_cache[key] = _os.environ.get(env_var, "0") == "1"
+
+
+def pp_timing_enabled_v1() -> bool:
+    """True if PP timing output is enabled."""
+    _pp_refresh()
+    return _pp_cache["enable"] or False
+
+
+def pp_timing_sync_v1() -> None:
+    """Synchronize device if PP timing sync is enabled. Safe for both
+    CUDA and NPU (checks device availability)."""
+    _pp_refresh()
+    if _pp_cache["sync"]:
+        if hasattr(torch, "cuda") and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            torch.npu.synchronize()
