@@ -1984,13 +1984,11 @@ def get_kv_cache_configs(
         for layer_name, layer_spec in kv_cache_spec_one_worker.items():
             if layer_name not in merged_kv_cache_specs:
                 merged_kv_cache_specs[layer_name] = layer_spec
-            elif not vllm_config.parallel_config.enable_edge_cloud:
+            else:
                 assert merged_kv_cache_specs[layer_name] == layer_spec, (
                     "The KV cache specs for the same layer are different "
                     "across workers. This is not supported yet."
                 )
-            # When edge-cloud is enabled, allow later workers (Cloud) to
-            # override the earlier virtual spec from Edge.
 
     # Get global KV cache groups. This also handles spec unification for
     # hybrid models when disable_hybrid_kv_cache_manager is enabled.

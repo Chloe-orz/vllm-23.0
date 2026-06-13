@@ -6723,14 +6723,15 @@ class GPUModelRunner(
             max_num_blocks_per_req = cdiv(
                 max_model_len, block_size * get_total_cp_world_size()
             )
+            logger.info(
+                "[EdgeCloud] may_reinit: group=%d block_size=%d "
+                "spec_type=%s max_blocks_before=%d",
+                len(max_num_blocks),
+                block_size,
+                type(kv_cache_group.kv_cache_spec).__name__,
+                max_num_blocks_per_req,
+            )
             if isinstance(kv_cache_group.kv_cache_spec, MambaSpec):
-                # Mamba uses a large block_size (e.g. max_model_len)
-                # because one block can hold the full recurrent state.
-                # However chunked prefill splits the sequence into
-                # multiple chunks, each of which needs its own block.
-                # Use the standard cache block_size to bound the
-                # maximum chunk count so the block table has enough
-                # columns.
                 if self.cache_config.enable_prefix_caching:
                     max_num_blocks_per_req = max_num_blocks_per_req
                 else:
@@ -6740,6 +6741,13 @@ class GPUModelRunner(
                     )
                     max_num_blocks_per_req = max(max_num_blocks_per_req, max_chunks)
                 max_num_blocks_per_req += kv_cache_group.kv_cache_spec.num_speculative_blocks
+                logger.info(
+                    "[EdgeCloud] may_reinit: Mamba group=%d "
+                    "max_blocks_after=%d cache_block_size=%d",
+                    len(max_num_blocks),
+                    max_num_blocks_per_req,
+                    self.cache_config.block_size,
+                )
             max_num_blocks.append(max_num_blocks_per_req)
 
         if (
