@@ -669,28 +669,18 @@ def make_layers(
                 real_iter = iter([])
             next_idx, next_layer = next(real_iter, (None, None))
             modules_list: list[torch.nn.Module] = []
-            real_count = 0
-            skip_count = 0
             for idx in range(num_hidden_layers):
                 if idx == next_idx:
                     modules_list.append(next_layer)
-                    real_count += 1
                     next_idx, next_layer = next(real_iter, (None, None))
                 else:
                     modules_list.append(PPMissingLayer())
-                    skip_count += 1
             if sorted_idx:
                 start_layer = sorted_idx[0]
                 end_layer = sorted_idx[-1] + 1
             else:
                 start_layer = 0
                 end_layer = 0
-            logger.info(
-                "[EdgeCloud] make_layers: total=%d real=%d skip=%d "
-                "real_indices=%s prefix=%s",
-                num_hidden_layers, real_count, skip_count,
-                sorted_idx, prefix,
-            )
             return start_layer, end_layer, torch.nn.ModuleList(modules_list)
         # Fall through: range not set — use standard contiguous PP split
 

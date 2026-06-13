@@ -2122,19 +2122,6 @@ def get_kv_cache_configs(
                     per_block = tensor.size // old_num_blocks
                     tensor.size = per_block * new_num_blocks
                 cfg.num_blocks = new_num_blocks
-                logger.info(
-                    "[EdgeCloud] Scaled KV cache for worker %d: "
-                    "layers=%d/%d actual=%.1f GiB expected=%.1f GiB "
-                    "num_blocks=%d→%d",
-                    i,
-                    worker_layers,
-                    max_local,
-                    worker_total / (1 << 30),
-                    expected / (1 << 30),
-                    old_num_blocks,
-                    new_num_blocks,
-                )
-
     return kv_cache_configs
 
 
