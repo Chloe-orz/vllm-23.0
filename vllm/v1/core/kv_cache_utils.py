@@ -1116,12 +1116,15 @@ def _get_kv_cache_groups_uniform_page_size(
     Returns:
         The generated KVCacheGroupSpecs
     """
-    # Group all layers by kv_cache_spec.
+    # Group all layers by kv_cache_spec type.
     # E.g., 2 full attention layers and 3 sliding window attention layers,
     # -> (full.0, full.1), (sw.0, sw.1, sw.2).
-    same_type_layers: dict[KVCacheSpec, list[str]] = defaultdict(list)
+    # Use the spec's class as the key so that layers whose specs differ
+    # only in non-structural attributes (e.g. different block_size or
+    # padding applied during edge-cloud merge) still land in the same group.
+    same_type_layers: dict[type, list[str]] = defaultdict(list)
     for layer_name, layer_spec in kv_cache_spec.items():
-        same_type_layers[layer_spec].append(layer_name)
+        same_type_layers[type(layer_spec)].append(layer_name)
 
     # Split each group into smaller groups, to make the number of layers in each
     # group identical. Add padding to the last group of each type if necessary.
@@ -2084,44 +2087,6 @@ def get_kv_cache_configs(
         if len(kv_cache_config.kv_cache_groups) > 0:
             _report_kv_cache_config(vllm_config, kv_cache_config)
 
-    # Edge-cloud: when the KV-cache grouping produces a single shared
-    # tensor per worker (e.g. per-layer groups with num_layer_tuples=1),
-    # every worker allocates roughly the same total regardless of how
-    # many layers it holds.  Detect this by comparing the edge worker's
-    # actual total with the layer-proportional expectation derived from
-    # the reference worker (the one with the most local layers).
-    if vllm_config.parallel_config.enable_edge_cloud:
-        max_local = max(len(spec) for spec in kv_cache_specs)
-        if max_local > 0:
-            # Find the reference (cloud) worker total
-            ref_total = 0
-            for cfg, worker_spec in zip(kv_cache_configs, kv_cache_specs):
-                if len(worker_spec) >= max_local:
-                    ref_total = sum(t.size for t in cfg.kv_cache_tensors)
-                    break
-
-            for i, (cfg, worker_spec) in enumerate(
-                zip(kv_cache_configs, kv_cache_specs)
-            ):
-                worker_layers = len(worker_spec)
-                if worker_layers <= 0 or worker_layers >= max_local:
-                    continue
-                worker_total = sum(t.size for t in cfg.kv_cache_tensors)
-                expected = int(ref_total * worker_layers / max_local)
-                # Only intervene when the actual total is grossly
-                # disproportionate (more than 3× the layer-proportional
-                # expectation).  Correct per-layer or per-tuple allocations
-                # fall well within this bound.
-                if worker_total <= expected * 3:
-                    continue
-                old_num_blocks = cfg.num_blocks
-                new_num_blocks = max(
-                    1, int(old_num_blocks * expected / worker_total)
-                )
-                for tensor in cfg.kv_cache_tensors:
-                    per_block = tensor.size // old_num_blocks
-                    tensor.size = per_block * new_num_blocks
-                cfg.num_blocks = new_num_blocks
     return kv_cache_configs
 
 
