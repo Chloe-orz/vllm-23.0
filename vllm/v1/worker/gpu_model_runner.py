@@ -6723,31 +6723,12 @@ class GPUModelRunner(
             max_num_blocks_per_req = cdiv(
                 max_model_len, block_size * get_total_cp_world_size()
             )
-            logger.info(
-                "[EdgeCloud] may_reinit: group=%d block_size=%d "
-                "spec_type=%s max_blocks_before=%d",
-                len(max_num_blocks),
-                block_size,
-                type(kv_cache_group.kv_cache_spec).__name__,
-                max_num_blocks_per_req,
-            )
             if isinstance(kv_cache_group.kv_cache_spec, MambaSpec):
-                if self.cache_config.enable_prefix_caching:
-                    max_num_blocks_per_req = max_num_blocks_per_req
-                else:
-                    max_chunks = cdiv(
-                        max_model_len,
-                        self.cache_config.block_size * get_total_cp_world_size(),
-                    )
-                    max_num_blocks_per_req = max(max_num_blocks_per_req, max_chunks)
-                max_num_blocks_per_req += kv_cache_group.kv_cache_spec.num_speculative_blocks
-                logger.info(
-                    "[EdgeCloud] may_reinit: Mamba group=%d "
-                    "max_blocks_after=%d cache_block_size=%d",
-                    len(max_num_blocks),
-                    max_num_blocks_per_req,
-                    self.cache_config.block_size,
-                )
+                max_num_blocks_per_req = (
+                    max_num_blocks_per_req
+                    if self.cache_config.enable_prefix_caching
+                    else 1
+                ) + kv_cache_group.kv_cache_spec.num_speculative_blocks
             max_num_blocks.append(max_num_blocks_per_req)
 
         if (
