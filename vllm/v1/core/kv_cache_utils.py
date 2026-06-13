@@ -1116,15 +1116,12 @@ def _get_kv_cache_groups_uniform_page_size(
     Returns:
         The generated KVCacheGroupSpecs
     """
-    # Group all layers by kv_cache_spec type.
+    # Group all layers by kv_cache_spec.
     # E.g., 2 full attention layers and 3 sliding window attention layers,
     # -> (full.0, full.1), (sw.0, sw.1, sw.2).
-    # Use the spec's class as the key so that layers whose specs differ
-    # only in non-structural attributes (e.g. different block_size or
-    # padding applied during edge-cloud merge) still land in the same group.
-    same_type_layers: dict[type, list[str]] = defaultdict(list)
+    same_type_layers: dict[KVCacheSpec, list[str]] = defaultdict(list)
     for layer_name, layer_spec in kv_cache_spec.items():
-        same_type_layers[type(layer_spec)].append(layer_name)
+        same_type_layers[layer_spec].append(layer_name)
 
     # Split each group into smaller groups, to make the number of layers in each
     # group identical. Add padding to the last group of each type if necessary.
