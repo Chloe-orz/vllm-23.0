@@ -6724,16 +6724,21 @@ class GPUModelRunner(
                 max_model_len, block_size * get_total_cp_world_size()
             )
             if isinstance(kv_cache_group.kv_cache_spec, MambaSpec):
-                # Without prefix caching Mamba only needs 1 block for
-                # the recurrent state, but chunked prefill (edge-cloud
-                # or otherwise) may produce multiple chunks each needing
-                # its own block.  Keep the full sequence estimate as
-                # the upper bound and let the scheduler trim it at
-                # runtime.
+                # Mamba uses a large block_size (e.g. max_model_len)
+                # because one block can hold the full recurrent state.
+                # However chunked prefill splits the sequence into
+                # multiple chunks, each of which needs its own block.
+                # Use the standard cache block_size to bound the
+                # maximum chunk count so the block table has enough
+                # columns.
                 if self.cache_config.enable_prefix_caching:
                     max_num_blocks_per_req = max_num_blocks_per_req
                 else:
-                    max_num_blocks_per_req = max(max_num_blocks_per_req, 1)
+                    max_chunks = cdiv(
+                        max_model_len,
+                        self.cache_config.block_size * get_total_cp_world_size(),
+                    )
+                    max_num_blocks_per_req = max(max_num_blocks_per_req, max_chunks)
                 max_num_blocks_per_req += kv_cache_group.kv_cache_spec.num_speculative_blocks
             max_num_blocks.append(max_num_blocks_per_req)
 
