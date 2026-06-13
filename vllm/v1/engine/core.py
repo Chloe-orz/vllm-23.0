@@ -277,6 +277,12 @@ class EngineCore:
             scheduler_kv_cache_config = generate_scheduler_kv_cache_config(
                 [kv_cache_configs[max_group_idx]]
             )
+            # Edge workers may have fewer blocks after layer-proportional
+            # scaling. Use the minimum across all workers so the scheduler
+            # doesn't over-commit on the edge side.
+            scheduler_kv_cache_config.num_blocks = min(
+                cfg.num_blocks for cfg in kv_cache_configs
+            )
         else:
             scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
         vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks

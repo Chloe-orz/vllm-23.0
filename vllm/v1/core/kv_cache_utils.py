@@ -2086,6 +2086,42 @@ def get_kv_cache_configs(
         if len(kv_cache_config.kv_cache_groups) > 0:
             _report_kv_cache_config(vllm_config, kv_cache_config)
 
+    # Edge-cloud: scale down workers whose layer count is much smaller
+    # than the merged total.  Without this step a worker with 2 local
+    # layers and one with 62 local layers both allocate the same total
+    # KV-cache memory although the former needs far fewer blocks per
+    # request in practice.
+    if vllm_config.parallel_config.enable_edge_cloud:
+        total_merged = len(merged_kv_cache_specs)
+        max_local = max(len(spec) for spec in kv_cache_specs)
+        for i, (cfg, worker_spec) in enumerate(
+            zip(kv_cache_configs, kv_cache_specs)
+        ):
+            worker_layers = len(worker_spec)
+            # Only scale workers with significantly fewer layers
+            # than the worker holding the most layers (typically cloud).
+            if worker_layers <= 0 or worker_layers >= max_local:
+                continue
+            scale = worker_layers / max_local
+            old_num_blocks = cfg.num_blocks
+            new_num_blocks = max(1, int(old_num_blocks * scale))
+            # Scale each tensor's size keeping the per-block size intact.
+            for tensor in cfg.kv_cache_tensors:
+                per_block = tensor.size // old_num_blocks
+                tensor.size = per_block * new_num_blocks
+            cfg.num_blocks = new_num_blocks
+            logger.info(
+                "[EdgeCloud] Scaled KV cache for worker %d: "
+                "layers=%d/%d scale=%.3f num_blocks=%d→%d total=%.1f GiB",
+                i,
+                worker_layers,
+                max_local,
+                scale,
+                old_num_blocks,
+                new_num_blocks,
+                sum(t.size for t in cfg.kv_cache_tensors) / (1 << 30),
+            )
+
     return kv_cache_configs
 
 
