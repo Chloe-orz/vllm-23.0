@@ -1143,21 +1143,20 @@ def _get_kv_cache_groups_uniform_page_size(
     for layer_name, layer_spec in kv_cache_spec.items():
         same_type_layers[layer_spec].append(layer_name)
 
-    # Split each group into smaller groups, to make the number of layers in each
-    # group identical. Add padding to the last group of each type if necessary.
-    # E.g., (full.0, full.1), (sw.0, sw.1, sw.2)
-    # split to 3 groups with 2 layers each:
-    # (full.0, full.1), (sw.0, sw.2), (sw.1, padding).
-    # FIXME(Chen): At the moment of writing this code (2025-06-02), all
-    # open-source hybrid model follows a n:1 pattern between different attention
-    # types (e.g., Gemma3 5:1 between sw and full, LLaMA4 3:1 between local and
-    # full), so we can use the "1" in the n:1 pattern as the group size, which
-    # is the minimum number of layers among all attention types. Need a better
-    # strategy if we want to support more complex patterns (e.g., 20 full + 30
-    # sw, where the group size should be 10).
-    min_num_layers = min([len(layers) for layers in same_type_layers.values()])
+
+    # Compute min_num_layers from the TOTAL layer count per spec TYPE
+    # (class), not per exact spec match.  In edge-cloud mode the edge
+    # side may own the first / last layers whose specs differ from the
+    # cloud-side layers of the same type (e.g. different state shapes
+    # or block_size).  Using per-type totals prevents a single edge
+    # layer from dragging min_num_layers down to 1 and triggering
+    # per-layer grouping.
+    per_type_counts: dict[type, int] = defaultdict(int)
+    for spec, names in same_type_layers.items():
+        per_type_counts[type(spec)] += len(names)
+    min_num_layers = min(per_type_counts.values())
     group_size = min_num_layers
-    max_num_layers = max([len(layers) for layers in same_type_layers.values()])
+    max_num_layers = max(per_type_counts.values())
     if max_num_layers < min_num_layers * 1.5:
         # If the number of layers is not much larger than the minimum number of
         # layers, use the maximum number of layers as the group size to avoid
@@ -1233,8 +1232,25 @@ def _get_kv_cache_config_deepseek_v4(
     buckets = _bucket_layers_by_page_size(kv_cache_groups)
     total_num_bytes_per_block = sum(ps * len(slots) for ps, slots in buckets.items())
 
-    num_blocks = available_memory // total_num_bytes_per_block
-    num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+    # Pre-bucket each group's layers by page_size (registration order within
+    # bucket). bucketed[g_idx][page_size] = [layer_name, ...].
+    bucketed: list[dict[int, list[str]]] = []
+    for group in kv_cache_groups:
+        assert isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        specs = group.kv_cache_spec.kv_cache_specs
+        b: dict[int, list[str]] = defaultdict(list)
+        for name in group.layer_names:
+            b[specs[name].page_size_bytes].append(name)
+        bucketed.append(b)
+
+    # num_layer_tuples = longest bucket list across all groups. For the
+    # full-MLA group this equals the count of layers in the largest
+    # per-page-size bucket (= get_num_layer_tuples()); for SWA sub-groups
+    # this equals the sub-group size (each has a single page_size).
+    num_layer_tuples = max(len(layers) for b in bucketed for layers in b.values())
+
+    num_blocks_initial = available_memory // (layer_tuple_page_bytes * num_layer_tuples)
+    num_blocks = may_override_num_blocks(vllm_config, num_blocks_initial)
 
     kv_cache_tensors: list[KVCacheTensor] = []
     for ps, slots in buckets.items():
@@ -1996,13 +2012,11 @@ def get_kv_cache_configs(
         for layer_name, layer_spec in kv_cache_spec_one_worker.items():
             if layer_name not in merged_kv_cache_specs:
                 merged_kv_cache_specs[layer_name] = layer_spec
-            elif not vllm_config.parallel_config.enable_edge_cloud:
+            else:
                 assert merged_kv_cache_specs[layer_name] == layer_spec, (
                     "The KV cache specs for the same layer are different "
                     "across workers. This is not supported yet."
                 )
-            # When edge-cloud is enabled, allow later workers (Cloud) to
-            # override the earlier virtual spec from Edge.
 
     # Check if the KV cache specs are registered correctly.
     # This is to prevent that some layers are initialized with unregistered specs.
