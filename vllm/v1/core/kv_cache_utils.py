@@ -1051,6 +1051,44 @@ def is_kv_cache_type_attention_free(kv_cache_spec: dict[str, KVCacheSpec]) -> bo
     return not kv_cache_spec
 
 
+def _log_same_type_layers(
+    same_type_layers: dict,
+) -> None:
+    """Log KV cache grouping structure for edge-cloud diagnosis."""
+    logger.info(
+        "[EdgeCloud] KV grouping: %d buckets, sizes=%s",
+        len(same_type_layers),
+        sorted(len(v) for v in same_type_layers.values()),
+    )
+    for spec, layer_names in same_type_layers.items():
+        names_preview = layer_names[:3]
+        if isinstance(spec, MambaSpec):
+            logger.info(
+                "[EdgeCloud]   MambaSpec bucket: %d layers, names=%s..., "
+                "block_size=%d page_size=%d shapes=%s dtypes=%s "
+                "mamba_type=%s cache_mode=%s spec_blocks=%d",
+                len(layer_names),
+                names_preview,
+                spec.block_size,
+                spec.page_size_bytes,
+                spec.shapes,
+                spec.dtypes,
+                spec.mamba_type,
+                spec.mamba_cache_mode,
+                spec.num_speculative_blocks,
+            )
+        else:
+            logger.info(
+                "[EdgeCloud]   %s bucket: %d layers, names=%s..., "
+                "block_size=%d page_size=%d",
+                type(spec).__name__,
+                len(layer_names),
+                names_preview,
+                getattr(spec, "block_size", 0),
+                getattr(spec, "page_size_bytes", 0),
+            )
+
+
 def _get_kv_cache_groups_uniform_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec]:
@@ -1122,6 +1160,9 @@ def _get_kv_cache_groups_uniform_page_size(
     same_type_layers: dict[KVCacheSpec, list[str]] = defaultdict(list)
     for layer_name, layer_spec in kv_cache_spec.items():
         same_type_layers[layer_spec].append(layer_name)
+
+    # Log grouping structure for edge-cloud diagnosis
+    _log_same_type_layers(same_type_layers)
 
     # Split each group into smaller groups, to make the number of layers in each
     # group identical. Add padding to the last group of each type if necessary.
@@ -1212,8 +1253,18 @@ def _get_kv_cache_config_deepseek_v4(
     # this equals the sub-group size (each has a single page_size).
     num_layer_tuples = max(len(layers) for b in bucketed for layers in b.values())
 
-    num_blocks = available_memory // (layer_tuple_page_bytes * num_layer_tuples)
-    num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+    num_blocks_initial = available_memory // (layer_tuple_page_bytes * num_layer_tuples)
+    logger.info(
+        "[EdgeCloud] DeepSeekV4: num_layer_tuples=%d page_sizes=%s "
+        "layer_tuple_page_bytes=%d available_memory=%.1f GiB "
+        "num_blocks_initial=%d",
+        num_layer_tuples,
+        page_sizes,
+        layer_tuple_page_bytes,
+        available_memory / (1 << 30),
+        num_blocks_initial,
+    )
+    num_blocks = may_override_num_blocks(vllm_config, num_blocks_initial)
 
     kv_cache_tensors: list[KVCacheTensor] = []
     for tuple_idx in range(num_layer_tuples):
@@ -2071,6 +2122,11 @@ def get_kv_cache_configs(
     # allocating unused memory.
     min_num_blocks = min(
         kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
+    )
+    logger.info(
+        "[EdgeCloud] min_num_blocks: initial=%s min=%d",
+        [cfg.num_blocks for cfg in kv_cache_configs],
+        min_num_blocks,
     )
     for kv_cache_config in kv_cache_configs:
         num_blocks_old = kv_cache_config.num_blocks
