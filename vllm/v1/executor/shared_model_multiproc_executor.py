@@ -49,6 +49,7 @@ from vllm.distributed.utils import (
 from vllm.envs import enable_envs_cache
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.sequence import IntermediateTensors
 from vllm.tracing import instrument, maybe_init_worker_tracer
 from vllm.utils import numa_utils
 from vllm.utils.network_utils import (
@@ -70,6 +71,24 @@ from vllm.v1.outputs import AsyncModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
+
+
+# Duck-typed detection of :class:`_BatchedExecuteMarker` (defined in
+# vllm_ascend) so the upstream busy_loop does not need to import
+# vllm_ascend at module load time. The marker carries a ``bundle``
+# attribute (set in
+# :meth:`SharedModelEdgeWorker.execute_model_batched_pre`) and a
+# ``worker`` attribute (the
+# :class:`SharedModelEdgeWorker` that produced it). It is also an
+# :class:`AsyncModelRunnerOutput` (so the existing
+# ``_pending_deferred`` machinery picks it up), but the
+# ``getattr(..., "bundle", None) is not None`` test distinguishes
+# batched markers from the legacy
+# :class:`DeferredExecutePostprocess` returned by the original
+# ``execute_model`` path.
+def _is_batched_execute_marker(obj: Any) -> bool:
+    return (getattr(obj, "bundle", None) is not None
+            and getattr(obj, "worker", None) is not None)
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +250,18 @@ class SharedModelWorkerProc:
         # by insertion (Python 3.7+) so the round's tail
         # processing happens in dispatch order.
         self._pending_deferred: dict[int, AsyncModelRunnerOutput] = {}
+
+        # Batched-compute round state (Step 11). The dispatch
+        # phase populates ``_round_bundles[k]`` (one bundle per
+        # dp_rank carrying the per-dp_rank preprocess state from
+        # ``NPUModelRunner.execute_model_pre``); the drain phase
+        # populates ``_round_intermediates[k]`` with the
+        # ``IntermediateTensors`` received back from the cloud.
+        # Both are cleared at end-of-round. The types are loaded
+        # lazily inside the methods that touch them to avoid an
+        # import cycle with vllm_ascend at module import time.
+        self._round_bundles: dict[int, Any] = {}
+        self._round_intermediates: dict[int, IntermediateTensors] = {}
 
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
@@ -428,7 +459,122 @@ class SharedModelWorkerProc:
                 if self._pending_deferred:
                     pending, self._pending_deferred = (
                         self._pending_deferred, {})
-                    for dp_rank, deferred in pending.items():
+
+                    # Step 11 batched-compute path: when the
+                    # ``_dispatch`` step accumulated
+                    # :class:`_BatchedExecuteMarker`s, drive the
+                    # batched round via the marker's class and
+                    # member functions. Phase A (1× batched head +
+                    # per-dp_rank PP isend + recv closure) runs
+                    # first; Phase B/C (recv + 1× batched tail +
+                    # per-dp_rank post_batched + handle_output)
+                    # runs at the end. The marker is the single
+                    # owner of all the batched logic — the
+                    # busy_loop only routes the round state dicts
+                    # and the response-MQ callback.
+                    #
+                    # Mixed-SYNC partitioning: the batched path
+                    # only operates on the dp_ranks that produced
+                    # batched markers in this round. Any
+                    # non-batched entries in ``pending`` (legacy
+                    # ``DeferredExecutePostprocess`` from the
+                    # original ``execute_model`` path, used by
+                    # non-batched callers) are routed through the
+                    # legacy ``deferred()`` loop below — that path
+                    # runs the original head + send / tail recv +
+                    # tail forward end-to-end and is fully
+                    # independent of the batched path. This way
+                    # the batched head / tail / post only see
+                    # the dp_ranks that actually want to be
+                    # merged.
+                    batched_dp_ranks_list = sorted(
+                        k for k, d in pending.items()
+                        if _is_batched_execute_marker(d))
+                    batched_pending: dict[int, Any] = {
+                        k: pending[k] for k in batched_dp_ranks_list
+                    }
+                    legacy_pending: dict[int, Any] = {
+                        k: d for k, d in pending.items()
+                        if k not in batched_pending
+                    }
+                    if batched_pending:
+                        # Phase A — batched head (1× per round).
+                        # ``run_batched_head`` and ``drain_batched_round``
+                        # are class functions on the vllm_ascend
+                        # ``_BatchedExecuteMarker``; reach them via
+                        # ``type(marker)`` to avoid an upstream
+                        # import of vllm_ascend.
+                        marker_cls = type(batched_pending[
+                            batched_dp_ranks_list[0]])
+                        try:
+                            marker_cls.run_batched_head(
+                                batched_dp_ranks_list,
+                                self._round_bundles)
+                        except Exception as e:
+                            if hasattr(e, "add_note"):
+                                e.add_note(traceback.format_exc())
+                            logger.exception(
+                                "SharedModelWorkerProc hit an exception "
+                                "running batched head.")
+                            for k in batched_dp_ranks_list:
+                                self.handle_output(k, e)
+                            self._round_bundles.clear()
+                            self._round_intermediates.clear()
+                            marker_cls._per_dp_hidden = None
+                            dispatched = True
+                            continue
+
+                        # Phase A — per-dp_rank PP isend + recv
+                        # closure. Each batched marker installs its
+                        # own recv closure into ``batched_pending``.
+                        drive_failures: dict[int, Exception] = {}
+                        for dp_rank, marker in batched_pending.items():
+                            try:
+                                marker.drive_batched_round(
+                                    batched_pending)
+                            except Exception as e:
+                                if hasattr(e, "add_note"):
+                                    e.add_note(traceback.format_exc())
+                                logger.exception(
+                                    "SharedModelWorkerProc hit an "
+                                    "exception running per-dp_rank "
+                                    "PP isend / recv closure on "
+                                    "dp_rank=%d.", dp_rank)
+                                drive_failures[dp_rank] = e
+
+                        # Surface any per-dp_rank Phase A failure as
+                        # a FAILURE response on its MQ.
+                        for k, e in drive_failures.items():
+                            self.handle_output(k, e)
+                            self._round_bundles.pop(k, None)
+                            batched_pending.pop(k, None)
+
+                        # Phase B/C — recv + batched tail + per-dp_rank
+                        # post_batched + handle_output. The marker
+                        # class function drives this end-to-end,
+                        # operating only on ``batched_pending``.
+                        marker_cls.drain_batched_round(
+                            self._round_bundles,
+                            self._round_intermediates,
+                            batched_pending,
+                            on_dp_rank_output=self.handle_output,
+                        )
+                        # ``drain_batched_round`` has cleared
+                        # ``_round_bundles`` / ``_round_intermediates``
+                        # at end-of-round; the legacy entries have
+                        # not been touched and are still in
+                        # ``legacy_pending`` below.
+
+                    # Legacy / non-batched path: each
+                    # ``deferred`` is either a legacy
+                    # ``DeferredExecutePostprocess`` (its
+                    # ``__call__`` runs the original head + send /
+                    # tail recv + tail forward end-to-end) or a
+                    # raw output (passed through). The
+                    # ``batched_markers`` partition above has
+                    # already removed any batched entries from
+                    # this loop.
+                    for dp_rank, deferred in legacy_pending.items():
                         try:
                             if callable(deferred):
                                 output = deferred()
@@ -467,11 +613,26 @@ class SharedModelWorkerProc:
         """
         virtual_worker = self.worker[dp_rank]
         try:
-            if isinstance(method, str):
+            # Step 11 batched path: route ``execute_model`` RPCs to
+            # the new ``execute_model_batched_pre`` interface, which
+            # only does per-dp_rank preprocess and returns a
+            # ``_BatchedExecuteMarker`` (or an early-return
+            # ``ModelRunnerOutput`` / ``None`` for no-work cases).
+            # The original head + send path of ``execute_model`` is
+            # not taken; the busy_loop drives the batched head / tail
+            # / per-dp_rank post on the leader runner.
+            if method == "execute_model" and hasattr(
+                    virtual_worker, "execute_model_batched_pre"):
+                output = virtual_worker.execute_model_batched_pre(
+                    args[0] if args else None)
+            elif isinstance(method, str):
                 func = getattr(virtual_worker, method)
+                output = func(*args, **kwargs)
             elif isinstance(method, bytes):
                 func = partial(cloudpickle.loads(method), virtual_worker)
-            output = func(*args, **kwargs)
+                output = func(*args, **kwargs)
+            else:
+                output = None
         except Exception as e:
             if hasattr(e, "add_note"):
                 e.add_note(traceback.format_exc())
@@ -483,21 +644,24 @@ class SharedModelWorkerProc:
             return
 
         if output_rank is None or self.rank == output_rank:
-            # Batch postprocess: any ``execute_model`` result
-            # that comes back as an :class:`AsyncModelRunnerOutput`
-            # — including the ``DeferredExecutePostprocess``
-            # marker (which is also callable, for direct use) —
-            # is held back. The ``worker_busy_loop`` invokes
-            # ``get_output()`` on each marker at the end of the
-            # current round (via :meth:`handle_output` →
-            # :meth:`enqueue_output`), which runs the deferred
-            # tail recv + tail forward. The marker's
-            # ``get_output()`` does one more type check on the
-            # postprocess return value (so a nested async
-            # output is unwrapped), while the direct-call path
-            # (``__call__``) skips that check.
+            # Step 11 batched-compute path: when ``execute_model`` is
+            # dispatched, the worker returns a marker that carries a
+            # per-dp_rank bundle (in ``output.bundle``). Duck-typed
+            # check — no vllm_ascend import needed in this upstream
+            # module. The marker is stored in ``_pending_deferred``
+            # like any other async marker, and its ``__call__`` (run
+            # by the round barrier in :meth:`worker_busy_loop`)
+            # drives the batched head / recv / tail / per-dp_rank
+            # post end-to-end.
             if (method == "execute_model"
-                    and isinstance(output, AsyncModelRunnerOutput)):
+                    and getattr(output, "bundle", None) is not None):
+                self._round_bundles[dp_rank] = output.bundle
+                self._pending_deferred[dp_rank] = output
+            elif (method == "execute_model"
+                  and isinstance(output, AsyncModelRunnerOutput)):
+                # Legacy ``DeferredExecutePostprocess`` from the
+                # original ``execute_model`` path (kept around for
+                # any non-batched callers).
                 self._pending_deferred[dp_rank] = output
             else:
                 self.handle_output(dp_rank, output)
