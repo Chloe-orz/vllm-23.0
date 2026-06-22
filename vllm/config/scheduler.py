@@ -153,6 +153,19 @@ class SchedulerConfig:
     A smaller value (1) makes streaming smoother by sending each token immediately,
     while a larger value (e.g., 10) reduces host overhead and may increase throughput
     by batching multiple tokens before sending."""
+    
+    
+    pd_scheduling_policy: Literal["prefill_first", "decode_first", "strict_alternation"] = "prefill_first"
+    """The scheduling policy to use when PD separation is enabled:
+    - "prefill_first": prioritize prefill requests over decode requests.
+    - "decode_first": prioritize decode requests over prefill requests.
+    - "strict_alternation": strictly alternate between prefill and decode steps."""
+
+    pd_prefill_inflight_limit: int = Field(default=1, ge=1)
+    """Maximum number of prefill head-segment (PREFILL_FIRST) batches that
+    can be in flight at the same time.  When the limit is reached the
+    scheduler will fall back to decode or emit an empty batch until a
+    corresponding PREFILL_LAST batch completes."""
 
     @staticmethod
     def default_factory(**kwargs):

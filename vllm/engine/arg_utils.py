@@ -571,6 +571,7 @@ class EngineArgs:
     disable_chunked_mm_input: bool = SchedulerConfig.disable_chunked_mm_input
 
     scheduler_reserve_full_isl: bool = SchedulerConfig.scheduler_reserve_full_isl
+    pd_scheduling_policy: str = SchedulerConfig.pd_scheduling_policy
 
     disable_hybrid_kv_cache_manager: bool | None = (
         SchedulerConfig.disable_hybrid_kv_cache_manager
@@ -1349,6 +1350,10 @@ class EngineArgs:
         scheduler_group.add_argument(
             "--stream-interval", **scheduler_kwargs["stream_interval"]
         )
+        
+        scheduler_group.add_argument(
+            "--pd-scheduling-policy", **scheduler_kwargs["pd_scheduling_policy"]
+        )
 
         # Compilation arguments
         compilation_kwargs = get_kwargs(CompilationConfig)
@@ -1959,6 +1964,7 @@ class EngineArgs:
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
+            pd_scheduling_policy=self.pd_scheduling_policy,
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:
