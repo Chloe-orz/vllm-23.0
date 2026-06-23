@@ -1088,11 +1088,17 @@ class InputBatch:
 
     @property
     def all_greedy(self) -> bool:
-        return len(self.random_reqs) == 0
+        num_reqs = self.num_reqs
+        if num_reqs == 0:
+            return True
+        return (self.temperature_cpu[:num_reqs] < 1e-5).all()
 
     @property
     def all_random(self) -> bool:
-        return len(self.greedy_reqs) == 0
+        num_reqs = self.num_reqs
+        if num_reqs == 0:
+            return True
+        return (self.temperature_cpu[:num_reqs] >= 1e-5).all()
 
     @property
     def no_top_p(self) -> bool:
