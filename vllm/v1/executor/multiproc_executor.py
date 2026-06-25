@@ -526,6 +526,16 @@ class MultiprocExecutor(Executor):
         self.collective_rpc("check_health", timeout=10)
         return
 
+    @cached_property
+    def max_concurrent_batches(self) -> int:
+        # PP requires PP-size concurrent batches to fill the pipeline.
+        pp_size = self.parallel_config.pipeline_parallel_size
+        # [ascend insert] 边云协同模式需要更大的 batch queue 来填满
+        # Head-Middle-Tail 多阶段流水线。
+        if getattr(self.parallel_config, "enable_edge_cloud", False):
+            return 4
+        return 2 if pp_size <= 1 and self.scheduler_config.async_scheduling else pp_size
+
     def _get_output_rank(self) -> int:
         # Only returns ModelRunnerOutput from TP rank=0 and PP rank=-1
         # (the first TP worker of the last PP stage).
