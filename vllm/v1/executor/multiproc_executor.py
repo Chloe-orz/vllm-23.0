@@ -1057,12 +1057,10 @@ class WorkerProc:
     def worker_busy_loop(self):
         """Main busy loop for Multiprocessing Workers"""
         assert self.rpc_broadcast_mq is not None
-        run_rpc_broadcast_mq = True
-        run_local_rpc_broadcast_mq = False
         while True:
             # Poll local MQ for pp scheduler output from passive
             # EngineCore (non-blocking).
-            if self.local_rpc_broadcast_mq is not None and run_local_rpc_broadcast_mq:
+            if self.local_rpc_broadcast_mq is not None:
                 try:
                     method, args, kwargs, output_rank = (
                         self.local_rpc_broadcast_mq.dequeue(timeout=0)
@@ -1084,8 +1082,6 @@ class WorkerProc:
                                 "PP worker execute_model failed."
                             )
                             if output_rank is None or self.rank == output_rank:
-                                run_rpc_broadcast_mq = True
-                                run_local_rpc_broadcast_mq = False
                                 self.handle_output(e)
                             continue
                         # For layer slicing: non-last slices produce
@@ -1095,15 +1091,10 @@ class WorkerProc:
                         if slice_info is not None and not slice_info.is_last_slice:
                             continue
                         if output_rank is None or self.rank == output_rank:
-                            run_rpc_broadcast_mq = True
-                            run_local_rpc_broadcast_mq = False
                             self.handle_output(output)
                         continue
                 except Exception:
                     pass  # TimeoutError or empty queue
-
-            if not run_rpc_broadcast_mq:
-                continue
 
             # Poll cross-node MQ with short timeout so we can
             # periodically check the local MQ.
@@ -1122,9 +1113,8 @@ class WorkerProc:
                 and isinstance(method, str)
                 and method == "execute_model"
             ):
-                run_rpc_broadcast_mq = False
-                run_local_rpc_broadcast_mq = True
                 continue
+
             try:
                 if isinstance(method, str):
                     func = getattr(self.worker, method)
