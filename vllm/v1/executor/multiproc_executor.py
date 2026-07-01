@@ -1063,7 +1063,7 @@ class WorkerProc:
             if self.local_rpc_broadcast_mq is not None:
                 try:
                     method, args, kwargs, output_rank = (
-                        self.local_rpc_broadcast_mq.dequeue(timeout=0)
+                        self.local_rpc_broadcast_mq.dequeue(timeout=0.1)
                     )
                     if isinstance(method, bytes) and method == b"pp_scheduler_output":
                         scheduler_output = args[0]
