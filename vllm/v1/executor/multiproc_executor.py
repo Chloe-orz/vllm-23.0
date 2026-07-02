@@ -1114,8 +1114,26 @@ class WorkerProc:
                         # follows the normal flow.
                         if slice_info is not None and not slice_info.is_last_slice:
                             continue
-                        if output_rank is None or self.rank == output_rank:
-                            self.handle_output(output)
+                        ack = {
+                            "__pp_scheduler_ack__": True,
+                            "batch_type": scheduler_output.batch_type,
+                            "head_token": getattr(scheduler_output, "head_token", None),
+                            "hidden_channel": getattr(scheduler_output, "hidden_channel", None),
+                        }
+                        should_send_ack = (
+                            (output_rank is None and self.local_rank == 0)
+                            or self.rank == output_rank
+                        )
+                        if should_send_ack:
+                            response_mq = (
+                                self.local_worker_response_mq
+                                if self.local_worker_response_mq is not None
+                                else self.worker_response_mq
+                            )
+                            if response_mq is not None:
+                                response_mq.enqueue(
+                                    (WorkerProc.ResponseStatus.SUCCESS, ack)
+                                )
                         continue
                 except Exception:
                     pass  # TimeoutError or empty queue
