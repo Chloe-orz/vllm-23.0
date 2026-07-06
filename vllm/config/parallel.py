@@ -214,7 +214,7 @@ class ParallelConfig:
     """
     is_edge_node: bool = False
     """Whether this engine process belongs to the edge node."""
-    is_shared_model_edge: bool = Field(init=False)
+    is_shared_model_edge: bool = False
     """Whether the edge side of an edge-cloud configuration is in
     the shared-model topology.
 
