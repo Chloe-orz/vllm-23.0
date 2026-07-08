@@ -1096,12 +1096,25 @@ class WorkerProc:
             # EngineCore (non-blocking).
             if self.local_rpc_broadcast_mq is not None:
                 try:
+                    _t0 = time.monotonic()
                     method, args, kwargs, output_rank = (
                         self.local_rpc_broadcast_mq.dequeue(timeout=0.1)
                     )
+                    _dt_deq = (time.monotonic() - _t0) * 1000
                     if isinstance(method, bytes) and method == b"pp_scheduler_output":
                         scheduler_output = args[0]
                         slice_info = args[1] if len(args) > 1 else None
+                        _bt = (
+                            scheduler_output.batch_type.value
+                            if scheduler_output.batch_type is not None else "N/A"
+                        )
+                        if _dt_deq > 1.0:
+                            logger.info(
+                                "[CLOUD-WORKER-DEQUEUE] dequeue took %.3f ms "
+                                "batch_type=%s",
+                                _dt_deq,
+                                _bt,
+                            )
                         # Execute model with the received SchedulerOutput.
                         try:
                             func = getattr(self.worker, "execute_model")
