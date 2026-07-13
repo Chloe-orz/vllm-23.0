@@ -1222,8 +1222,6 @@ def _replace_active_groups(
 
 _TP: GroupCoordinator | None = None
 _IS_EDGE_DEVICE: bool | None = None
-_EDGE_CLOUD_HEAD_K: int = 0
-_EDGE_CLOUD_TAIL_K: int = 0
 
 
 def is_edge_device() -> bool:
@@ -1240,28 +1238,6 @@ def is_edge_cloud_pp_mode() -> bool:
 
 def is_edge_cloud_first_stage(intermediate_tensors) -> bool:
     return is_edge_cloud_pp_mode() and intermediate_tensors is None
-
-
-def set_edge_cloud_layer_range(head_k: int, tail_k: int) -> None:
-    """Store the edge-cloud head / tail layer counts for use by
-    :func:`make_layers` during model initialisation.
-
-    Must be called **before** ``initialize_model()`` / ``get_model()``
-    so that ``make_layers()`` can create the correct mix of real layers
-    and ``PPMissingLayer`` placeholders directly on the target device.
-    """
-    global _EDGE_CLOUD_HEAD_K, _EDGE_CLOUD_TAIL_K
-    _EDGE_CLOUD_HEAD_K = head_k
-    _EDGE_CLOUD_TAIL_K = tail_k
-
-
-def get_edge_cloud_layer_range() -> tuple[int, int] | None:
-    """Return ``(head_k, tail_k)`` if edge-cloud mode is active,
-    or ``None`` otherwise.
-    """
-    if _IS_EDGE_DEVICE is None:
-        return None
-    return _EDGE_CLOUD_HEAD_K, _EDGE_CLOUD_TAIL_K
 
 
 def get_tp_group() -> GroupCoordinator:
