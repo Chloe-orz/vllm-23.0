@@ -262,6 +262,16 @@ class MultiprocExecutor(Executor):
     def _post_init_executor(self) -> None:
         pass
 
+    @cached_property
+    def max_concurrent_batches(self) -> int:
+        # PP requires PP-size concurrent batches to fill the pipeline.
+        pp_size = self.parallel_config.pipeline_parallel_size
+        # [ascend insert] edge-cloud mode needs larger batch queue
+        # to fill Head-Middle-Tail multi-stage pipeline.
+        if getattr(self.parallel_config, "enable_edge_cloud", False):
+            return 4
+        return 2 if pp_size <= 1 and self.scheduler_config.async_scheduling else pp_size
+
     def _is_driver_worker(self, rank: int) -> bool:
         return rank % self.parallel_config.tensor_parallel_size == 0
 

@@ -96,6 +96,15 @@ class RayDistributedExecutor(Executor):
 
         self.scheduler_output: SchedulerOutput | None = None
 
+    @property
+    def max_concurrent_batches(self) -> int:
+        # PP requires PP-size concurrent batches to fill the pipeline.
+        pp_size = self.parallel_config.pipeline_parallel_size
+        # [ascend insert] edge-cloud mode needs larger batch queue.
+        if getattr(self.parallel_config, "enable_edge_cloud", False):
+            return 4
+        return 2 if pp_size <= 1 and self.scheduler_config.async_scheduling else pp_size
+
     def shutdown(self) -> None:
         if logger:
             # Somehow logger can be None here.

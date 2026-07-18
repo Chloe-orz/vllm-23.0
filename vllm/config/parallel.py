@@ -197,6 +197,41 @@ class ParallelConfig:
     enable_elastic_ep: bool = False
     """Enable elastic expert parallelism with stateless NCCL groups for DP/EP."""
 
+    enable_edge_cloud: bool = False
+    """Enable edge-cloud collaboration mode for Ascend NPU."""
+    edge_npu_count: int = 0
+    """Total number of edge NPUs across all DP ranks (i.e. the
+    sum over all DP instances) when edge-cloud mode is enabled.
+
+    In :meth:`__post_init__` this value is divided by
+    ``data_parallel_size`` so the rest of the config (TP groups, PP
+    groups, ``local_world_size``, etc.) sees the per-DP-instance
+    count, matching the convention used elsewhere in vLLM. Use
+    :attr:`edge_npu_count_per_dp` to read the per-DP-instance value
+    after init.
+    """
+    cloud_npu_count: int = 0
+    """Total number of cloud NPUs across all DP ranks (i.e. the sum
+    over all DP instances) when edge-cloud mode is enabled.
+
+    Divided by ``data_parallel_size`` in :meth:`__post_init__`; the
+    per-DP-instance value is available as
+    :attr:`cloud_npu_count_per_dp`.
+    """
+    is_edge_node: bool = False
+    """Whether this engine process belongs to the edge node."""
+    is_shared_model_edge: bool = False
+    """Whether the edge side of an edge-cloud configuration is in
+    the shared-model topology.
+
+    Set in :meth:`__post_init__` to ``True`` iff
+    :attr:`edge_npu_count` was 1 before being divided by
+    ``data_parallel_size``. A shared-model edge has a single
+    distributed rank hosting ``data_parallel_size`` virtual workers
+    that all share one ``nn.Module`` replica; the cloud side keeps
+    the original per-DP-instance layout.
+    """
+
     enable_dbo: bool = False
     """Enable dual batch overlap for the model executor."""
     ubatch_size: int = Field(default=0, ge=0)
@@ -500,7 +535,17 @@ class ParallelConfig:
     @property
     def world_size_across_dp(self) -> int:
         """world_size_across_dp is TPxPPxDP, it is the size of the world
-        including data parallelism."""
+        including data parallelism.
+
+        For the shared-model edge-cloud topology
+        (:attr:`is_shared_model_edge`) the edge is a single shared
+        distributed rank rather than one rank per DP instance, so
+        the total world size is
+        ``1 + data_parallel_size * cloud_npu_count`` instead of the
+        usual ``(1 + cloud_npu_count) * data_parallel_size``.
+        """
+        if self.is_shared_model_edge:
+            return 1 + self.data_parallel_size * self.cloud_npu_count
         return self.world_size * self.data_parallel_size
 
     @property
@@ -666,6 +711,8 @@ class ParallelConfig:
 
     @property
     def local_world_size(self) -> int:
+        if self.enable_edge_cloud:
+            return self.edge_npu_count if self.is_edge_node else self.cloud_npu_count
         return self.world_size // self.nnodes_within_dp
 
     @staticmethod
@@ -778,6 +825,66 @@ class ParallelConfig:
             * self.tensor_parallel_size
             * self.prefill_context_parallel_size
         )
+
+        if self.enable_edge_cloud:
+            if self.edge_npu_count <= 0 or self.cloud_npu_count <= 0:
+                raise ValueError(
+                    "edge_npu_count and cloud_npu_count must be positive "
+                    "when enable_edge_cloud is True."
+                )
+            if self.edge_npu_count >= self.cloud_npu_count:
+                raise ValueError(
+                    f"edge_npu_count ({self.edge_npu_count}) must be less than "
+                    f"cloud_npu_count ({self.cloud_npu_count}) for edge-cloud "
+                    "collaboration."
+                )
+            if self.pipeline_parallel_size != 1 or self.tensor_parallel_size != 1:
+                raise ValueError(
+                    "pipeline_parallel_size and tensor_parallel_size must be 1 "
+                    "in edge-cloud collaboration mode."
+                )
+            if self.cloud_npu_count % self.data_parallel_size != 0:
+                raise ValueError(
+                    f"cloud_npu_count ({self.cloud_npu_count}) must be a "
+                    f"multiple of data_parallel_size "
+                    f"({self.data_parallel_size}) so that each dp "
+                    f"instance gets the same number of cloud ranks.")
+            if (
+                self.edge_npu_count % self.data_parallel_size != 0
+                and self.edge_npu_count != 1
+            ):
+                raise ValueError(
+                    f"edge_npu_count ({self.edge_npu_count}) must either be "
+                    f"a multiple of data_parallel_size "
+                    f"({self.data_parallel_size}) or equal to 1 (the "
+                    f"shared-model topology, in which a single "
+                    f"distributed rank hosts data_parallel_size "
+                    f"virtual workers).")
+            self.is_shared_model_edge = (
+                self.edge_npu_count == 1
+                and self.data_parallel_size > 1
+            )
+            if self.is_shared_model_edge:
+                self.cloud_npu_count = (
+                    self.cloud_npu_count // self.data_parallel_size
+                )
+            else:
+                self.edge_npu_count = (
+                    self.edge_npu_count // self.data_parallel_size
+                )
+                self.cloud_npu_count = (
+                    self.cloud_npu_count // self.data_parallel_size
+                )
+
+            # ``world_size`` is per-dp-instance in edge-cloud mode
+            # and does not cross dp rank boundaries. The formula
+            # applies to both topologies (the shared-model case
+            # counts the single edge rank as ``1``).
+            self.world_size = self.edge_npu_count + self.cloud_npu_count
+            self.pipeline_parallel_size = 2
+            self.tensor_parallel_size = (
+                self.edge_npu_count if self.is_edge_node else self.cloud_npu_count
+            )
 
         if self.distributed_executor_backend == "external_launcher":
             logger.info("Using external launcher for distributed inference.")
