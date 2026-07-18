@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import enum
 from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING
@@ -25,6 +26,47 @@ else:
     PoolingParams = object
     SamplingParams = object
     Request = object
+
+class HiddenChannelType(enum.Enum):
+    """Data-plane hidden tensor channel for edge-cloud PD separation."""
+    PREFILL_1 = "prefill_1"
+    PREFILL_2 = "prefill_2"
+    DECODE = "decode"
+
+
+class BatchType(enum.Enum):
+    """Composition of a single SchedulerOutput batch.
+
+    Tagged by the producing scheduler so that the non-leader PP rank's
+    PassiveScheduler can route the batch without re-inspecting per-request
+    state.
+
+    - PD_MIX:        prefill and decode requests in the same batch (default
+                     for the legacy mixed scheduler)
+    - PURE_PREFILL:  every scheduled request is in its prefill phase
+                     (legacy PP / PDmix mode)
+    - PURE_DECODE:   every scheduled request is in its decode phase
+                     (legacy PP / PDmix mode)
+    - EMPTY:         no tokens scheduled this step (sync-only batch, e.g.
+                     propagating finished_req_ids)
+    - PREFILL_FIRST: edge-cloud PD separation — prefill batch executing the
+                     edge head segment (segment_a)
+    - PREFILL_LAST:  edge-cloud PD separation — prefill batch executing the
+                     edge tail segment (segment_e + sampler)
+    - DECODE_FIRST:  edge-cloud PD separation — decode batch executing the
+                     edge head segment (Phase 4)
+    - DECODE_LAST:   edge-cloud PD separation — decode batch executing the
+                     edge tail segment (Phase 4)
+    """
+    PD_MIX = "pd_mix"
+    PURE_PREFILL = "pure_prefill"
+    PURE_DECODE = "pure_decode"
+    EMPTY = "empty"
+
+    PREFILL_FIRST = "prefill_first"
+    PREFILL_LAST = "prefill_last"
+    DECODE_FIRST = "decode_first"
+    DECODE_LAST = "decode_last"
 
 
 @dataclass
@@ -120,7 +162,10 @@ class CachedRequestData:
     new_token_ids: list[list[int]]
     # For requests not scheduled in the last step, propagate the token ids to the
     # connector. Won't contain requests that were scheduled in the prior step.
-    all_token_ids: dict[str, list[int]]
+    # Values are np.ndarray(int32): pickle protocol 5 zerocopies them via
+    # PickleBuffer, avoiding the per-int PyLong alloc that dominated the worker
+    # dequeue (pickle.loads) cost under bench load.
+    all_token_ids: dict[str, "npt.NDArray[np.int32]"]
     new_block_ids: list[tuple[list[int], ...] | None]
     num_computed_tokens: list[int]
     num_output_tokens: list[int]
@@ -239,6 +284,32 @@ class SchedulerOutput:
     # The worker zeros the corresponding GPU memory before the blocks are used,
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
+    
+    # Composition of the scheduled batch. Producers (schedulers) tag this
+    # field so downstream consumers — notably the non-leader PP rank's
+    # PassiveScheduler — can route the batch without re-inspecting per-request
+    # state. The base PD-mix Scheduler leaves it at the default (PD_MIX);
+    # PDSeparatedScheduler overrides it to PURE_PREFILL / PURE_DECODE / EMPTY.
+    batch_type: BatchType = BatchType.PD_MIX
+
+    # Head-token for edge-cloud PD-separation pairing.
+    # EngineCore assigns a UUID on PF/DF, cloud PassiveEngineCore echoes it
+    # back on PL/DL via POST_OUT, and the edge worker embeds it into the
+    # intermediate tensors payload so control-plane / data-plane alignment
+    # can be verified before running the tail segment.
+    head_token: str | None = None
+
+    # Data-plane hidden tensor channel for edge-cloud PD separation. Prefill
+    # head/tail batches use one of two prefill channels; decode uses the
+    # dedicated decode channel. The cloud echoes this field back unchanged.
+    hidden_channel: HiddenChannelType | None = None
+
+    # Edge-side hint to cloud-side PassiveScheduler about whether layer slicing
+    # is worthwhile for this prefill batch. True = decode is (or will soon be)
+    # active on the cloud side, so interleaving slices with decode batches is
+    # profitable. False = cold-start / pure-prefill phase, skip slicing to avoid
+    # throttle and multi-dispatch overhead.
+    cloud_suggest_slicing: bool | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
@@ -252,6 +323,7 @@ class SchedulerOutput:
             num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
+            batch_type=BatchType.EMPTY,
         )
 
 
