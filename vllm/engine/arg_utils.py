@@ -491,6 +491,11 @@ class EngineArgs:
     disable_nccl_for_dp_synchronization: bool | None = (
         ParallelConfig.disable_nccl_for_dp_synchronization
     )
+    # Edge-cloud collaborative inference configuration.
+    enable_edge_cloud: bool = ParallelConfig.enable_edge_cloud
+    edge_npu_count: int = ParallelConfig.edge_npu_count
+    cloud_npu_count: int = ParallelConfig.cloud_npu_count
+    is_edge_node: bool = ParallelConfig.is_edge_node
     eplb_config: EPLBConfig = get_field(ParallelConfig, "eplb_config")
     enable_eplb: bool = ParallelConfig.enable_eplb
     expert_placement_strategy: ExpertPlacementStrategy = (
@@ -1086,6 +1091,23 @@ class EngineArgs:
         parallel_group.add_argument(
             "--dbo-prefill-token-threshold",
             **parallel_kwargs["dbo_prefill_token_threshold"],
+        )
+        # Edge-cloud collaborative inference arguments.
+        parallel_group.add_argument(
+            "--enable-edge-cloud",
+            **parallel_kwargs["enable_edge_cloud"],
+        )
+        parallel_group.add_argument(
+            "--edge-npu-count",
+            **parallel_kwargs["edge_npu_count"],
+        )
+        parallel_group.add_argument(
+            "--cloud-npu-count",
+            **parallel_kwargs["cloud_npu_count"],
+        )
+        parallel_group.add_argument(
+            "--is-edge-node",
+            **parallel_kwargs["is_edge_node"],
         )
         parallel_group.add_argument(
             "--disable-nccl-for-dp-synchronization",
