@@ -2397,11 +2397,12 @@ def get_node_count() -> int:
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
-    global _TP
+    global _TP, _IS_EDGE_DEVICE
 
     if _TP:
         _TP.destroy()
     _TP = None
+    _IS_EDGE_DEVICE = None
 
     global _DCP
     if _DCP:

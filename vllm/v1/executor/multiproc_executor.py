@@ -15,7 +15,7 @@ from concurrent.futures import Future, InvalidStateError
 from contextlib import suppress
 from dataclasses import dataclass
 from enum import Enum, auto
-from functools import partial
+from functools import cached_property, partial
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from multiprocessing.synchronize import Lock as LockType
@@ -420,26 +420,31 @@ class MultiprocExecutor(Executor):
         else:
             send_method = cloudpickle.dumps(method, protocol=pickle.HIGHEST_PROTOCOL)
 
-        # [EDGE-ENQUEUE] 参考 passive_core.py:590 格式记录边侧 enqueue 耗时
-        _bt = "N/A"
-        if (
-            isinstance(method, str)
-            and method == "execute_model"
-            and args
-            and hasattr(args[0], "batch_type")
-            and args[0].batch_type is not None
-        ):
-            _bt = args[0].batch_type.value
-        _t0 = time.monotonic()
-        self.rpc_broadcast_mq.enqueue(
-            (send_method, args, kwargs, output_rank), local_only=local_only
-        )
-        _dt_ms = (time.monotonic() - _t0) * 1000
-        logger.info(
-            "[EDGE-ENQUEUE] %s enqueue took %.3f ms",
-            _bt,
-            _dt_ms,
-        )
+        # [EDGE-ENQUEUE] 边侧 enqueue 耗时记录，仅在边云模式下启用
+        if getattr(self.parallel_config, "enable_edge_cloud", False):
+            _bt = "N/A"
+            if (
+                isinstance(method, str)
+                and method == "execute_model"
+                and args
+                and hasattr(args[0], "batch_type")
+                and args[0].batch_type is not None
+            ):
+                _bt = args[0].batch_type.value
+            _t0 = time.monotonic()
+            self.rpc_broadcast_mq.enqueue(
+                (send_method, args, kwargs, output_rank), local_only=local_only
+            )
+            _dt_ms = (time.monotonic() - _t0) * 1000
+            logger.info(
+                "[EDGE-ENQUEUE] %s enqueue took %.3f ms",
+                _bt,
+                _dt_ms,
+            )
+        else:
+            self.rpc_broadcast_mq.enqueue(
+                (send_method, args, kwargs, output_rank), local_only=local_only
+            )
 
         response_mqs: Sequence[MessageQueue] = self.response_mqs
         if output_rank is not None:
