@@ -1842,6 +1842,10 @@ def initialize_model_parallel(
     parallel_config = config.parallel_config
     coord_store: Store | None = None
 
+    # Edge-cloud mode uses module-level flags to communicate the
+    # edge/cloud role to downstream code (is_edge_device, etc.).
+    global _IS_EDGE_DEVICE
+
     # Shared-model edge-cloud collaboration mode.
     # Activated by ``is_shared_model_edge``: the edge side has a
     # single distributed rank (one process) hosting
