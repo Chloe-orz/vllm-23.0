@@ -275,7 +275,16 @@ class EngineCore:
         if max_model_len_after != max_model_len_before:
             self.collective_rpc("update_max_model_len", args=(max_model_len_after,))
 
-        scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
+        if vllm_config.parallel_config.enable_edge_cloud:
+            max_group_idx = max(
+                range(len(kv_cache_configs)),
+                key=lambda i: len(kv_cache_configs[i].kv_cache_groups),
+            )
+            scheduler_kv_cache_config = generate_scheduler_kv_cache_config(
+                [kv_cache_configs[max_group_idx]]
+            )
+        else:
+            scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
         vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks
         kv_cache_groups = scheduler_kv_cache_config.kv_cache_groups
         if kv_cache_groups:

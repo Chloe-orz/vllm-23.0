@@ -1844,7 +1844,10 @@ def initialize_model_parallel(
 
     # Edge-cloud mode uses module-level flags to communicate the
     # edge/cloud role to downstream code (is_edge_device, etc.).
-    global _IS_EDGE_DEVICE
+    # All parallel-group globals must be declared up-front: the
+    # shared-model edge-cloud branches below assign them before the
+    # standard path's own (now redundant) global declarations.
+    global _IS_EDGE_DEVICE, _TP, _PP, _DCP, _PCP, _DP, _EP, _EPLB
 
     # Shared-model edge-cloud collaboration mode.
     # Activated by ``is_shared_model_edge``: the edge side has a
@@ -2149,7 +2152,6 @@ def initialize_model_parallel(
     )  # noqa
 
     # Build the tensor model-parallel groups.
-    global _TP
     assert _TP is None, "tensor model parallel group is already initialized"
     group_ranks = all_ranks.view(-1, tensor_model_parallel_size).unbind(0)
     group_ranks = [x.tolist() for x in group_ranks]
@@ -2166,7 +2168,6 @@ def initialize_model_parallel(
     )
 
     # Build the DCP model-parallel groups.
-    global _DCP
     assert _DCP is None, "decode context model parallel group is already initialized"
     # Note(hc): In the current implementation of decode context parallel,
     # dcp_size must not exceed tp_size, because the world size does not
@@ -2187,7 +2188,6 @@ def initialize_model_parallel(
         group_name="dcp",
     )
 
-    global _PCP
     assert _PCP is None, "prefill context parallel group is already initialized"
     group_ranks = (
         all_ranks.transpose(3, 4)
@@ -2207,7 +2207,6 @@ def initialize_model_parallel(
     )
 
     # Build the pipeline model-parallel groups.
-    global _PP
     assert _PP is None, "pipeline model parallel group is already initialized"
     group_ranks = (
         all_ranks.transpose(2, 4).reshape(-1, pipeline_model_parallel_size).unbind(0)
@@ -2224,7 +2223,6 @@ def initialize_model_parallel(
         group_ranks, get_world_group().local_rank, backend, group_name="pp"
     )
 
-    global _DP
     assert _DP is None, "data parallel group is already initialized"
     group_ranks = all_ranks.transpose(1, 4).reshape(-1, data_parallel_size).unbind(0)
     group_ranks = [x.tolist() for x in group_ranks]
@@ -2241,7 +2239,6 @@ def initialize_model_parallel(
             group_ranks, get_world_group().local_rank, backend, group_name="dp"
         )
 
-    global _EP
     assert _EP is None, "expert parallel group is already initialized"
     # Don't create EP group for dense models.
     if config.model_config is None or config.model_config.is_moe:
