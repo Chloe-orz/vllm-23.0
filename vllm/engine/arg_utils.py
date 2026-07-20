@@ -2020,7 +2020,7 @@ class EngineArgs:
             enable_edge_cloud=self.enable_edge_cloud,
             edge_npu_count=self.edge_npu_count,
             cloud_npu_count=self.cloud_npu_count,
-            is_edge_node=self.is_edge_node,
+            is_edge_node=not headless if self.enable_edge_cloud else False,
             enable_eplb=self.enable_eplb,
             eplb_config=self.eplb_config,
             expert_placement_strategy=self.expert_placement_strategy,
