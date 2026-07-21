@@ -302,7 +302,20 @@ def set_device_control_env_var(
     local_world_size = vllm_config.parallel_config.local_world_size
     evar = current_platform.device_control_env_var
 
-    value = get_device_indices(evar, local_dp_rank, world_size, local_world_size)
+    # Edge-cloud mode: every node hosts all DP instances, and each
+    # instance's devices on this node form a contiguous shard of
+    # ``local_world_size`` NPUs (edge_npu_count on the edge node,
+    # cloud_npu_count on the cloud node). The shard offset is
+    # therefore ``local_dp_rank * local_world_size``; the upstream
+    # default stride ``world_size`` spans both edge and cloud NPUs
+    # (world_size == edge_npu_count + cloud_npu_count) and does not
+    # match the per-node device layout.
+    shard_stride = (
+        local_world_size
+        if vllm_config.parallel_config.enable_edge_cloud
+        else world_size
+    )
+    value = get_device_indices(evar, local_dp_rank, shard_stride, local_world_size)
     with patch.dict(os.environ, values=((evar, value),)):
         yield
 
