@@ -276,7 +276,16 @@ class EngineCore:
         if max_model_len_after != max_model_len_before:
             self.collective_rpc("update_max_model_len", args=(max_model_len_after,))
 
-        scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
+        if vllm_config.parallel_config.enable_edge_cloud:
+            max_group_idx = max(
+                range(len(kv_cache_configs)),
+                key=lambda i: len(kv_cache_configs[i].kv_cache_groups),
+            )
+            scheduler_kv_cache_config = generate_scheduler_kv_cache_config(
+                [kv_cache_configs[max_group_idx]]
+            )
+        else:
+            scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
         vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks
         kv_cache_groups = scheduler_kv_cache_config.kv_cache_groups
         if kv_cache_groups:
@@ -1155,12 +1164,13 @@ class EngineCoreProc(EngineCore):
                 parallel_config.data_parallel_rank = dp_rank
                 engine_core = DPEngineCoreProc(*args, **kwargs)
             else:
-                # Non-MoE DP ranks are completely independent, so treat like DP=1.
-                # Note that parallel_config.data_parallel_index will still reflect
-                # the original DP rank.
-                parallel_config.data_parallel_size = 1
-                parallel_config.data_parallel_size_local = 1
-                parallel_config.data_parallel_rank = 0
+                # # Non-MoE DP ranks are completely independent, so treat like DP=1.
+                # # Note that parallel_config.data_parallel_index will still reflect
+                # # the original DP rank.
+                # parallel_config.data_parallel_size = 1
+                # parallel_config.data_parallel_size_local = 1
+                # parallel_config.data_parallel_rank = 0
+                parallel_config.data_parallel_rank = dp_rank
                 engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
 
             assert engine_core is not None
