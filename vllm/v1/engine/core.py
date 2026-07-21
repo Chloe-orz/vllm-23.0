@@ -276,7 +276,16 @@ class EngineCore:
         if max_model_len_after != max_model_len_before:
             self.collective_rpc("update_max_model_len", args=(max_model_len_after,))
 
-        scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
+        if vllm_config.parallel_config.enable_edge_cloud:
+            max_group_idx = max(
+                range(len(kv_cache_configs)),
+                key=lambda i: len(kv_cache_configs[i].kv_cache_groups),
+            )
+            scheduler_kv_cache_config = generate_scheduler_kv_cache_config(
+                [kv_cache_configs[max_group_idx]]
+            )
+        else:
+            scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
         vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks
         kv_cache_groups = scheduler_kv_cache_config.kv_cache_groups
         if kv_cache_groups:
@@ -538,11 +547,15 @@ class EngineCore:
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
                 batch_queue.appendleft((future, scheduler_output, exec_future))
-                if len(batch_queue) < self.batch_queue_size and (
-                    model_executed or self.scheduler.has_requests()
+                # Don't block on next worker response unless the queue is full
+                # or there are no more requests to schedule.
+                # [edge] also don't block while the oldest queued worker
+                # response is still pending (avoid head-of-line blocking).
+                if (
+                    len(batch_queue) < self.batch_queue_size
+                    and (model_executed or self.scheduler.has_requests())
+                    and not batch_queue[-1][0].done()
                 ):
-                    # Don't block on next worker response unless the queue is full
-                    # or there are no more requests to schedule.
                     return None, model_executed
 
         elif not batch_queue:
@@ -1154,13 +1167,19 @@ class EngineCoreProc(EngineCore):
                 # Set data parallel rank for this engine process.
                 parallel_config.data_parallel_rank = dp_rank
                 engine_core = DPEngineCoreProc(*args, **kwargs)
-            else:
+            elif not parallel_config.enable_edge_cloud:
                 # Non-MoE DP ranks are completely independent, so treat like DP=1.
                 # Note that parallel_config.data_parallel_index will still reflect
                 # the original DP rank.
                 parallel_config.data_parallel_size = 1
                 parallel_config.data_parallel_size_local = 1
                 parallel_config.data_parallel_rank = 0
+                engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+            else:
+                # [edge] 边云协同 / 单卡多DP：保留真实 DP 拓扑，不做
+                # "treat like DP=1" 重置，让每个 DP rank 运行独立的
+                # EngineCoreProc。
+                parallel_config.data_parallel_rank = dp_rank
                 engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
 
             assert engine_core is not None

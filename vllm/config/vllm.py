@@ -495,6 +495,11 @@ class VllmConfig:
 
     @property
     def max_concurrent_batches(self) -> int:
+        # [ascend insert] 边云协同模式需要更大的 batch queue 来填满
+        # Head-Middle-Tail 多阶段流水线。(v0.23: 该属性从 executor
+        # 移至 VllmConfig，边云覆盖逻辑随之移植到这里。)
+        if getattr(self.parallel_config, "enable_edge_cloud", False):
+            return 4
         # PP requires PP-size concurrent batches to fill the pipeline.
         # Async scheduling requires 2 concurrent batches to overlap.
         pp_size = self.parallel_config.pipeline_parallel_size
