@@ -1404,6 +1404,8 @@ def register_all_kvcache_specs(vllm_config):
 
     from vllm.platforms import current_platform
 
+    current_platform.register_custom_kv_cache_specs(vllm_config)
+
 
 # Backward-compatible spec-to-manager mapping for vllm-ascend integration.
 # The 23.0 baseline uses KVCacheSpecRegistry; this dict provides the same
@@ -1419,5 +1421,3 @@ spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
     CrossAttentionSpec: CrossAttentionManager,
     SinkFullAttentionSpec: SinkFullAttentionManager,
 }
-
-    current_platform.register_custom_kv_cache_specs(vllm_config)
