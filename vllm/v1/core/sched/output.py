@@ -32,7 +32,6 @@ class HiddenChannelType(enum.Enum):
     PREFILL_1 = "prefill_1"
     PREFILL_2 = "prefill_2"
     DECODE = "decode"
-    MTP_DRAFT = "mtp_draft"
 
 
 class BatchType(enum.Enum):
@@ -58,12 +57,10 @@ class BatchType(enum.Enum):
                      edge head segment (Phase 4)
     - DECODE_LAST:   edge-cloud PD separation — decode batch executing the
                      edge tail segment (Phase 4)
-    - MTP_DRAFT_FIRST:
-                     edge-cloud Qwen-MTP draft batch executing the edge head
-                     segment for one draft step
-    - MTP_DRAFT_LAST:
-                     edge-cloud Qwen-MTP draft batch executing the edge tail
-                     segment for one draft step
+    - DRAFT_FIRST:   edge-cloud speculative draft batch executing the edge
+                     head segment for one draft step
+    - DRAFT_LAST:    edge-cloud speculative draft batch executing the edge
+                     tail segment for one draft step
     """
     PD_MIX = "pd_mix"
     PURE_PREFILL = "pure_prefill"
@@ -74,8 +71,8 @@ class BatchType(enum.Enum):
     PREFILL_LAST = "prefill_last"
     DECODE_FIRST = "decode_first"
     DECODE_LAST = "decode_last"
-    MTP_DRAFT_FIRST = "mtp_draft_first"
-    MTP_DRAFT_LAST = "mtp_draft_last"
+    DRAFT_FIRST = "draft_first"
+    DRAFT_LAST = "draft_last"
 
 
 @dataclass
@@ -308,15 +305,16 @@ class SchedulerOutput:
 
     # Data-plane hidden tensor channel for edge-cloud PD separation. Prefill
     # head/tail batches use one of two prefill channels; decode uses the
-    # dedicated decode channel; Qwen-MTP draft uses the dedicated MTP draft
-    # channel. The cloud echoes this field back unchanged.
+    # dedicated decode channel. Scheduled speculative drafts also use the
+    # decode channel. The cloud echoes this field back unchanged.
     hidden_channel: HiddenChannelType | None = None
 
-    # Qwen-MTP draft control-plane identity. Each draft step uses its own
+    # Scheduled draft control-plane identity. Each draft step uses its own
     # head_token for edge/cloud pairing; the fields below identify the parent
-    # request, the whole draft chain, and the current draft step.
+    # request, the whole draft chain, and the current draft step. This is
+    # shared by MTP and Eagle-style draft models.
     parent_req_id: str | None = None
-    mtp_draft_task_id: str | None = None
+    draft_task_id: str | None = None
     draft_step_idx: int | None = None
 
     @classmethod
