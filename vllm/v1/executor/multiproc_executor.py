@@ -115,12 +115,13 @@ class MultiprocExecutor(Executor):
         self.failure_callback: FailureCallback | None = None
 
         tp_size, pp_size, pcp_size = self._get_parallel_sizes()
-        assert self.world_size == tp_size * pp_size * pcp_size, (
-            f"world_size ({self.world_size}) must be equal to the "
-            f"tensor_parallel_size ({tp_size}) x pipeline"
-            f"_parallel_size ({pp_size}) x prefill_context"
-            f"_parallel_size ({pcp_size}). "
-        )
+        if not self.parallel_config.enable_edge_cloud:
+            assert self.world_size == tp_size * pp_size * pcp_size, (
+                f"world_size ({self.world_size}) must be equal to the "
+                f"tensor_parallel_size ({tp_size}) x pipeline"
+                f"_parallel_size ({pp_size}) x prefill_context"
+                f"_parallel_size ({pcp_size}). "
+            )
 
         set_multiprocessing_worker_envs()
 
@@ -155,15 +156,48 @@ class MultiprocExecutor(Executor):
                 connect_ip=mq_connect_ip,
             )
             scheduler_output_handle = self.rpc_broadcast_mq.export_handle()
+        elif envs.VLLM_PP_NON_LEADER_ENGINE_CORE:
+            # For non-leader PP rank running with a passive EngineCore,
+            # create a local rpc_broadcast_mq for local enginecore-worker
+            # communication. Workers also create a cross-node MQ via
+            # inner_dp_world_group for communication with pp rank 0.
+            max_chunk_bytes = envs.VLLM_MQ_MAX_CHUNK_BYTES_MB * 1024 * 1024
+            mq_connect_ip = get_loopback_ip()
+            logger.info(
+                "DP group non-leader with passive EngineCore: "
+                "node_rank=%d, node_rank_within_dp=%d, "
+                "master_addr=%s, mq_connect_ip=%s (loopback), "
+                "world_size=%d, local_world_size=%d",
+                self.parallel_config.node_rank,
+                self.parallel_config.node_rank_within_dp,
+                self.parallel_config.master_addr,
+                mq_connect_ip,
+                self.world_size,
+                self.local_world_size,
+            )
+            self.rpc_broadcast_mq = MessageQueue(
+                self.local_world_size,
+                self.local_world_size,
+                max_chunk_bytes=max_chunk_bytes,
+                connect_ip=mq_connect_ip,
+            )
+            scheduler_output_handle = self.rpc_broadcast_mq.export_handle()
         # Create workers
         context = get_mp_context()
         shared_worker_lock = context.Lock()
         unready_workers: list[UnreadyWorkerProcHandle] = []
         success = False
         try:
-            global_start_rank = (
-                self.local_world_size * self.parallel_config.node_rank_within_dp
-            )
+            if self.parallel_config.enable_edge_cloud:
+                global_start_rank = (
+                    0
+                    if self.parallel_config.is_edge_node
+                    else self.parallel_config.edge_npu_count
+                )
+            else:
+                global_start_rank = (
+                    self.local_world_size * self.parallel_config.node_rank_within_dp
+                )
             # When using fork, keep track of socket file descriptors that are
             # inherited by the worker, so that we can close them in subsequent
             # workers
@@ -206,10 +240,16 @@ class MultiprocExecutor(Executor):
 
             self.response_mqs = []
             # Only leader node have remote response mqs
-            if self.parallel_config.node_rank_within_dp == 0:
+            if self.parallel_config.node_rank_within_dp == 0 and (
+                not self.parallel_config.enable_edge_cloud
+                or self.parallel_config.is_edge_node
+            ):
                 for rank in range(self.world_size):
-                    if rank < self.local_world_size:
-                        local_message_queue = self.workers[rank].worker_response_mq
+                    local_idx = rank - global_start_rank
+                    if 0 <= local_idx < self.local_world_size:
+                        local_message_queue = self.workers[
+                            local_idx
+                        ].worker_response_mq
                         assert local_message_queue is not None
                         self.response_mqs.append(local_message_queue)
                     else:
@@ -218,6 +258,13 @@ class MultiprocExecutor(Executor):
                         ]
                         assert remote_message_queue is not None
                         self.response_mqs.append(remote_message_queue)
+            elif envs.VLLM_PP_NON_LEADER_ENGINE_CORE:
+                # For non-leader PP rank with passive EngineCore,
+                # collect local worker response mqs only.
+                for rank in range(self.local_world_size):
+                    local_message_queue = self.workers[rank].worker_response_mq
+                    assert local_message_queue is not None
+                    self.response_mqs.append(local_message_queue)
 
             # Ensure message queues are ready. Will deadlock if re-ordered
             # Must be kept consistent with the WorkerProc.
@@ -248,11 +295,12 @@ class MultiprocExecutor(Executor):
 
     def _get_parallel_sizes(self) -> tuple[int, int, int]:
         self.world_size = self.parallel_config.world_size
-        assert self.world_size % self.parallel_config.nnodes_within_dp == 0, (
-            f"global world_size ({self.parallel_config.world_size}) must be "
-            f"divisible by nnodes_within_dp "
-            f"({self.parallel_config.nnodes_within_dp}). "
-        )
+        if not getattr(self.parallel_config, "enable_edge_cloud", False):
+            assert self.world_size % self.parallel_config.nnodes_within_dp == 0, (
+                f"global world_size ({self.parallel_config.world_size}) must be "
+                f"divisible by nnodes_within_dp "
+                f"({self.parallel_config.nnodes_within_dp}). "
+            )
         self.local_world_size = self.parallel_config.local_world_size
         tp_size = self.parallel_config.tensor_parallel_size
         pp_size = self.parallel_config.pipeline_parallel_size
@@ -263,6 +311,12 @@ class MultiprocExecutor(Executor):
         pass
 
     def _is_driver_worker(self, rank: int) -> bool:
+        if self.parallel_config.enable_edge_cloud:
+            return rank == (
+                0
+                if self.parallel_config.is_edge_node
+                else self.parallel_config.edge_npu_count
+            )
         return rank % self.parallel_config.tensor_parallel_size == 0
 
     def start_worker_monitor(self, inline=False) -> None:
@@ -307,6 +361,18 @@ class MultiprocExecutor(Executor):
     def execute_model(  # type: ignore[override]
         self, scheduler_output: SchedulerOutput, non_block: bool = False
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
+        # Edge-cloud: deliver execute_model to local edge workers only,
+        # skipping the cross-node send to the cloud. The cloud receives work
+        # solely via ZMQ (PassiveEngineCore -> cloud local rpc_broadcast_mq,
+        # method b"pp_scheduler_output"); edge-only tail segments
+        # (PREFILL_LAST / DECODE_LAST) must never be serialized cross-node.
+        # Edge workers are local readers of rpc_broadcast_mq and are
+        # unaffected by local_only; only the remote (TCP) send is skipped.
+        pc = self.parallel_config
+        local_only = bool(
+            getattr(pc, "enable_edge_cloud", False)
+            and getattr(pc, "is_edge_node", False)
+        )
         return self.collective_rpc(
             "execute_model",
             args=(scheduler_output,),
@@ -314,6 +380,7 @@ class MultiprocExecutor(Executor):
             non_block=non_block,
             timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
             kv_output_aggregator=self.kv_output_aggregator,
+            local_only=local_only,
         )
 
     def sample_tokens(  # type: ignore[override]
@@ -346,6 +413,7 @@ class MultiprocExecutor(Executor):
         non_block: bool = False,
         unique_reply_rank: int | None = None,
         kv_output_aggregator: KVOutputAggregator | None = None,
+        local_only: bool = False,
     ) -> Any:
         """Returns single result if unique_reply_rank and/or kv_output_aggregator
         is provided, otherwise list."""
@@ -371,7 +439,27 @@ class MultiprocExecutor(Executor):
             send_method = method
         else:
             send_method = cloudpickle.dumps(method, protocol=pickle.HIGHEST_PROTOCOL)
-        self.rpc_broadcast_mq.enqueue((send_method, args, kwargs, output_rank))
+
+        # [EDGE-ENQUEUE] 参考 passive_core.py:590 格式记录边侧 enqueue 耗时
+        _bt = "N/A"
+        if (
+            isinstance(method, str)
+            and method == "execute_model"
+            and args
+            and hasattr(args[0], "batch_type")
+            and args[0].batch_type is not None
+        ):
+            _bt = args[0].batch_type.value
+        _t0 = time.monotonic()
+        self.rpc_broadcast_mq.enqueue(
+            (send_method, args, kwargs, output_rank), local_only=local_only
+        )
+        _dt_ms = (time.monotonic() - _t0) * 1000
+        logger.info(
+            "[EDGE-ENQUEUE] %s enqueue took %.3f ms",
+            _bt,
+            _dt_ms,
+        )
 
         response_mqs: Sequence[MessageQueue] = self.response_mqs
         if output_rank is not None:
@@ -492,6 +580,15 @@ class MultiprocExecutor(Executor):
         self.collective_rpc("check_health", timeout=10)
         return
 
+    def max_concurrent_batches(self) -> int:
+        # PP requires PP-size concurrent batches to fill the pipeline.
+        pp_size = self.parallel_config.pipeline_parallel_size
+        # [ascend insert] 边云协同模式需要更大的 batch queue 来填满
+        # Head-Middle-Tail 多阶段流水线。
+        if getattr(self.parallel_config, "enable_edge_cloud", False):
+            return 4
+        return 2 if pp_size <= 1 and self.scheduler_config.async_scheduling else pp_size
+
     def _get_output_rank(self) -> int:
         # Only returns ModelRunnerOutput from TP rank=0 and PP rank=-1
         # (the first TP worker of the last PP stage).
@@ -502,6 +599,9 @@ class MultiprocExecutor(Executor):
         # 16-23, PP rank 2
         # 24-31, PP rank 3
         # so world_size - tp_size = 32 - 8 = 24 should be PP rank = -1 (i.e. 3)
+        if self.parallel_config.enable_edge_cloud:
+            return 0
+
         return (
             self.world_size
             - self.parallel_config.tensor_parallel_size
@@ -562,7 +662,7 @@ class WorkerProc:
         self, input_shm_handle: Handle, vllm_config: VllmConfig
     ) -> None:
         if vllm_config.parallel_config.nnodes_within_dp == 1:
-            # Initialize MessageQueue for receiving SchedulerOutput
+            # Single-node: use local MQ
             self.rpc_broadcast_mq = MessageQueue.create_from_handle(
                 input_shm_handle, self.worker.rank
             )
@@ -570,8 +670,30 @@ class WorkerProc:
             # Initializes a message queue for sending the model output
             self.worker_response_mq = MessageQueue(1, 1)
             self.peer_response_handles = []
+            self.local_rpc_broadcast_mq = None
+            self.local_worker_response_mq = None
+        elif envs.VLLM_PP_NON_LEADER_ENGINE_CORE:
+            # Non-leader PP rank with passive EngineCore:
+            # Dual MQ — local MQ for passive enginecore handshake +
+            # cross-node MQ for actual communication with pp rank0.
+            # Local MQs (for passive enginecore handshake only)
+            self.local_rpc_broadcast_mq = MessageQueue.create_from_handle(
+                input_shm_handle, self.local_rank
+            )
+            self.local_worker_response_mq = MessageQueue(1, 1)
+            self.local_peer_response_handles: list = []
+            # Cross-node MQs (for actual work with pp rank0)
+            self.rpc_broadcast_mq = get_inner_dp_world_group().create_mq_broadcaster(
+                external_writer_handle=None,
+                blocking=False,
+            )
+            self.worker_response_mq, self.peer_response_handles = (
+                get_inner_dp_world_group().create_single_reader_mq_broadcasters(
+                    reader_rank_in_group=0, vllm_config=vllm_config
+                )
+            )
         else:
-            # Initialize remote MessageQueue for receiving SchedulerOutput across nodes
+            # Leader node multi-node: use cross-node MQ via inner_dp_world_group
             self.rpc_broadcast_mq = get_inner_dp_world_group().create_mq_broadcaster(
                 external_writer_handle=input_shm_handle,
                 # Since there is external_writer_handle from executor proc,
@@ -586,9 +708,11 @@ class WorkerProc:
             # that include handles for all ranks
             self.worker_response_mq, self.peer_response_handles = (
                 get_inner_dp_world_group().create_single_reader_mq_broadcasters(
-                    reader_rank_in_group=0
+                    reader_rank_in_group=0, vllm_config=vllm_config
                 )
             )
+            self.local_rpc_broadcast_mq = None
+            self.local_worker_response_mq = None
 
     @instrument(span_name="Worker init")
     def __init__(
@@ -602,6 +726,7 @@ class WorkerProc:
         is_driver_worker: bool,
     ):
         self.rank = rank
+        self.local_rank = local_rank
         wrapper = WorkerWrapperBase(rpc_rank=local_rank, global_rank=rank)
         # TODO: move `init_worker` to executor level as a collective rpc call
         all_kwargs: list[dict] = [
@@ -772,6 +897,12 @@ class WorkerProc:
             self.rpc_broadcast_mq.shutdown()
         if self.worker_response_mq is not None:
             self.worker_response_mq.shutdown()
+        if getattr(self, "local_rpc_broadcast_mq", None) is not None:
+            self.local_rpc_broadcast_mq.shutdown()
+            self.local_rpc_broadcast_mq = None
+        if getattr(self, "local_worker_response_mq", None) is not None:
+            self.local_worker_response_mq.shutdown()
+            self.local_worker_response_mq = None
         self.worker.shutdown()
         self.rpc_broadcast_mq = None
         self.worker_response_mq = None
@@ -796,9 +927,14 @@ class WorkerProc:
                 logger.warning("Death monitoring error: %s", e)
 
         # Pass queue references directly to avoid gc issues if passing self
+        queues = [self.rpc_broadcast_mq, self.worker_response_mq]
+        if self.local_rpc_broadcast_mq is not None:
+            queues.append(self.local_rpc_broadcast_mq)
+        if self.local_worker_response_mq is not None:
+            queues.append(self.local_worker_response_mq)
         Thread(
             target=death_pipe_monitor,
-            args=([self.rpc_broadcast_mq, self.worker_response_mq],),
+            args=(queues,),
             daemon=True,
             name="DeathPipeMonitor",
         ).start()
@@ -859,19 +995,35 @@ class WorkerProc:
 
             worker.monitor_death_pipe(death_pipe, shutdown_requested)
 
-            # Send READY once we know everything is loaded
-            ready_writer.send(
-                {
-                    "status": WorkerProc.READY_STR,
-                    "handle": worker.worker_response_mq.export_handle(),
-                    "peer_response_handles": worker.peer_response_handles,
-                }
-            )
+            # Send READY once we know everything is loaded.
+            # For non-leader PP rank with passive EngineCore, send local
+            # MQ handles (for passive enginecore handshake) instead of
+            # cross-node MQ handles (used for actual work).
+            if envs.VLLM_PP_NON_LEADER_ENGINE_CORE and worker.local_worker_response_mq is not None:
+                ready_writer.send(
+                    {
+                        "status": WorkerProc.READY_STR,
+                        "handle": worker.local_worker_response_mq.export_handle(),
+                        "peer_response_handles": worker.local_peer_response_handles,
+                    }
+                )
+            else:
+                ready_writer.send(
+                    {
+                        "status": WorkerProc.READY_STR,
+                        "handle": worker.worker_response_mq.export_handle(),
+                        "peer_response_handles": worker.peer_response_handles,
+                    }
+                )
 
             # Ensure message queues are ready. Will deadlock if re-ordered.
             # Must be kept consistent with the Executor
+            if worker.local_rpc_broadcast_mq is not None:
+                worker.local_rpc_broadcast_mq.wait_until_ready()
             if worker.rpc_broadcast_mq is not None:
                 worker.rpc_broadcast_mq.wait_until_ready()
+            if worker.local_worker_response_mq is not None:
+                worker.local_worker_response_mq.wait_until_ready()
             worker.worker_response_mq.wait_until_ready()
             ready_writer.close()
             ready_writer = None
@@ -970,15 +1122,98 @@ class WorkerProc:
         """Main busy loop for Multiprocessing Workers"""
         assert self.rpc_broadcast_mq is not None
         while True:
-            method, args, kwargs, output_rank = self.rpc_broadcast_mq.dequeue(
-                indefinite=True
-            )
+            # Poll local MQ for pp scheduler output from passive
+            # EngineCore (non-blocking).
+            if self.local_rpc_broadcast_mq is not None:
+                try:
+                    method, args, kwargs, output_rank = (
+                        self.local_rpc_broadcast_mq.dequeue(timeout=0.1)
+                    )
+                    if isinstance(method, bytes) and method == b"pp_scheduler_output":
+                        scheduler_output = args[0]
+                        slice_info = args[1] if len(args) > 1 else None
+                        # Execute model with the received SchedulerOutput.
+                        try:
+                            func = getattr(self.worker, "execute_model")
+                            output = func(
+                                scheduler_output,
+                                layer_slice_info=slice_info,
+                            )
+                        except Exception as e:
+                            if hasattr(e, "add_note"):
+                                e.add_note(traceback.format_exc())
+                            logger.exception(
+                                "PP worker execute_model failed."
+                            )
+                            if output_rank is None or self.rank == output_rank:
+                                self.handle_output(e)
+                            continue
+                        # For layer slicing: non-last slices produce
+                        # no external output; keep polling local MQ for
+                        # the next slice.  Last slice (or no slicing)
+                        # follows the normal flow.
+                        if slice_info is not None and not slice_info.is_last_slice:
+                            continue
+                        ack = {
+                            "__pp_scheduler_ack__": True,
+                            "batch_type": scheduler_output.batch_type,
+                            "head_token": getattr(scheduler_output, "head_token", None),
+                            "hidden_channel": getattr(scheduler_output, "hidden_channel", None),
+                        }
+                        should_send_ack = (
+                            (output_rank is None and self.local_rank == 0)
+                            or self.rank == output_rank
+                        )
+                        if should_send_ack:
+                            response_mq = (
+                                self.local_worker_response_mq
+                                if self.local_worker_response_mq is not None
+                                else self.worker_response_mq
+                            )
+                            if response_mq is not None:
+                                response_mq.enqueue(
+                                    (WorkerProc.ResponseStatus.SUCCESS, ack)
+                                )
+                        continue
+                except Exception:
+                    pass  # TimeoutError or empty queue
+
+            # Poll cross-node MQ with short timeout so we can
+            # periodically check the local MQ.
+            try:
+                _t0 = time.monotonic()
+                method, args, kwargs, output_rank = self.rpc_broadcast_mq.dequeue(
+                    timeout=0.1
+                )
+                _dt_ms = (time.monotonic() - _t0) * 1000
+            except TimeoutError:
+                continue
+
+            # Skip execute_model from cross-node MQ on pp rank1 workers.
+            # These workers execute model only when triggered by their
+            # local passive EngineCore via local_rpc_broadcast_mq.
+            if (
+                self.local_rpc_broadcast_mq is not None
+                and isinstance(method, str)
+                and method == "execute_model"
+            ):
+                continue
+
             try:
                 if isinstance(method, str):
                     func = getattr(self.worker, method)
                 elif isinstance(method, bytes):
                     func = partial(cloudpickle.loads(method), self.worker)
-
+                if method == "execute_model":
+                    _bt = (
+                        getattr(args[0], "batch_type", None)
+                        if args else None
+                    )
+                    logger.info(
+                        "[EDGE-DEQUEUE] dequeue took %.3f ms batch_type: %s",
+                        _dt_ms,
+                        _bt.value if _bt is not None else "N/A",
+                    )
                 output = func(*args, **kwargs)
             except Exception as e:
                 # Notes have been introduced in python 3.11
