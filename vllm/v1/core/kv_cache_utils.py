@@ -1121,21 +1121,20 @@ def _get_kv_cache_groups_uniform_page_size(
     for layer_name, layer_spec in kv_cache_spec.items():
         same_type_layers[layer_spec].append(layer_name)
 
-    # Split each group into smaller groups, to make the number of layers in each
-    # group identical. Add padding to the last group of each type if necessary.
-    # E.g., (full.0, full.1), (sw.0, sw.1, sw.2)
-    # split to 3 groups with 2 layers each:
-    # (full.0, full.1), (sw.0, sw.2), (sw.1, padding).
-    # FIXME(Chen): At the moment of writing this code (2025-06-02), all
-    # open-source hybrid model follows a n:1 pattern between different attention
-    # types (e.g., Gemma3 5:1 between sw and full, LLaMA4 3:1 between local and
-    # full), so we can use the "1" in the n:1 pattern as the group size, which
-    # is the minimum number of layers among all attention types. Need a better
-    # strategy if we want to support more complex patterns (e.g., 20 full + 30
-    # sw, where the group size should be 10).
-    min_num_layers = min([len(layers) for layers in same_type_layers.values()])
+
+    # Compute min_num_layers from the TOTAL layer count per spec TYPE
+    # (class), not per exact spec match.  In edge-cloud mode the edge
+    # side may own the first / last layers whose specs differ from the
+    # cloud-side layers of the same type (e.g. different state shapes
+    # or block_size).  Using per-type totals prevents a single edge
+    # layer from dragging min_num_layers down to 1 and triggering
+    # per-layer grouping.
+    per_type_counts: dict[type, int] = defaultdict(int)
+    for spec, names in same_type_layers.items():
+        per_type_counts[type(spec)] += len(names)
+    min_num_layers = min(per_type_counts.values())
     group_size = min_num_layers
-    max_num_layers = max([len(layers) for layers in same_type_layers.values()])
+    max_num_layers = max(per_type_counts.values())
     if max_num_layers < min_num_layers * 1.5:
         # If the number of layers is not much larger than the minimum number of
         # layers, use the maximum number of layers as the group size to avoid
@@ -1210,8 +1209,8 @@ def _get_kv_cache_config_deepseek_v4(
     # this equals the sub-group size (each has a single page_size).
     num_layer_tuples = max(len(layers) for b in bucketed for layers in b.values())
 
-    num_blocks = available_memory // (layer_tuple_page_bytes * num_layer_tuples)
-    num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+    num_blocks_initial = available_memory // (layer_tuple_page_bytes * num_layer_tuples)
+    num_blocks = may_override_num_blocks(vllm_config, num_blocks_initial)
 
     kv_cache_tensors: list[KVCacheTensor] = []
     for tuple_idx in range(num_layer_tuples):
@@ -1898,8 +1897,10 @@ def _project_kv_cache_groups_to_worker(
         worker_layer_names = [
             layer_name for layer_name in group.layer_names if layer_name in worker_spec
         ]
+        if not worker_layer_names:
+            continue
         group_spec = group.kv_cache_spec
-        if worker_layer_names and isinstance(group_spec, UniformTypeKVCacheSpecs):
+        if isinstance(group_spec, UniformTypeKVCacheSpecs):
             group_spec = UniformTypeKVCacheSpecs(
                 block_size=group_spec.block_size,
                 kv_cache_specs={
@@ -1974,8 +1975,15 @@ def get_kv_cache_configs(
     # If original_max_model_len was -1, automatically
     # determine the maximum model length that fits in available GPU memory.
     # We use per-worker projected groups to account for PP sharding.
+    # When edge-cloud is enabled, a worker (especially the embedding-only
+    # edge side) may report an empty spec because static_forward_context
+    # was cleaned after sharding. Fall back to the merged full-model spec
+    # so that projected groups remain non-empty and the scheduler can work.
     projected_groups_per_worker = [
-        _project_kv_cache_groups_to_worker(global_kv_cache_groups, worker_spec)
+        _project_kv_cache_groups_to_worker(
+            global_kv_cache_groups,
+            worker_spec if worker_spec else merged_kv_cache_specs,
+        )
         for worker_spec in kv_cache_specs
     ]
 
@@ -2021,9 +2029,14 @@ def get_kv_cache_configs(
     for projected_groups, kv_cache_spec_one_worker, available_memory_one_worker in zip(
         projected_groups_per_worker, kv_cache_specs, available_memory
     ):
-        assert sum(len(group.layer_names) for group in projected_groups) == len(
-            kv_cache_spec_one_worker
-        ), "Some layers are not assigned to any group."
+        # In edge-cloud embedding_only mode, the edge worker has no local
+        # attention layers and reports an empty spec. Its projected_groups
+        # is built from the merged full-model spec, so the assertion would
+        # fail. Skip the assertion when the worker spec is empty.
+        if kv_cache_spec_one_worker:
+            assert sum(len(group.layer_names) for group in projected_groups) == len(
+                kv_cache_spec_one_worker
+            ), "Some layers are not assigned to any group."
         kv_cache_configs.append(
             get_kv_cache_config_from_groups(
                 vllm_config, projected_groups, available_memory_one_worker

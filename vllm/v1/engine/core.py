@@ -6,6 +6,7 @@ import queue
 import signal
 import threading
 import time
+import logging
 from collections import defaultdict, deque
 from collections.abc import Callable, Generator
 from concurrent.futures import Future
@@ -24,7 +25,7 @@ import vllm.envs as envs
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.envs import enable_envs_cache
-from vllm.logger import init_logger
+from vllm.logger import logger
 from vllm.logging_utils.dump_input import dump_engine_exception
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -80,8 +81,6 @@ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import compute_iteration_details
 from vllm.version import __version__ as VLLM_VERSION
-
-logger = init_logger(__name__)
 
 HANDSHAKE_TIMEOUT_MINS = 5
 
@@ -269,7 +268,16 @@ class EngineCore:
         if max_model_len_after != max_model_len_before:
             self.collective_rpc("update_max_model_len", args=(max_model_len_after,))
 
-        scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
+        if vllm_config.parallel_config.enable_edge_cloud:
+            max_group_idx = max(
+                range(len(kv_cache_configs)),
+                key=lambda i: len(kv_cache_configs[i].kv_cache_groups),
+            )
+            scheduler_kv_cache_config = generate_scheduler_kv_cache_config(
+                [kv_cache_configs[max_group_idx]]
+            )
+        else:
+            scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
         vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks
         kv_cache_groups = scheduler_kv_cache_config.kv_cache_groups
         if kv_cache_groups:
@@ -497,13 +505,13 @@ class EngineCore:
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
                 batch_queue.appendleft((future, scheduler_output, exec_future))
+                # Don't block on next worker response unless the queue is full
+                # or there are no more requests to schedule.
                 if (
                     model_executed
                     and len(batch_queue) < self.batch_queue_size
                     and not batch_queue[-1][0].done()
                 ):
-                    # Don't block on next worker response unless the queue is full
-                    # or there are no more requests to schedule.
                     return None, True
 
         elif not batch_queue:

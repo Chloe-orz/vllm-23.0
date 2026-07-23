@@ -57,6 +57,7 @@ def create_scheduler(
     pipeline_parallel_size: int = 1,
     use_ec_connector: bool = False,
     ec_role: str | None = None,
+    pd_scheduling_policy: str = "prefill_first",
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -89,6 +90,7 @@ def create_scheduler(
         enable_chunked_prefill=enable_chunked_prefill,
         async_scheduling=async_scheduling,
         is_encoder_decoder=model_config.is_encoder_decoder,
+        pd_scheduling_policy=pd_scheduling_policy,
     )
     # Cache config, optionally force APC
     cache_config = CacheConfig(
@@ -160,7 +162,7 @@ def create_scheduler(
         ],
     )
     cache_config.num_gpu_blocks = num_blocks
-    scheduler_cls = AsyncScheduler if async_scheduling else Scheduler
+    scheduler_cls = scheduler_config.get_scheduler_cls()
     return scheduler_cls(
         vllm_config=vllm_config,
         kv_cache_config=kv_cache_config,

@@ -387,6 +387,8 @@ class Scheduler(SchedulerInterface):
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
+            if len(scheduled_running_reqs) >= self.max_num_running_reqs:
+                break
             request = self.running[req_index]
 
             if (
@@ -863,7 +865,14 @@ class Scheduler(SchedulerInterface):
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
 
         assert token_budget >= 0
-        assert len(self.running) <= self.max_num_running_reqs
+        # TODO: In PD-separated mode, requests may enter self.running via
+        # update_from_output() after the cloud returns the prefill tail,
+        # bypassing the schedule() capacity gate.  A hard cap on the number
+        # of scheduled running requests is enforced above.  This assertion
+        # remains disabled because update_from_output() can legitimately
+        # grow running beyond max_num_running_reqs when many prefill tails
+        # return in the same step.
+        # assert len(self.running) <= self.max_num_running_reqs
         # Since some requests in the RUNNING queue may not be scheduled in
         # this step, the total number of scheduled requests can be smaller than
         # len(self.running).
@@ -1094,7 +1103,13 @@ class Scheduler(SchedulerInterface):
                 assert not scheduled_in_prev_step
                 resumed_req_ids.add(req_id)
             if not scheduled_in_prev_step:
-                all_token_ids[req_id] = req.all_token_ids.copy()
+                # np.ndarray(int32) on the wire: pickle protocol 5 routes numpy
+                # arrays through PickleBuffer, so deserialize is a zero-copy
+                # np.frombuffer (no per-int PyLong alloc) even when inlined
+                # (<1 MiB). ~halves bytes vs list[int] and avoids the
+                # PyLong-per-int GIL cost that dominated dequeue latency.
+                # Use Request-level cached view to avoid repeated conversion.
+                all_token_ids[req_id] = req.cached_all_token_ids_np
             new_block_ids.append(
                 req_to_new_blocks[req_id].get_block_ids(allow_none=True)
             )

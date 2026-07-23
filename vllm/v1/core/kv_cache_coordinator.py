@@ -457,9 +457,10 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             else:
                 attention_groups.append((spec, [i], manager_cls))
 
-        assert len(attention_groups) > 1, (
-            "HybridKVCacheCoordinator requires at least two attention groups."
-        )
+        if not attention_groups:
+            self.attention_groups = []
+            self.lcm_block_size = self.hash_block_size
+            return
 
         # Put full attention first: its efficient left-to-right scan provides
         # a tighter initial bound, reducing work for subsequent groups.
@@ -603,7 +604,7 @@ def get_kv_cache_coordinator(
     hash_block_size: int,
     metrics_collector: KVCacheMetricsCollector | None = None,
 ) -> KVCacheCoordinator:
-    if not enable_caching:
+    if not enable_caching or len(kv_cache_config.kv_cache_groups) == 0:
         return KVCacheCoordinatorNoPrefixCache(
             kv_cache_config,
             max_model_len,

@@ -700,8 +700,19 @@ class MessageQueue:
                 self._spin_condition.record_read()
                 break
 
-    def enqueue(self, obj, timeout: float | None = None):
-        """Write to message queue with optional timeout (in seconds)"""
+    def enqueue(
+        self,
+        obj,
+        timeout: float | None = None,
+        local_only: bool = False,
+    ):
+        """Write to message queue with optional timeout (in seconds).
+
+        When ``local_only`` is True the message is delivered only to local
+        (shared-memory) readers; remote (cross-node) readers are skipped.
+        Used by the edge-cloud executor to keep edge SchedulerOutputs off the
+        cross-node wire when the cloud receives them via ZMQ instead.
+        """
         assert self._is_writer, "Only writers can enqueue"
         all_buffers: list[SizedBuffer] = [b""]
         total_bytes = 6  # 2 bytes for oob buffer count, 4 for main buffer size
@@ -742,7 +753,7 @@ class MessageQueue:
 
             self._spin_condition.notify()
 
-        if self.n_remote_reader > 0:
+        if self.n_remote_reader > 0 and not local_only:
             self.remote_socket.send_multipart(all_buffers, copy=False)
 
     def dequeue(
@@ -793,6 +804,7 @@ class MessageQueue:
         max_chunks,
         reader_rank: int = 0,
         blocking: bool = False,
+        vllm_config=None,
     ) -> tuple["MessageQueue", list[Handle]]:
         """
         Creates a MessageQueue for a process group with a single reader.
@@ -816,9 +828,23 @@ class MessageQueue:
             The MessageQueue instance for the calling process,
             and a list of handles (only non-empty for the reader process).
         """
-        local_size = current_platform.device_count()
         rank = dist.get_rank()
-        same_node = rank // local_size == reader_rank // local_size
+        ranks = dist.get_process_group_ranks(pg)
+        reader_rank_in_group = ranks.index(reader_rank)
+        rank_in_group = ranks.index(rank)
+        if (
+            vllm_config is not None
+            and vllm_config.parallel_config.enable_edge_cloud
+        ):
+            from vllm.distributed.parallel_state import in_the_same_node_as_edge_cloud
+
+            same_node_status = in_the_same_node_as_edge_cloud(
+                pg, source_rank=reader_rank_in_group, vllm_config=vllm_config
+            )
+            same_node = same_node_status[rank_in_group]
+        else:
+            local_size = current_platform.device_count()
+            same_node = rank // local_size == reader_rank // local_size
         buffer_io = MessageQueue(
             n_reader=1,
             n_local_reader=1 if same_node else 0,

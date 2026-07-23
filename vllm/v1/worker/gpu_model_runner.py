@@ -42,6 +42,8 @@ from vllm.distributed.parallel_state import (
     get_pp_group,
     get_tp_group,
     graph_capture,
+    is_edge_cloud_first_stage,
+    is_edge_device,
     is_global_first_rank,
     prepare_communication_buffer_for_model,
 )
@@ -1322,7 +1324,12 @@ class GPUModelRunner(
                     # We must recover the output token ids for resumed requests in the
                     # async scheduling case, so that correct input_ids are obtained.
                     resumed_token_ids = req_data.all_token_ids[req_id]
-                    req_state.output_token_ids = resumed_token_ids[-num_output_tokens:]
+                    # resumed_token_ids is an np.ndarray(int32) on the wire
+                    # (see scheduler._make_cached_request_data). .tolist()
+                    # yields a native list[int] so downstream list ops
+                    # (.append/.extend/.clear/del) keep working.
+                    req_state.output_token_ids = resumed_token_ids[
+                        -num_output_tokens:].tolist()
 
                 reqs_to_add.append(req_state)
                 # Track resumed requests for ngram_gpu full tensor copy
@@ -3229,7 +3236,7 @@ class GPUModelRunner(
         # modal outputs after that to ensure the correct order
         ec_connector_output = None
 
-        if self.supports_mm_inputs and is_first_rank and not is_encoder_decoder:
+        if self.supports_mm_inputs and is_first_rank and not is_encoder_decoder and intermediate_tensors is None:
             # Run the multimodal encoder if any.
             with self.maybe_get_ec_connector_output(
                 scheduler_output,
@@ -3255,7 +3262,7 @@ class GPUModelRunner(
                 **self._init_model_kwargs(),
                 **self._extract_mm_kwargs(scheduler_output),
             }
-        elif self.enable_prompt_embeds and is_first_rank:
+        elif self.enable_prompt_embeds and is_first_rank and intermediate_tensors is None:
             # Get the input embeddings for the tokens that are not input embeds,
             # then put them into the appropriate positions.
             # TODO(qthequartermasterman): Since even when prompt embeds are
@@ -3300,7 +3307,7 @@ class GPUModelRunner(
             if num_input_tokens > num_scheduled_tokens:
                 self.positions[num_scheduled_tokens:num_input_tokens].zero_()
 
-        if is_first_rank:
+        if is_first_rank and (not is_edge_device() or intermediate_tensors is None):
             intermediate_tensors = None
         else:
             assert intermediate_tensors is not None
@@ -4067,7 +4074,10 @@ class GPUModelRunner(
 
             if not self.broadcast_pp_output:
                 # Common case.
-                if not get_pp_group().is_last_rank:
+                if (
+                    not get_pp_group().is_last_rank
+                    or is_edge_cloud_first_stage(intermediate_tensors)
+                ):
                     # Return the intermediate tensors.
                     assert isinstance(hidden_states, IntermediateTensors)
                     hidden_states.kv_connector_output = kv_connector_output

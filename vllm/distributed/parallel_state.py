@@ -415,7 +415,7 @@ class GroupCoordinator:
         )
 
     def create_single_reader_mq_broadcasters(
-        self, reader_rank_in_group=0, blocking=False
+        self, reader_rank_in_group=0, blocking=False, vllm_config=None
     ):
         from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 
@@ -425,6 +425,7 @@ class GroupCoordinator:
             6,
             reader_rank=self.ranks[reader_rank_in_group],
             blocking=blocking,
+            vllm_config=vllm_config,
         )
 
     @property
@@ -440,11 +441,15 @@ class GroupCoordinator:
     @property
     def is_first_rank(self):
         """Return whether the caller is the first process in the group"""
+        if _IS_EDGE_DEVICE is not None and self.unique_name.startswith("pp"):
+            return not is_cloud_device()
         return self.rank == self.first_rank
 
     @property
     def is_last_rank(self):
         """Return whether the caller is the last process in the group"""
+        if _IS_EDGE_DEVICE is not None and self.unique_name.startswith("pp"):
+            return not is_cloud_device()
         return self.rank == self.last_rank
 
     @property
@@ -1216,6 +1221,47 @@ def _replace_active_groups(
 
 
 _TP: GroupCoordinator | None = None
+_IS_EDGE_DEVICE: bool | None = None
+_EDGE_CLOUD_HEAD_K: int = 0
+_EDGE_CLOUD_TAIL_K: int = 0
+
+
+def is_edge_device() -> bool:
+    return _IS_EDGE_DEVICE is True
+
+
+def is_cloud_device() -> bool:
+    return _IS_EDGE_DEVICE is False
+
+
+def is_edge_cloud_pp_mode() -> bool:
+    return _IS_EDGE_DEVICE is not None
+
+
+def is_edge_cloud_first_stage(intermediate_tensors) -> bool:
+    return is_edge_cloud_pp_mode() and intermediate_tensors is None
+
+
+def set_edge_cloud_layer_range(head_k: int, tail_k: int) -> None:
+    """Store the edge-cloud head / tail layer counts for use by
+    :func:`make_layers` during model initialisation.
+
+    Must be called **before** ``initialize_model()`` / ``get_model()``
+    so that ``make_layers()`` can create the correct mix of real layers
+    and ``PPMissingLayer`` placeholders directly on the target device.
+    """
+    global _EDGE_CLOUD_HEAD_K, _EDGE_CLOUD_TAIL_K
+    _EDGE_CLOUD_HEAD_K = head_k
+    _EDGE_CLOUD_TAIL_K = tail_k
+
+
+def get_edge_cloud_layer_range() -> tuple[int, int] | None:
+    """Return ``(head_k, tail_k)`` if edge-cloud mode is active,
+    or ``None`` otherwise.
+    """
+    if _IS_EDGE_DEVICE is None:
+        return None
+    return _EDGE_CLOUD_HEAD_K, _EDGE_CLOUD_TAIL_K
 
 
 def get_tp_group() -> GroupCoordinator:
@@ -1518,11 +1564,91 @@ def initialize_model_parallel(
 
     from vllm.config import get_current_vllm_config
 
+    global _IS_EDGE_DEVICE, _TP, _PP, _DCP, _PCP, _DP, _EP, _EPLB
+
     config = get_current_vllm_config()
     data_parallel_size = config.parallel_config.data_parallel_size
     enable_elastic_ep = config.parallel_config.enable_elastic_ep
     parallel_config = config.parallel_config
     coord_store: Store | None = None
+    if parallel_config.enable_edge_cloud:
+        world_size = torch.distributed.get_world_size()
+        rank = torch.distributed.get_rank()
+        backend = backend or torch.distributed.get_backend(
+            get_world_group().device_group
+        )
+        edge_npu_count = parallel_config.edge_npu_count
+        is_edge = rank < edge_npu_count
+        _IS_EDGE_DEVICE = is_edge
+
+        tp_edge_ranks = list(range(edge_npu_count))
+        tp_cloud_ranks = list(range(edge_npu_count, world_size))
+        assert _TP is None, "tensor model parallel group is already initialized"
+        _TP = init_model_parallel_group(
+            [tp_edge_ranks, tp_cloud_ranks],
+            get_world_group().local_rank,
+            backend,
+            use_message_queue_broadcaster=True,
+            group_name="tp",
+        )
+
+        pp_group_ranks = [0, edge_npu_count]
+        pp_other_ranks = [
+            [r] for r in range(world_size) if r not in (0, edge_npu_count)
+        ]
+        assert _PP is None, "pipeline model parallel group is already initialized"
+        _PP = init_model_parallel_group(
+            [pp_group_ranks] + pp_other_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="pp",
+        )
+
+        all_ranks = list(range(world_size))
+        assert _DCP is None, "decode context model parallel group is already initialized"
+        _DCP = init_model_parallel_group(
+            [[r] for r in all_ranks],
+            get_world_group().local_rank,
+            backend,
+            use_message_queue_broadcaster=True,
+            group_name="dcp",
+        )
+        assert _PCP is None, "prefill context parallel group is already initialized"
+        _PCP = init_model_parallel_group(
+            [[r] for r in all_ranks],
+            get_world_group().local_rank,
+            backend,
+            group_name="pcp",
+        )
+        assert _DP is None, "data parallel group is already initialized"
+        _DP = init_model_parallel_group(
+            [[r] for r in all_ranks],
+            get_world_group().local_rank,
+            backend,
+            group_name="dp",
+        )
+        assert _EP is None, "expert parallel group is already initialized"
+        _EP = init_model_parallel_group(
+            [tp_edge_ranks, tp_cloud_ranks],
+            get_world_group().local_rank,
+            backend,
+            group_name="ep",
+        )
+
+        logger.info_once(
+            "Edge-cloud collaboration mode initialized: rank=%s, is_edge=%s, "
+            "edge_npu_count=%s, cloud_npu_count=%s, TP edge ranks=%s, "
+            "TP cloud ranks=%s, PP group ranks=%s",
+            rank,
+            is_edge,
+            edge_npu_count,
+            parallel_config.cloud_npu_count,
+            tuple(tp_edge_ranks),
+            tuple(tp_cloud_ranks),
+            tuple(pp_group_ranks),
+        )
+        return
+
     if enable_elastic_ep:
         coord_store = get_cached_tcp_store_client(
             parallel_config.data_parallel_master_ip,
@@ -1567,7 +1693,6 @@ def initialize_model_parallel(
     )  # noqa
 
     # Build the tensor model-parallel groups.
-    global _TP
     assert _TP is None, "tensor model parallel group is already initialized"
     group_ranks = all_ranks.view(-1, tensor_model_parallel_size).unbind(0)
     group_ranks = [x.tolist() for x in group_ranks]
@@ -1584,7 +1709,6 @@ def initialize_model_parallel(
     )
 
     # Build the DCP model-parallel groups.
-    global _DCP
     assert _DCP is None, "decode context model parallel group is already initialized"
     # Note(hc): In the current implementation of decode context parallel,
     # dcp_size must not exceed tp_size, because the world size does not
@@ -1605,7 +1729,6 @@ def initialize_model_parallel(
         group_name="dcp",
     )
 
-    global _PCP
     assert _PCP is None, "prefill context parallel group is already initialized"
     group_ranks = (
         all_ranks.transpose(3, 4)
@@ -1625,7 +1748,6 @@ def initialize_model_parallel(
     )
 
     # Build the pipeline model-parallel groups.
-    global _PP
     assert _PP is None, "pipeline model parallel group is already initialized"
     group_ranks = (
         all_ranks.transpose(2, 4).reshape(-1, pipeline_model_parallel_size).unbind(0)
@@ -1642,7 +1764,6 @@ def initialize_model_parallel(
         group_ranks, get_world_group().local_rank, backend, group_name="pp"
     )
 
-    global _DP
     assert _DP is None, "data parallel group is already initialized"
     group_ranks = all_ranks.transpose(1, 4).reshape(-1, data_parallel_size).unbind(0)
     group_ranks = [x.tolist() for x in group_ranks]
@@ -1659,7 +1780,6 @@ def initialize_model_parallel(
             group_ranks, get_world_group().local_rank, backend, group_name="dp"
         )
 
-    global _EP
     assert _EP is None, "expert parallel group is already initialized"
     # Don't create EP group for dense models.
     if config.model_config is None or config.model_config.is_moe:
@@ -1691,7 +1811,6 @@ def initialize_model_parallel(
         # This is a separate process group to isolate EPLB communications
         # from MoE forward pass collectives and prevent deadlocks when
         # using torch.distributed in execution with torch.distributed in EPLB.
-        global _EPLB
         assert _EPLB is None, "EPLB group is already initialized"
         if config.parallel_config.enable_eplb:
             if enable_elastic_ep:
@@ -1854,11 +1973,12 @@ def get_node_count() -> int:
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
-    global _TP
+    global _TP, _IS_EDGE_DEVICE
 
     if _TP:
         _TP.destroy()
     _TP = None
+    _IS_EDGE_DEVICE = None
 
     global _DCP
     if _DCP:
@@ -1935,6 +2055,25 @@ def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
             logger.warning(
                 "torch._C._host_emptyCache() only available in Pytorch >=2.5"
             )
+
+
+def in_the_same_node_as_edge_cloud(
+    pg: ProcessGroup | StatelessProcessGroup,
+    source_rank: int,
+    vllm_config,
+) -> list[bool]:
+    if isinstance(pg, ProcessGroup):
+        ranks = torch.distributed.get_process_group_ranks(pg)
+    else:
+        ranks = list(range(pg.world_size))
+
+    edge_npu_count = vllm_config.parallel_config.edge_npu_count
+    source_global_rank = ranks[source_rank]
+    source_is_edge = source_global_rank < edge_npu_count
+    return [
+        rank < edge_npu_count if source_is_edge else rank >= edge_npu_count
+        for rank in ranks
+    ]
 
 
 def in_the_same_node_as(
