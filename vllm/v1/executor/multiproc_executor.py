@@ -455,11 +455,11 @@ class MultiprocExecutor(Executor):
             (send_method, args, kwargs, output_rank), local_only=local_only
         )
         _dt_ms = (time.monotonic() - _t0) * 1000
-        logger.info(
-            "[EDGE-ENQUEUE] %s enqueue took %.3f ms",
-            _bt,
-            _dt_ms,
-        )
+        # logger.info(
+        #     "[EDGE-ENQUEUE] %s enqueue took %.3f ms",
+        #     _bt,
+        #     _dt_ms,
+        # )
 
         response_mqs: Sequence[MessageQueue] = self.response_mqs
         if output_rank is not None:
@@ -1209,11 +1209,11 @@ class WorkerProc:
                         getattr(args[0], "batch_type", None)
                         if args else None
                     )
-                    logger.info(
-                        "[EDGE-DEQUEUE] dequeue took %.3f ms batch_type: %s",
-                        _dt_ms,
-                        _bt.value if _bt is not None else "N/A",
-                    )
+                    # logger.info(
+                    #     "[EDGE-DEQUEUE] dequeue took %.3f ms batch_type: %s",
+                    #     _dt_ms,
+                    #     _bt.value if _bt is not None else "N/A",
+                    # )
                 output = func(*args, **kwargs)
             except Exception as e:
                 # Notes have been introduced in python 3.11

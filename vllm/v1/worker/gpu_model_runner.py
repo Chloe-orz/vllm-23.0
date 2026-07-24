@@ -1388,13 +1388,55 @@ class GPUModelRunner(
                 if self.use_async_scheduling and num_output_tokens > 0:
                     # We must recover the output token ids for resumed requests in the
                     # async scheduling case, so that correct input_ids are obtained.
-                    resumed_token_ids = req_data.all_token_ids[req_id]
+                    resumed_token_ids = req_data.all_token_ids.get(req_id)
+                    if resumed_token_ids is None:
+                        # [ascend fix] The entry may be missing when the
+                        # scheduler-side downlink condition and the
+                        # placeholder-inclusive wire num_output_tokens
+                        # disagree (e.g. chunked-prefill continuation), or
+                        # when an edge-cloud trim dropped it. Degrade to an
+                        # empty recovery with a loud log instead of crashing
+                        # the whole engine with a KeyError.
+                        # logger.error(
+                        #     "[EDGE-CLOUD-RECOVER] req=%s missing "
+                        #     "all_token_ids entry (num_output_tokens=%d); "
+                        #     "recovering with empty output history",
+                        #     req_id,
+                        #     num_output_tokens,
+                        # )
+                        resumed_token_ids = np.empty(0, dtype=np.int32)
+                    # [ascend fix] `num_output_tokens` on the wire includes
+                    # `num_output_placeholders` (in-flight async/spec tokens
+                    # that have NOT been appended to `all_token_ids` yet).
+                    # Upstream only resumes after preemption, where the
+                    # placeholder count is reset to 0, so slicing with the
+                    # placeholder-inclusive count is safe there. In edge-cloud
+                    # PD separation the cloud side may rebuild its persistent
+                    # batch while placeholders are pending; slicing
+                    # [-num_output_tokens:] then reaches placeholder-count
+                    # tokens into the PROMPT and poisons output_token_ids,
+                    # producing garbled decode. Clamp to the tokens that
+                    # actually exist beyond the prompt; the placeholder tokens
+                    # will arrive through the normal update path.
+                    num_recoverable = (
+                        len(resumed_token_ids) - req_state.num_prompt_tokens
+                    )
+                    if num_output_tokens > num_recoverable:
+                        # logger.warning(
+                        #     "[EDGE-CLOUD-RECOVER] req=%s clamping recovered "
+                        #     "output tokens: requested=%d recoverable=%d "
+                        #     "(async placeholders in flight)",
+                        #     req_id,
+                        #     num_output_tokens,
+                        #     num_recoverable,
+                        # )
+                        num_output_tokens = max(num_recoverable, 0)
                     # resumed_token_ids is an np.ndarray(int32) on the wire
                     # (see scheduler._make_cached_request_data). .tolist()
                     # yields a native list[int] so downstream list ops
                     # (.append/.extend/.clear/del) keep working.
                     req_state.output_token_ids = resumed_token_ids[
-                        -num_output_tokens:].tolist()
+                        -num_output_tokens:].tolist() if num_output_tokens > 0 else []
 
                 reqs_to_add.append(req_state)
                 # Track resumed requests for ngram_gpu full tensor copy

@@ -1131,13 +1131,30 @@ class Scheduler(SchedulerInterface):
             if idx >= num_running_reqs:
                 assert not scheduled_in_prev_step
                 resumed_req_ids.add(req_id)
-            if not scheduled_in_prev_step:
+            if (not scheduled_in_prev_step or req.num_output_tokens > 0
+                    or req.num_output_placeholders > 0):
                 # np.ndarray(int32) on the wire: pickle protocol 5 routes numpy
                 # arrays through PickleBuffer, so deserialize is a zero-copy
                 # np.frombuffer (no per-int PyLong alloc) even when inlined
                 # (<1 MiB). ~halves bytes vs list[int] and avoids the
                 # PyLong-per-int GIL cost that dominated dequeue latency.
                 # Use Request-level cached view to avoid repeated conversion.
+                #
+                # In edge-cloud PD separation the cloud (non-last PP rank) may
+                # rebuild its persistent batch (unscheduled removal drops an
+                # in-flight request), so a continuously-scheduled request can
+                # appear with req_index is None and trigger the all_token_ids
+                # recovery path.  Standard PP avoids this because every rank
+                # receives the same scheduler_output; edge-cloud must therefore
+                # carry all_token_ids for ANY request with output tokens, not
+                # only newly-scheduled ones.
+                #
+                # The num_output_placeholders term matters: the wire value of
+                # num_output_tokens (below) INCLUDES async/spec placeholders,
+                # so the worker-side recovery path can trigger for a request
+                # with zero real output tokens (e.g. a chunked-prefill
+                # continuation in async mode). Without this term the entry
+                # would be missing and the worker crashes with a KeyError.
                 all_token_ids[req_id] = req.cached_all_token_ids_np
             new_block_ids.append(
                 req_to_new_blocks[req_id].get_block_ids(allow_none=True)

@@ -195,6 +195,24 @@ class EngineCore:
         ) = None
         if self.batch_queue_size > 1:
             logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
+        # [ascend insert] Edge-cloud diagnosis: the Head-Middle-Tail pipeline
+        # requires batch_queue_size >= 4. Log the effective value together
+        # with the scheduler class so a misconfigured (e.g. non PD-separated)
+        # deployment is visible at startup instead of as garbled output.
+        if getattr(vllm_config.parallel_config, "enable_edge_cloud", False):
+            logger.info(
+                "[EDGE-CLOUD] batch_queue_size=%d, scheduler_cls=%s, "
+                "async_scheduling=%s",
+                self.batch_queue_size,
+                vllm_config.scheduler_config.scheduler_cls,
+                vllm_config.scheduler_config.async_scheduling,
+            )
+            if self.batch_queue_size < 4:
+                logger.warning(
+                    "[EDGE-CLOUD] batch_queue_size=%d < 4: the edge-cloud "
+                    "pipeline may misalign head/tail stages under load.",
+                    self.batch_queue_size,
+                )
             self.batch_queue = deque(maxlen=self.batch_queue_size)
 
         self.is_ec_consumer = (
