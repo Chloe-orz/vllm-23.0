@@ -1761,6 +1761,23 @@ def _report_kv_cache_config(
             getattr(_spec, "block_size", "?"),
             _page_bytes,
         )
+        # [diagnosis] Full spec repr: reveals whether num_kv_heads /
+        # state heads are TP-sharded (compare across versions).
+        logger.info_once("[KVCFG] group=%d spec_repr=%r", _i, _spec)
+    _pc = vllm_config.parallel_config
+    logger.info_once(
+        "[KVCFG] parallel: tp=%d pp=%d dp=%d dcp=%d pcp=%d world=%d "
+        "edge_cloud=%s edge_npu=%s cloud_npu=%s",
+        _pc.tensor_parallel_size,
+        _pc.pipeline_parallel_size,
+        _pc.data_parallel_size,
+        getattr(_pc, "decode_context_parallel_size", -1),
+        getattr(_pc, "prefill_context_parallel_size", -1),
+        _pc.world_size,
+        getattr(_pc, "enable_edge_cloud", None),
+        getattr(_pc, "edge_npu_count", None),
+        getattr(_pc, "cloud_npu_count", None),
+    )
     for _t in kv_cache_config.kv_cache_tensors:
         logger.info_once(
             "[KVCFG] tensor size=%d shared_by=%d layers",
