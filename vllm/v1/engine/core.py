@@ -302,6 +302,15 @@ class EngineCore:
             scheduler_kv_cache_config = generate_scheduler_kv_cache_config(
                 [kv_cache_configs[max_group_idx]]
             )
+            # [diagnosis] Which worker config drives the scheduler.
+            logger.info(
+                "[KVCFG] scheduler config from worker=%d groups=%d "
+                "num_blocks=%d (all worker group counts=%s)",
+                max_group_idx,
+                len(scheduler_kv_cache_config.kv_cache_groups),
+                scheduler_kv_cache_config.num_blocks,
+                [len(c.kv_cache_groups) for c in kv_cache_configs],
+            )
         else:
             scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
         vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks

@@ -1743,6 +1743,36 @@ def _report_kv_cache_config(
     num_tokens = int(max_concurrency * max_model_len)
 
     logger.info_once("GPU KV cache size: %s tokens", f"{num_tokens:,}")
+    # [diagnosis] Dump per-group / per-tensor composition so KV-capacity
+    # regressions (same GiB, fewer tokens) can be attributed to a specific
+    # group or tensor. Remove after root cause is confirmed.
+    for _i, _group in enumerate(kv_cache_config.kv_cache_groups):
+        _spec = _group.kv_cache_spec
+        try:
+            _page_bytes = _spec.max_memory_usage_bytes(vllm_config)
+        except Exception:
+            _page_bytes = -1
+        logger.info_once(
+            "[KVCFG] group=%d layers=%d spec=%s block_size=%s "
+            "page_bytes_per_layer=%s",
+            _i,
+            len(_group.layer_names),
+            type(_spec).__name__,
+            getattr(_spec, "block_size", "?"),
+            _page_bytes,
+        )
+    for _t in kv_cache_config.kv_cache_tensors:
+        logger.info_once(
+            "[KVCFG] tensor size=%d shared_by=%d layers",
+            _t.size,
+            len(_t.shared_by),
+        )
+    logger.info_once(
+        "[KVCFG] num_blocks=%d block_size=%s num_tensors=%d",
+        kv_cache_config.num_blocks,
+        vllm_config.cache_config.block_size,
+        len(kv_cache_config.kv_cache_tensors),
+    )
     logger.info_once(
         "Maximum concurrency for %s tokens per request: %.2fx",
         f"{max_model_len:,}",
@@ -2018,6 +2048,16 @@ def get_kv_cache_configs(
     # hybrid models when disable_hybrid_kv_cache_manager is enabled.
     # After this call, merged_kv_cache_specs may be modified in-place.
     global_kv_cache_groups = get_kv_cache_groups(vllm_config, merged_kv_cache_specs)
+    # [diagnosis] Global merged spec/group summary.
+    logger.info(
+        "[KVCFG] merged spec: layers=%d global_groups=%d "
+        "layers_per_group=%s kv_dtype=%s block_size=%s",
+        len(merged_kv_cache_specs),
+        len(global_kv_cache_groups),
+        [len(g.layer_names) for g in global_kv_cache_groups],
+        vllm_config.cache_config.cache_dtype,
+        vllm_config.cache_config.block_size,
+    )
 
     # If original_max_model_len was -1, automatically
     # determine the maximum model length that fits in available GPU memory.
@@ -2084,6 +2124,18 @@ def get_kv_cache_configs(
             assert sum(len(group.layer_names) for group in projected_groups) == len(
                 kv_cache_spec_one_worker
             ), "Some layers are not assigned to any group."
+        # [diagnosis] Per-worker capacity inputs: spec size, projected
+        # groups, available memory. Compare across versions to find which
+        # input to the num_blocks computation changed.
+        logger.info(
+            "[KVCFG] worker=%d spec_layers=%d projected_groups=%d "
+            "projected_layers=%d avail_mem=%.2fGiB",
+            len(kv_cache_configs),
+            len(kv_cache_spec_one_worker),
+            len(projected_groups),
+            sum(len(g.layer_names) for g in projected_groups),
+            available_memory_one_worker / (1 << 30),
+        )
         kv_cache_configs.append(
             get_kv_cache_config_from_groups(
                 vllm_config, projected_groups, available_memory_one_worker
@@ -2095,6 +2147,13 @@ def get_kv_cache_configs(
     # allocating unused memory.
     min_num_blocks = min(
         kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
+    )
+    # [diagnosis] Block-count summary before unification: per-worker
+    # num_blocks and the adopted minimum.
+    logger.info(
+        "[KVCFG] per-worker num_blocks=%s -> unified min=%d",
+        [cfg.num_blocks for cfg in kv_cache_configs],
+        min_num_blocks,
     )
     for kv_cache_config in kv_cache_configs:
         num_blocks_old = kv_cache_config.num_blocks
