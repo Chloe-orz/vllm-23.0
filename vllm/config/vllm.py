@@ -495,6 +495,13 @@ class VllmConfig:
 
     @property
     def max_concurrent_batches(self) -> int:
+        # [ascend insert] Edge-cloud co-mode needs a deeper batch queue to
+        # fill the Head-Middle-Tail multi-stage pipeline. Keep this in sync
+        # with MultiprocExecutor.max_concurrent_batches(); EngineCore reads
+        # the value from here (vllm/v1/engine/core.py), so the executor-side
+        # override alone is not sufficient.
+        if getattr(self.parallel_config, "enable_edge_cloud", False):
+            return 4
         # PP requires PP-size concurrent batches to fill the pipeline.
         # Async scheduling requires 2 concurrent batches to overlap.
         pp_size = self.parallel_config.pipeline_parallel_size

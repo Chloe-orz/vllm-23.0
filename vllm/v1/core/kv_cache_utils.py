@@ -1935,8 +1935,16 @@ def _project_kv_cache_groups_to_worker(
         worker_layer_names = [
             layer_name for layer_name in group.layer_names if layer_name in worker_spec
         ]
+        if not worker_layer_names:
+            # Edge-cloud head_tail (首一尾一): a group whose layers all live
+            # on the peer side has no layers on this worker. Drop it so the
+            # per-worker config only contains groups with real local layers;
+            # the scheduler side uses the max-groups worker config instead
+            # (see EngineCore._initialize_kv_caches), so cross-worker group
+            # structure divergence is expected and supported.
+            continue
         group_spec = group.kv_cache_spec
-        if worker_layer_names and isinstance(group_spec, UniformTypeKVCacheSpecs):
+        if isinstance(group_spec, UniformTypeKVCacheSpecs):
             group_spec = UniformTypeKVCacheSpecs(
                 block_size=group_spec.block_size,
                 kv_cache_specs={
