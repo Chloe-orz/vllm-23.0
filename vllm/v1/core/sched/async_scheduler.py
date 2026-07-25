@@ -56,8 +56,25 @@ class AsyncScheduler(Scheduler):
         )
 
         # Update the number of output placeholders.
-        request.num_output_placeholders -= len(new_token_ids)
-        assert request.num_output_placeholders >= 0
+        if request.num_output_placeholders < len(new_token_ids):
+            # [ascend fix] In edge-cloud PD separation an unattributable
+            # output frame (e.g. a duplicated DECODE_LAST, or a stale frame
+            # racing with preemption) would drive num_output_placeholders
+            # negative. Upstream turns this into a fatal assert, killing the
+            # whole engine for what is a single-request accounting anomaly.
+            # Clamp instead and log loudly so the anomaly is visible without
+            # taking every other running request down with it.
+            logger.warning(
+                "[PD-ASYNC-GUARD] req=%s unattributable output frame: "
+                "num_output_placeholders=%d < new_token_ids=%d; clamping to "
+                "zero instead of crashing the engine.",
+                request.request_id,
+                request.num_output_placeholders,
+                len(new_token_ids),
+            )
+            request.num_output_placeholders = 0
+        else:
+            request.num_output_placeholders -= len(new_token_ids)
 
         # Cache the new tokens. Preempted requests should be skipped.
         if status_before_update == RequestStatus.RUNNING:
