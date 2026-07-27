@@ -3499,6 +3499,31 @@ class GPUModelRunner(
                 is_multimodal=is_mm_embed,
             )
 
+            # [diagnosis] Log freshly-computed embeddings stats for the
+            # first real batch: distinguishes "embed_input_ids returned
+            # wrong values" from "buffer overwritten after compute".
+            if not getattr(self, "_first_embeds_logged", False) and len(self.requests) > 0:
+                self._first_embeds_logged = True
+                try:
+                    _st = inputs_embeds_scheduled.detach().float()
+                    _w = None
+                    try:
+                        _emb_mod = getattr(self.model.model, "embed_tokens", None)
+                        if _emb_mod is not None:
+                            _w = (
+                                float(_emb_mod.weight.detach().float().abs().max()),
+                                tuple(_emb_mod.weight.shape),
+                            )
+                    except Exception:
+                        pass
+                    logger.warning(
+                        "[EC-DIAG] mm branch embeds: scheduled(absmax,sum)="
+                        "(%s, %s) embed_weight(absmax,shape)=%s",
+                        float(_st.abs().max()), float(_st.sum()), _w,
+                    )
+                except Exception:
+                    logger.exception("[EC-DIAG] failed to log mm embeds")
+
             # TODO(woosuk): Avoid the copy. Optimize.
             self.inputs_embeds.gpu[:num_scheduled_tokens].copy_(inputs_embeds_scheduled)
 
