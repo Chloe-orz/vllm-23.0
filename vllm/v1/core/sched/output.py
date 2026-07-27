@@ -317,6 +317,13 @@ class SchedulerOutput:
     draft_task_id: str | None = None
     draft_step_idx: int | None = None
 
+    # Edge-side hint to cloud-side PassiveScheduler about whether layer slicing
+    # is worthwhile for this prefill batch. True = decode is (or will soon be)
+    # active on the cloud side, so interleaving slices with decode batches is
+    # profitable. False = cold-start / pure-prefill phase, skip slicing to avoid
+    # throttle and multi-dispatch overhead.
+    cloud_suggest_slicing: bool | None = None
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(
