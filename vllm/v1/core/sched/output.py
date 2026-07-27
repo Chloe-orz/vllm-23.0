@@ -57,6 +57,10 @@ class BatchType(enum.Enum):
                      edge head segment (Phase 4)
     - DECODE_LAST:   edge-cloud PD separation — decode batch executing the
                      edge tail segment (Phase 4)
+    - DRAFT_FIRST:   edge-cloud speculative draft batch executing the edge
+                     head segment for one draft step
+    - DRAFT_LAST:    edge-cloud speculative draft batch executing the edge
+                     tail segment for one draft step
     """
     PD_MIX = "pd_mix"
     PURE_PREFILL = "pure_prefill"
@@ -67,6 +71,8 @@ class BatchType(enum.Enum):
     PREFILL_LAST = "prefill_last"
     DECODE_FIRST = "decode_first"
     DECODE_LAST = "decode_last"
+    DRAFT_FIRST = "draft_first"
+    DRAFT_LAST = "draft_last"
 
 
 @dataclass
@@ -301,8 +307,24 @@ class SchedulerOutput:
 
     # Data-plane hidden tensor channel for edge-cloud PD separation. Prefill
     # head/tail batches use one of two prefill channels; decode uses the
-    # dedicated decode channel. The cloud echoes this field back unchanged.
+    # dedicated decode channel. Scheduled speculative drafts also use the
+    # decode channel. The cloud echoes this field back unchanged.
     hidden_channel: HiddenChannelType | None = None
+
+    # Scheduled draft control-plane identity. Each draft step uses its own
+    # head_token for edge/cloud pairing; the fields below identify the parent
+    # request, the whole draft chain, and the current draft step. This is
+    # shared by MTP and Eagle-style draft models.
+    parent_req_id: str | None = None
+    draft_task_id: str | None = None
+    draft_step_idx: int | None = None
+
+    # Edge-side hint to cloud-side PassiveScheduler about whether layer slicing
+    # is worthwhile for this prefill batch. True = decode is (or will soon be)
+    # active on the cloud side, so interleaving slices with decode batches is
+    # profitable. False = cold-start / pure-prefill phase, skip slicing to avoid
+    # throttle and multi-dispatch overhead.
+    cloud_suggest_slicing: bool | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
