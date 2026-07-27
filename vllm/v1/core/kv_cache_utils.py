@@ -1245,6 +1245,73 @@ def _get_kv_cache_config_deepseek_v4(
     return num_blocks, kv_cache_tensors
 
 
+def _local_sharded_page_size_bytes(spec: KVCacheSpec) -> int:
+    """Per-block bytes the OWNING worker must physically allocate for this
+    spec, ignoring the canonical page_size_padded (which exists only to
+    align page sizes across edge/cloud workers with different TP sizes).
+    Falls back to page_size_bytes for specs without a padded/real split."""
+    real_page_size = getattr(spec, "real_page_size_bytes", None)
+    if real_page_size is not None:
+        # AttentionSpec family: real page derives from the worker-local
+        # (TP-sharded) num_kv_heads / head_size.
+        real = real_page_size
+        kv_quant_mode = getattr(spec, "kv_quant_mode", None)
+        if kv_quant_mode is not None and kv_quant_mode.is_per_token_head:
+            real += (
+                2 * spec.block_size * spec.num_kv_heads
+                * get_dtype_size(torch.float32)
+            )
+        return real
+    if isinstance(spec, MambaSpec):
+        # Mamba state page derives from the worker-local (TP-sharded)
+        # conv/ssm shapes.
+        return sum(
+            math.prod(shape) * get_dtype_size(dtype)
+            for shape, dtype in zip(spec.shapes, spec.dtypes)
+        )
+    return spec.page_size_bytes
+
+
+def _localize_group_page_sizes(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> list[KVCacheGroupSpec]:
+    """Rebase every group's page_size_padded from the canonical
+    (cross-worker alignment) page to the LOCAL page, keeping pages uniform
+    across groups (the shared-tensor layout requires a single page size)
+    while restoring true physical capacity on the higher-TP side.
+
+    The local page mirrors how the canonical page is composed: the shared
+    tensor's per-block region packs the attention KV and the mamba conv
+    state contiguously (the KV view strides by the FULL padded page, see
+    NPUModelRunner._reshape_kv_cache_tensors), so the page must cover
+    ``max(attention real page) + conv state page`` — computed here from the
+    worker-LOCAL (TP-sharded) components instead of the canonical TP=1
+    components. Using only ``max(real pages)`` under-allocates each block
+    by the conv-state bytes and corrupts every block beyond the first."""
+    real_pages: list[int] = []
+    conv_page = 0
+    for group in kv_cache_groups:
+        spec = group.kv_cache_spec
+        real_pages.append(_local_sharded_page_size_bytes(spec))
+        if isinstance(spec, MambaSpec):
+            # conv state is the smallest mamba shape component (cf.
+            # patch_mamba_config: ssm = max, conv = min).
+            conv_page = min(
+                math.prod(shape) * get_dtype_size(dtype)
+                for shape, dtype in zip(spec.shapes, spec.dtypes)
+            )
+    local_page = max(real_pages) + conv_page
+    localized: list[KVCacheGroupSpec] = []
+    for group in kv_cache_groups:
+        spec = group.kv_cache_spec
+        if spec.page_size_bytes != local_page:
+            # Rebase to the local uniform page. local_page covers every
+            # group's real page, so page_size_padded >= real holds.
+            spec = replace(spec, page_size_padded=local_page)
+        localized.append(replace(group, kv_cache_spec=spec))
+    return localized
+
+
 def get_kv_cache_config_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1269,6 +1336,19 @@ def get_kv_cache_config_from_groups(
             kv_cache_tensors=[],
             kv_cache_groups=kv_cache_groups,
         )
+
+    if vllm_config.parallel_config.enable_edge_cloud:
+        # Edge-cloud: page_size_padded on the specs is the CANONICAL page
+        # (derived with canonical_tp=1) whose only purpose is to keep page
+        # sizes aligned across edge/cloud workers with different TP sizes,
+        # so that spec merging never scales block_size. Charging that
+        # canonical page to every worker over-provisions KV memory by
+        # cloud_tp-fold (e.g. 4x fewer blocks with cloud_tp=4). Rebase the
+        # per-worker config to the worker's LOCAL (TP-sharded) page for
+        # memory planning and tensor allocation; the scheduler accounts in
+        # tokens/block_size and physical addressing derives from the local
+        # tensor shapes, so both stay correct.
+        kv_cache_groups = _localize_group_page_sizes(kv_cache_groups)
 
     # Determine how model runners should initialize the KV cache tensors.
     if len(kv_cache_groups) == 1 and isinstance(
