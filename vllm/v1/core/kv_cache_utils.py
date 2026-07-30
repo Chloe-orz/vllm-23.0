@@ -1348,7 +1348,23 @@ def get_kv_cache_config_from_groups(
         # memory planning and tensor allocation; the scheduler accounts in
         # tokens/block_size and physical addressing derives from the local
         # tensor shapes, so both stay correct.
-        kv_cache_groups = _localize_group_page_sizes(kv_cache_groups)
+        # NOTE: This rebasing is only required for hybrid attention+mamba
+        # models where the shared-tensor layout needs a uniform local page
+        # size across groups. Other models (e.g. DeepseekV4 with
+        # UniformTypeKVCacheSpecs) already have correct per-spec page sizes
+        # and must not be rebased here.
+        if any(
+            isinstance(group.kv_cache_spec, MambaSpec)
+            or (
+                isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+                and any(
+                    isinstance(s, MambaSpec)
+                    for s in group.kv_cache_spec.kv_cache_specs.values()
+                )
+            )
+            for group in kv_cache_groups
+        ):
+            kv_cache_groups = _localize_group_page_sizes(kv_cache_groups)
 
     # Determine how model runners should initialize the KV cache tensors.
     if len(kv_cache_groups) == 1 and isinstance(
