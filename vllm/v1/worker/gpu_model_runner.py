@@ -1321,7 +1321,12 @@ class GPUModelRunner(
                         if self.input_batch.prev_req_id_to_index
                         else None
                     )
-                    if prev_req_index is not None:
+                    # [ascend] Skip prev entries re-injected after an
+                    # edge-cloud PD interleave removal: their index points
+                    # past the prev_num_draft_tokens buffer.
+                    if prev_req_index is not None and prev_req_index < len(
+                        self.prev_num_draft_tokens.np
+                    ):
                         self.prev_num_draft_tokens.np[prev_req_index] = (
                             optimistic_num_accepted
                         )
@@ -1523,6 +1528,11 @@ class GPUModelRunner(
                 ) in deferred_spec_decode_corrections:
                     prev_req_index = prev_req_id_to_index.get(req_id)
                     if prev_req_index is None:
+                        continue
+                    # [ascend] prev_req_index may point past
+                    # valid_sampled_token_count for prev entries re-injected
+                    # after an edge-cloud PD interleave removal; skip those.
+                    if prev_req_index >= len(valid_sampled_token_count):
                         continue
                     num_accepted = valid_sampled_token_count[prev_req_index] - 1
                     correction = optimistic_num_accepted - num_accepted
