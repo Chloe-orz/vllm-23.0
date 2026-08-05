@@ -315,6 +315,41 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
             output.routed_experts = self._routed_experts_cpu.tolists()
         del self._routed_experts
 
+        # Per-request debug logging: request id, first sampled token and
+        # other useful per-step info.
+        for req_index, req_id in enumerate(output.req_ids):
+            sampled_tokens = valid_sampled_token_ids[req_index]
+            first_token = sampled_tokens[0] if sampled_tokens else None
+            first_token_logprob = None
+            first_token_rank = None
+            if logprobs_lists is not None and first_token is not None:
+                # LogprobsLists rows are flattened over
+                # (num_reqs x num_generated_tokens); use the cumulative
+                # offset for spec decode, otherwise one row per request.
+                if logprobs_lists.cu_num_generated_tokens is not None:
+                    row = logprobs_lists.cu_num_generated_tokens[req_index]
+                else:
+                    row = req_index
+                # Column 0 corresponds to the sampled token.
+                first_token_logprob = float(logprobs_lists.logprobs[row][0])
+                first_token_rank = int(logprobs_lists.sampled_token_ranks[row])
+            num_nans = None
+            if output.num_nans_in_logits is not None:
+                num_nans = output.num_nans_in_logits.get(req_id)
+            logger.info(
+                "AsyncGPUModelRunnerOutput: req_id=%s, first_token=%s, "
+                "num_sampled_tokens=%d, sampled_tokens=%s, "
+                "first_token_logprob=%s, first_token_rank=%s, "
+                "num_nans_in_logits=%s",
+                req_id,
+                first_token,
+                len(sampled_tokens),
+                sampled_tokens,
+                first_token_logprob,
+                first_token_rank,
+                num_nans,
+            )
+
         return output
 
 
