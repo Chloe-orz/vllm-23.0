@@ -237,6 +237,19 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 
+# Debug: per-request sampling info is appended to this file.
+_SAMPLE_PRINT_FILE_PATH = "/home/q00842316/sample_print_file.log"
+_sample_print_file = None
+
+
+def _get_sample_print_file():
+    """Lazily open the per-request sample print file (append mode)."""
+    global _sample_print_file
+    if _sample_print_file is None:
+        _sample_print_file = open(_SAMPLE_PRINT_FILE_PATH, "a", encoding="utf-8")
+    return _sample_print_file
+
+
 # Wrapper for ModelRunnerOutput to support overlapped execution.
 class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
     def __init__(
@@ -248,9 +261,11 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         async_output_copy_stream: torch.cuda.Stream,
         vocab_size: int,
         routed_experts: RoutedExpertsTensors | None = None,
+        is_prefilling: list[bool] | None = None,
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
+        self._is_prefilling = is_prefilling
 
         # Event on the copy stream so we can synchronize the non-blocking copy.
         self.async_copy_ready_event = torch.Event()
@@ -316,10 +331,16 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         del self._routed_experts
 
         # Per-request debug logging: request id, first sampled token and
-        # other useful per-step info.
+        # other useful per-step info. Written to a dedicated file, one
+        # line per request.
+        log_lines = []
         for req_index, req_id in enumerate(output.req_ids):
             sampled_tokens = valid_sampled_token_ids[req_index]
             first_token = sampled_tokens[0] if sampled_tokens else None
+            if self._is_prefilling is not None:
+                phase = "prefill" if self._is_prefilling[req_index] else "decode"
+            else:
+                phase = "unknown"
             first_token_logprob = None
             first_token_rank = None
             if logprobs_lists is not None and first_token is not None:
@@ -336,19 +357,18 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
             num_nans = None
             if output.num_nans_in_logits is not None:
                 num_nans = output.num_nans_in_logits.get(req_id)
-            logger.info(
-                "AsyncGPUModelRunnerOutput: req_id=%s, first_token=%s, "
-                "num_sampled_tokens=%d, sampled_tokens=%s, "
-                "first_token_logprob=%s, first_token_rank=%s, "
-                "num_nans_in_logits=%s",
-                req_id,
-                first_token,
-                len(sampled_tokens),
-                sampled_tokens,
-                first_token_logprob,
-                first_token_rank,
-                num_nans,
+            log_lines.append(
+                f"req_id={req_id}, phase={phase}, first_token={first_token}, "
+                f"num_sampled_tokens={len(sampled_tokens)}, "
+                f"sampled_tokens={sampled_tokens}, "
+                f"first_token_logprob={first_token_logprob}, "
+                f"first_token_rank={first_token_rank}, "
+                f"num_nans_in_logits={num_nans}"
             )
+        if log_lines:
+            log_file = _get_sample_print_file()
+            log_file.write("\n".join(log_lines) + "\n")
+            log_file.flush()
 
         return output
 
@@ -4708,6 +4728,16 @@ class GPUModelRunner(
                     ].clone(),
                 )
 
+            # Per-request phase flag: True if the request still has
+            # unconsumed prompt tokens before this step (i.e. the step
+            # runs prefill), False for pure decode steps. Index i aligns
+            # with output.req_ids[i] (a copy of input_batch.req_ids).
+            num_reqs = len(output.req_ids)
+            is_prefilling = (
+                self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs]
+                < self.input_batch.num_prompt_tokens_cpu_tensor[:num_reqs]
+            ).tolist()
+
             async_output = AsyncGPUModelRunnerOutput(
                 model_runner_output=output,
                 sampled_token_ids=sampler_output.sampled_token_ids,
@@ -4716,6 +4746,7 @@ class GPUModelRunner(
                 async_output_copy_stream=self._get_or_create_async_output_copy_stream(),
                 vocab_size=self.input_batch.vocab_size,
                 routed_experts=routed_experts_snapshot,
+                is_prefilling=is_prefilling,
             )
         with record_function_or_nullcontext(
             "gpu_model_runner: set_async_sampled_token_ids"
