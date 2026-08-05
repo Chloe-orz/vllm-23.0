@@ -27,24 +27,16 @@ else:
     SamplingParams = object
     Request = object
 
-
 class HiddenChannelType:
     """Data-plane hidden tensor channel for edge-cloud PD separation.
 
-    Pre-generates a generous pool of PREFILL_1..N / DECODE_1..M members at
-    startup (minimum 16 prefill + 8 decode, doubling when needed), avoiding
-    the lazy-init ordering hazard of the old metaclass-based approach.
-
-    Call ``HiddenChannelType.init(dp_size=2)`` once during engine bootstrap;
-    after that ``HiddenChannelType.PREFILL_3`` / ``HiddenChannelType.prefill(3)``
-    / ``==`` / ``hash`` / ``pickle`` all work identically to the old enum.
-
-    DECODE is always set as a backward-compatibility alias for DECODE_1.
+    A generous PREFILL/DECODE pool is generated at import time. ``init`` is
+    idempotent and can be called again during engine bootstrap.
     """
 
-    # ------------------------------------------------------------------
-    # Instance
-    # ------------------------------------------------------------------
+    _initialized: bool = False
+    _MIN_PREFILL_POOL: int = 16
+    _MIN_DECODE_POOL: int = 8
 
     def __init__(self, value: str) -> None:
         self._value = value
@@ -67,16 +59,6 @@ class HiddenChannelType:
     def __reduce__(self):
         return (_hidden_channel_from_value, (self._value,))
 
-    # ------------------------------------------------------------------
-    # Dynamic generation
-    # ------------------------------------------------------------------
-
-    _initialized: bool = False
-
-    # Minimum pool sizes — double when dp_size exceeds them.
-    _MIN_PREFILL_POOL: int = 16
-    _MIN_DECODE_POOL: int = 8
-
     @classmethod
     def init(
         cls,
@@ -84,40 +66,24 @@ class HiddenChannelType:
         prefill_per_dp: int = 2,
         decode_per_dp: int = 1,
     ) -> None:
-        """Pre-create PREFILL_i / DECODE_j attributes for a generous pool.
-
-        Idempotent: only the first call takes effect.  The pool starts at
-        16 prefill / 8 decode and doubles until it covers ``dp_size``.
-        """
         if cls._initialized:
             return
         cls._initialized = True
 
-        # Compute total channels actually needed by the caller.
         need_prefill = dp_size * prefill_per_dp
         need_decode = dp_size * decode_per_dp
-
-        # Expand pool sizes to cover the need (minimum 16 / 8).
         prefill_pool = cls._MIN_PREFILL_POOL
+        decode_pool = cls._MIN_DECODE_POOL
         while prefill_pool < need_prefill:
             prefill_pool *= 2
-
-        decode_pool = cls._MIN_DECODE_POOL
         while decode_pool < need_decode:
             decode_pool *= 2
 
         for i in range(1, prefill_pool + 1):
             setattr(cls, f"PREFILL_{i}", cls(f"prefill_{i}"))
-
-        for j in range(1, decode_pool + 1):
-            setattr(cls, f"DECODE_{j}", cls(f"decode_{j}"))
-
-        # backward-compatibility alias
+        for i in range(1, decode_pool + 1):
+            setattr(cls, f"DECODE_{i}", cls(f"decode_{i}"))
         setattr(cls, "DECODE", getattr(cls, "DECODE_1"))
-
-    # ------------------------------------------------------------------
-    # Factory methods
-    # ------------------------------------------------------------------
 
     @staticmethod
     def prefill(i: int) -> "HiddenChannelType":
@@ -128,15 +94,11 @@ class HiddenChannelType:
         return getattr(HiddenChannelType, f"DECODE_{i}")
 
 
-# Auto-initialise on module import so that PREFILL_1..N / DECODE_1..M are
-# always available regardless of whether the caller explicitly invoked
-# ``HiddenChannelType.init()`` (idempotency guard prevents double-init when
-# ``parallel_state`` later calls ``init`` with a smaller dp_size).
 HiddenChannelType.init(dp_size=8)
 
 
 def _hidden_channel_from_value(value: str) -> HiddenChannelType:
-    """Deserialization helper (used by ``__reduce__`` for pickle support)."""
+    """Return a hidden-channel instance during pickle deserialization."""
     return HiddenChannelType(value)
 
 
@@ -424,6 +386,27 @@ class SchedulerOutput:
     parent_req_id: str | None = None
     draft_task_id: str | None = None
     draft_step_idx: int | None = None
+
+    # Rejection-corrected sampling state produced by the edge target step.
+    # It is carried only by DRAFT_FIRST step 0 so the cloud can update its
+    # target/draft state before running the independently scheduled draft.
+    num_accepted_tokens: list[int] | None = None
+    valid_sampled_token_count: list[int] | None = None
+
+    # Edge-side hint to the cloud PassiveScheduler. True means decode work is
+    # active (or imminent), so interleaving prefill slices is worthwhile.
+    # False denotes cold-start/pure-prefill and avoids slicing overhead.
+    cloud_suggest_slicing: bool | None = None
+
+    # Edge-cloud draft metadata invalidation. Task ids whose deferred draft
+    # was dropped on the edge before the draft chain fully consumed the
+    # cloud-side cached attention metadata (e.g. every request of the parent
+    # verify batch finished). The cloud model runner purges the corresponding
+    # cache entries. Produced only by the edge scheduler and consumed only by
+    # the cloud model runner. Only tasks whose draft was never dispatched (or
+    # was already fully consumed) are listed, so purging cannot race an
+    # in-flight DRAFT batch.
+    cloud_draft_invalidate_task_ids: list[str] | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
