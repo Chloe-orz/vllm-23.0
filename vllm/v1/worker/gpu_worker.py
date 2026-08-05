@@ -42,6 +42,7 @@ from vllm.distributed.parallel_state import (
     Handle,
     get_pp_group,
     get_tp_group,
+    is_edge_device,
 )
 from vllm.distributed.weight_transfer import (
     WeightTransferEngine,
@@ -77,6 +78,20 @@ from .utils import request_memory
 
 logger = init_logger(__name__)
 
+# Debug: edge-cloud hidden-recv info is appended to this file (same file
+# used by gpu_model_runner's per-request sample prints).
+_SAMPLE_PRINT_FILE_PATH = "/home/q00842316/sample_print_file.log"
+_sample_print_file = None
+
+
+def _get_sample_print_file():
+    """Lazily open the sample print file (append mode)."""
+    global _sample_print_file
+    if _sample_print_file is None:
+        _sample_print_file = open(_SAMPLE_PRINT_FILE_PATH, "a", encoding="utf-8")
+    return _sample_print_file
+
+
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -90,11 +105,13 @@ class AsyncIntermediateTensors(IntermediateTensors):
         tensors: dict[str, torch.Tensor],
         comm_handles: list[Handle] | None = None,
         comm_postprocess: list[Callable[[], None]] | None = None,
+        batch_type: Any = None,
     ) -> None:
         super().__init__(tensors)
         self._comm_handles = comm_handles
         self._comm_postprocess = comm_postprocess
         self._comm_waited = False
+        self._batch_type = batch_type
 
     def wait_for_comm(self) -> None:
         if self._comm_waited:
@@ -106,6 +123,30 @@ class AsyncIntermediateTensors(IntermediateTensors):
             for fn in self._comm_postprocess:
                 fn()
         self._comm_waited = True
+
+        # Edge-cloud debug: comm finished, the hidden tensors received
+        # from the previous PP stage (cloud side) are now valid.
+        # Write numeric stats of each received hidden tensor to file,
+        # one line per tensor.
+        log_lines = []
+        for name, tensor in self.tensors.items():
+            t = tensor.float()
+            log_lines.append(
+                f"[EDGE-CLOUD-RECV] is_edge={is_edge_device()} "
+                f"batch_type={self._batch_type} hidden '{name}' ready: "
+                f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+                f"mean={t.mean().item():.6f} "
+                f"std={t.std(unbiased=False).item():.6f} "
+                f"min={t.min().item():.6f} max={t.max().item():.6f} "
+                f"abs_max={t.abs().max().item():.6f} "
+                f"has_nan={torch.isnan(t).any().item()} "
+                f"first8={tensor.flatten()[:8].tolist()}"
+                f"last8={tensor.flatten()[-8:].tolist()}"
+            )
+        if log_lines:
+            log_file = _get_sample_print_file()
+            log_file.write("\n".join(log_lines) + "\n")
+            log_file.flush()
 
     def __getattribute__(self, name: str):
         # ensure `.tensors` is ready before use
@@ -858,11 +899,28 @@ class Worker(WorkerBase):
                 )
             )
             assert tensor_dict is not None
+            batch_type = getattr(scheduler_output, "batch_type", None)
             intermediate_tensors = AsyncIntermediateTensors(
                 tensor_dict,
                 comm_handles=comm_handles,
                 comm_postprocess=comm_postprocess,
+                batch_type=batch_type,
             )
+            # Edge-cloud debug: a non-first PP rank (edge tail segment or
+            # cloud middle segment) issued the recv for hidden tensors
+            # from the previous stage. Shapes/dtypes are known now; the
+            # values become valid in wait_for_comm().
+            tensor_desc = {
+                k: (tuple(v.shape), str(v.dtype), str(v.device))
+                for k, v in tensor_dict.items()
+            }
+            log_file = _get_sample_print_file()
+            log_file.write(
+                f"[EDGE-CLOUD-RECV] is_edge={is_edge_device()} "
+                f"batch_type={batch_type} issued recv of hidden tensors "
+                f"from prev PP rank: {tensor_desc}\n"
+            )
+            log_file.flush()
 
         with self.annotate_profile(scheduler_output):
             output = self.model_runner.execute_model(
