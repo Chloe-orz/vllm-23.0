@@ -106,12 +106,14 @@ class AsyncIntermediateTensors(IntermediateTensors):
         comm_handles: list[Handle] | None = None,
         comm_postprocess: list[Callable[[], None]] | None = None,
         batch_type: Any = None,
+        req_ids: list[str] | None = None,
     ) -> None:
         super().__init__(tensors)
         self._comm_handles = comm_handles
         self._comm_postprocess = comm_postprocess
         self._comm_waited = False
         self._batch_type = batch_type
+        self._req_ids = req_ids
 
     def wait_for_comm(self) -> None:
         if self._comm_waited:
@@ -133,7 +135,8 @@ class AsyncIntermediateTensors(IntermediateTensors):
             t = tensor.float()
             log_lines.append(
                 f"[EDGE-CLOUD-RECV] is_edge={is_edge_device()} "
-                f"batch_type={self._batch_type} hidden '{name}' ready: "
+                f"batch_type={self._batch_type} req_ids={self._req_ids} "
+                f"hidden '{name}' ready: "
                 f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
                 f"mean={t.mean().item():.6f} "
                 f"std={t.std(unbiased=False).item():.6f} "
@@ -900,11 +903,16 @@ class Worker(WorkerBase):
             )
             assert tensor_dict is not None
             batch_type = getattr(scheduler_output, "batch_type", None)
+            # Req ids scheduled in this batch, in batch order; the rows of
+            # the received hidden tensors correspond to the tokens of
+            # these requests (concatenated in this order).
+            req_ids = list(scheduler_output.num_scheduled_tokens.keys())
             intermediate_tensors = AsyncIntermediateTensors(
                 tensor_dict,
                 comm_handles=comm_handles,
                 comm_postprocess=comm_postprocess,
                 batch_type=batch_type,
+                req_ids=req_ids,
             )
             # Edge-cloud debug: a non-first PP rank (edge tail segment or
             # cloud middle segment) issued the recv for hidden tensors
@@ -917,7 +925,8 @@ class Worker(WorkerBase):
             log_file = _get_sample_print_file()
             log_file.write(
                 f"[EDGE-CLOUD-RECV] is_edge={is_edge_device()} "
-                f"batch_type={batch_type} issued recv of hidden tensors "
+                f"batch_type={batch_type} req_ids={req_ids} "
+                f"issued recv of hidden tensors "
                 f"from prev PP rank: {tensor_desc}\n"
             )
             log_file.flush()
