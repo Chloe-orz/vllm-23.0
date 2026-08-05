@@ -138,13 +138,13 @@ class AsyncIntermediateTensors(IntermediateTensors):
                 f"batch_type={self._batch_type} req_ids={self._req_ids} "
                 f"hidden '{name}' ready: "
                 f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
-                f"mean={t.mean().item():.6f} "
-                f"std={t.std(unbiased=False).item():.6f} "
-                f"min={t.min().item():.6f} max={t.max().item():.6f} "
-                f"abs_max={t.abs().max().item():.6f} "
-                f"has_nan={torch.isnan(t).any().item()} "
-                f"first8={tensor.flatten()[:8].tolist()}"
-                f"last8={tensor.flatten()[-8:].tolist()}"
+                # f"mean={t.mean().item():.6f} "
+                # f"std={t.std(unbiased=False).item():.6f} "
+                # f"min={t.min().item():.6f} max={t.max().item():.6f} "
+                # f"abs_max={t.abs().max().item():.6f} "
+                # f"has_nan={torch.isnan(t).any().item()} "
+                # f"first8={tensor.flatten()[:8].tolist()}"
+                # f"last8={tensor.flatten()[-8:].tolist()}"
             )
         if log_lines:
             log_file = _get_sample_print_file()
