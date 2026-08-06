@@ -1390,6 +1390,15 @@ class GPUModelRunner(
                     # async scheduling case, so that correct input_ids are obtained.
                     resumed_token_ids = req_data.all_token_ids.get(req_id)
                     if resumed_token_ids is None:
+                        print(
+                            f"[DEBUG] KeyError would happen! req_id={req_id}, "
+                            f"all_token_ids keys="
+                            f"{list(req_data.all_token_ids.keys())[:30]}, "
+                            f"num_output_tokens={num_output_tokens}, "
+                            f"resumed_req_ids={req_data.resumed_req_ids}, "
+                            f"dp_rank={self.dp_rank}, "
+                            f"req_data.num_reqs={len(req_data.req_ids)}"
+                        )
                         # [ascend fix] The entry may be missing when the
                         # scheduler-side downlink condition and the
                         # placeholder-inclusive wire num_output_tokens
