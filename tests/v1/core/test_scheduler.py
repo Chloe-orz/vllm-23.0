@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -25,6 +26,7 @@ from vllm.utils.hashing import sha256
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.core.sched.request_queue import SchedulingPolicy
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import FinishReason
 from vllm.v1.kv_cache_interface import (
@@ -39,6 +41,37 @@ from vllm.v1.structured_output import StructuredOutputManager
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
 pytestmark = pytest.mark.cpu_test
+
+
+def test_select_preemption_candidate_fcfs_selects_tail():
+    scheduler = Scheduler.__new__(Scheduler)
+    requests = [
+        SimpleNamespace(request_id="0"),
+        SimpleNamespace(request_id="1"),
+        SimpleNamespace(request_id="2"),
+    ]
+    scheduler.running = requests
+    scheduler.policy = SchedulingPolicy.FCFS
+
+    assert scheduler._select_preemption_candidate() is requests[-1]
+
+
+def test_select_preemption_candidate_priority():
+    scheduler = Scheduler.__new__(Scheduler)
+    lower_priority = SimpleNamespace(priority=2, arrival_time=1.0)
+    selected = SimpleNamespace(priority=4, arrival_time=2.0)
+    scheduler.running = [lower_priority, selected]
+    scheduler.policy = SchedulingPolicy.PRIORITY
+
+    assert scheduler._select_preemption_candidate() is selected
+
+
+def test_select_preemption_candidate_returns_none_when_empty():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.running = []
+    scheduler.policy = SchedulingPolicy.FCFS
+
+    assert scheduler._select_preemption_candidate() is None
 
 
 def test_add_requests():
@@ -741,6 +774,39 @@ def test_preempt_during_execution():
     # sampled token id.
     assert len(requests[1].output_token_ids) == 1
     assert requests[1].output_token_ids[0] == 42
+
+
+def test_preemption_is_deferred_when_all_running_requests_are_protected():
+    scheduler = create_scheduler(
+        max_num_batched_tokens=100,
+        block_size=16,
+        num_blocks=11,
+        enable_prefix_caching=False,
+    )
+    requests = create_requests(num_requests=2, num_tokens=80, block_size=16)
+
+    scheduler.add_request(requests[0])
+    scheduler_output0 = scheduler.schedule()
+    scheduler.add_request(requests[1])
+    _ = scheduler.schedule()
+
+    model_runner_output0 = ModelRunnerOutput(
+        req_ids=[requests[0].request_id],
+        req_id_to_index={requests[0].request_id: 0},
+        sampled_token_ids=[[0]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    scheduler.update_from_output(scheduler_output0, model_runner_output0)
+
+    scheduler._select_preemption_candidate = lambda: None
+    deferred_output = scheduler.schedule()
+
+    assert deferred_output.total_num_scheduled_tokens == 0
+    assert len(scheduler.running) == 2
+    assert all(request.status == RequestStatus.RUNNING for request in requests)
+    assert all(request.num_preemptions == 0 for request in requests)
 
 
 def test_scheduler_reset_prefix_cache():

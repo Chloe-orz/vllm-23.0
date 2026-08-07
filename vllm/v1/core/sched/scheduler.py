@@ -471,34 +471,39 @@ class Scheduler(SchedulerInterface):
                         # The request can be scheduled.
                         break
 
-                    # The request cannot be scheduled.
-                    # Preempt the lowest-priority request.
-                    if self.policy == SchedulingPolicy.PRIORITY:
-                        preempted_req = max(
-                            self.running,
-                            key=lambda r: (r.priority, r.arrival_time),
-                        )
-                        self.running.remove(preempted_req)
-                        if preempted_req in scheduled_running_reqs:
-                            preempted_req_id = preempted_req.request_id
-                            scheduled_running_reqs.remove(preempted_req)
-                            token_budget += num_scheduled_tokens.pop(preempted_req_id)
-                            req_to_new_blocks.pop(preempted_req_id)
-                            scheduled_spec_decode_tokens.pop(preempted_req_id, None)
-                            preempted_encoder_inputs = scheduled_encoder_inputs.pop(
-                                preempted_req_id, None
-                            )
-                            if preempted_encoder_inputs:
-                                # Restore encoder compute budget if the preempted
-                                # request had encoder inputs scheduled in this step.
-                                num_embeds_to_restore = sum(
-                                    preempted_req.get_num_encoder_embeds(i)
-                                    for i in preempted_encoder_inputs
-                                )
-                                encoder_compute_budget += num_embeds_to_restore
-                            req_index -= 1
+                    # The request cannot be scheduled. Preempt the lowest-priority
+                    # request that the scheduler implementation considers safe.
+                    preempted_req = self._select_preemption_candidate()
+                    if preempted_req is None:
+                        # Some scheduler implementations protect requests with
+                        # asynchronous work in flight. Defer allocation until one
+                        # of those requests becomes preemptible.
+                        break
+
+                    if preempted_req is self.running[-1]:
+                        # Preserve the O(1) FCFS fast path used by the standard
+                        # scheduler. Subclasses may select an earlier safe request.
+                        self.running.pop()
                     else:
-                        preempted_req = self.running.pop()
+                        self.running.remove(preempted_req)
+                    if preempted_req in scheduled_running_reqs:
+                        preempted_req_id = preempted_req.request_id
+                        scheduled_running_reqs.remove(preempted_req)
+                        token_budget += num_scheduled_tokens.pop(preempted_req_id)
+                        req_to_new_blocks.pop(preempted_req_id)
+                        scheduled_spec_decode_tokens.pop(preempted_req_id, None)
+                        preempted_encoder_inputs = scheduled_encoder_inputs.pop(
+                            preempted_req_id, None
+                        )
+                        if preempted_encoder_inputs:
+                            # Restore encoder compute budget if the preempted
+                            # request had encoder inputs scheduled in this step.
+                            num_embeds_to_restore = sum(
+                                preempted_req.get_num_encoder_embeds(i)
+                                for i in preempted_encoder_inputs
+                            )
+                            encoder_compute_budget += num_embeds_to_restore
+                        req_index -= 1
 
                     self._preempt_request(preempted_req, scheduled_timestamp)
                     preempted_reqs.append(preempted_req)
@@ -1002,6 +1007,18 @@ class Scheduler(SchedulerInterface):
 
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
+
+    def _select_preemption_candidate(self) -> Request | None:
+        """Select a request using the standard scheduling policy."""
+        if not self.running:
+            return None
+
+        if self.policy == SchedulingPolicy.PRIORITY:
+            return max(
+                self.running,
+                key=lambda request: (request.priority, request.arrival_time),
+            )
+        return self.running[-1]
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
