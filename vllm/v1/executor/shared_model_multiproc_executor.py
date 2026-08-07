@@ -449,6 +449,15 @@ class SharedModelWorkerProc:
                 if (method in self.SYNC_METHODS
                         and not is_empty_execute):
                     paused[k] = True
+                elif (method == "execute_model"
+                      and is_empty_execute
+                      and self.is_moe
+                      and getattr(args[0], "batch_type", None) in (
+                          BatchType.PREFILL_FIRST,
+                          BatchType.PREFILL_LAST,
+                          BatchType.DECODE_FIRST,
+                          BatchType.DECODE_LAST)):
+                    paused[k] = True
                 if method == 'initialize_from_config':
                     paused[k] = True
                     init_kv_cache = True

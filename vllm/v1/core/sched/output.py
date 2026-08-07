@@ -373,6 +373,17 @@ class SchedulerOutput:
     # can be verified before running the tail segment.
     head_token: str | None = None
 
+    # Edge-side original production sequence number. Assigned by the edge
+    # PDSeparatedScheduler when it first produces this SchedulerOutput
+    # (P首/D首/Draft首 head segments and dummies), so the edge and cloud
+    # workers can log it before inference and correlate edge-vs-cloud
+    # execution of the same logical batch. Tails inherit it via
+    # dataclasses.replace (D尾/Draft尾 on the edge; P尾 echoed by the cloud).
+    # Distinct from the cloud-side _passive_scheduler_arrival_seq (reception
+    # order). It is a real field so it survives ZMQ serialization (dynamic
+    # attrs are dropped) and replace.
+    original_seq: int | None = None
+
     # Data-plane hidden tensor channel for edge-cloud PD separation. Prefill
     # head/tail batches use one of two prefill channels; decode uses the
     # dedicated decode channel. Scheduled speculative drafts also use the
