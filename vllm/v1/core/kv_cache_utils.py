@@ -2011,6 +2011,7 @@ def _auto_fit_max_model_len(
 def _project_kv_cache_groups_to_worker(
     global_kv_cache_groups: list[KVCacheGroupSpec],
     worker_spec: dict[str, KVCacheSpec],
+    keep_empty_groups: bool = False,
 ) -> list[KVCacheGroupSpec]:
     """
     Projects global KV cache groups onto a single worker's assigned layers.
@@ -2022,6 +2023,10 @@ def _project_kv_cache_groups_to_worker(
     Args:
         global_kv_cache_groups: The global KV cache groups for the whole model.
         worker_spec: The KV cache spec of each layer on this worker.
+        keep_empty_groups: If True, groups whose layers all live on other
+            workers are kept as empty placeholder groups instead of being
+            dropped, so per-worker group indices stay aligned with the
+            global group order.
 
     Returns:
         The projected KV cache groups containing only this worker's layers.
@@ -2032,12 +2037,23 @@ def _project_kv_cache_groups_to_worker(
             layer_name for layer_name in group.layer_names if layer_name in worker_spec
         ]
         if not worker_layer_names:
-            # Edge-cloud head_tail (首一尾一): a group whose layers all live
-            # on the peer side has no layers on this worker. Drop it so the
-            # per-worker config only contains groups with real local layers;
-            # the scheduler side uses the max-groups worker config instead
-            # (see EngineCore._initialize_kv_caches), so cross-worker group
-            # structure divergence is expected and supported.
+            if keep_empty_groups:
+                # Edge-cloud head_tail (首一尾一): a group whose layers all
+                # live on the peer side has no layers on this worker. Keep an
+                # empty placeholder group so per-worker group indices stay
+                # aligned with the scheduler's (max-groups) config: the
+                # scheduler allocates blocks for EVERY global group and the
+                # SchedulerOutput carries per-group block_ids in global group
+                # order, so dropping the group here shifts every subsequent
+                # group's block table (MultiGroupBlockTable.add_row enumerates
+                # the worker's local tables against the global block_ids
+                # tuple), silently scattering KV into the wrong physical
+                # blocks. The runner explicitly supports empty groups (see
+                # model_runner_v1.py: "skip empty groups" and the
+                # kernel_block_sizes "keep list alignment" fallback).
+                projected_groups.append(KVCacheGroupSpec([], group.kv_cache_spec))
+            # else: a group with no layers on this worker carries no local
+            # state; drop it from the per-worker config.
             continue
         group_spec = group.kv_cache_spec
         if isinstance(group_spec, UniformTypeKVCacheSpecs):
@@ -2126,6 +2142,10 @@ def get_kv_cache_configs(
         _project_kv_cache_groups_to_worker(
             global_kv_cache_groups,
             worker_spec if worker_spec else merged_kv_cache_specs,
+            # Edge-cloud: the scheduler plans against the max-groups config
+            # (see EngineCore._initialize_kv_caches), so workers must keep
+            # empty placeholder groups to preserve global group indices.
+            keep_empty_groups=vllm_config.parallel_config.enable_edge_cloud,
         )
         for worker_spec in kv_cache_specs
     ]
