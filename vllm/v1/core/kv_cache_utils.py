@@ -2145,7 +2145,17 @@ def get_kv_cache_configs(
             # Edge-cloud: the scheduler plans against the max-groups config
             # (see EngineCore._initialize_kv_caches), so workers must keep
             # empty placeholder groups to preserve global group indices.
-            keep_empty_groups=vllm_config.parallel_config.enable_edge_cloud,
+            # Narrowed to DSv4-family models (SlidingWindowMLASpec): their
+            # tensor packing iterates layer_names and tolerates empty
+            # groups, while hybrid mamba/attention models account pages
+            # from group spec contents and break on placeholders.
+            keep_empty_groups=(
+                vllm_config.parallel_config.enable_edge_cloud
+                and any(
+                    isinstance(spec, SlidingWindowMLASpec)
+                    for spec in merged_kv_cache_specs.values()
+                )
+            ),
         )
         for worker_spec in kv_cache_specs
     ]
