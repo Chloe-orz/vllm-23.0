@@ -414,6 +414,28 @@ class SchedulerOutput:
     draft_task_id: str | None = None
     draft_step_idx: int | None = None
 
+    # Comm-layer sequencing for edge-cloud PD separation.  The edge
+    # scheduler (the single ordering authority) stamps the per-channel
+    # sequence number at FIRST-batch pick time; FIRST and its matching
+    # LAST share the value, so both peers derive the same per-channel
+    # order from the SO alone.  The comm channel buffers out-of-order
+    # submissions and posts strictly in seqno order.  None on batches
+    # that carry no cross-node traffic (EMPTY, legacy PD_MIX, ...).
+    comm_seqno: int | None = None
+
+    # True when a DRAFT_FIRST/DRAFT_LAST belongs to a prefill-phase draft
+    # chain (its parent tail is a PREFILL_LAST): such chains travel on the
+    # dedicated PREFILL_DRAFT channel pair, decoupled from decode traffic.
+    # Decode-phase chains (parent DECODE_LAST) keep the DECODE pair.
+    draft_prefill_phase: bool = False
+
+    # First comm seqno of the draft chain that will follow this batch,
+    # reserved by the edge scheduler at PF/DF pick time (chain steps take
+    # draft_seqno_base + draft_step_idx).  Lets both peers pre-post all n
+    # draft recv requests the moment the parent batch is published, before
+    # any DRAFT_FIRST SO exists.  None when scheduled draft is inactive.
+    draft_seqno_base: int | None = None
+
     # Rejection-corrected sampling state produced by the edge target step.
     # It is carried only by DRAFT_FIRST step 0 so the cloud can update its
     # target/draft state before running the independently scheduled draft.
