@@ -787,6 +787,14 @@ class WorkerProc:
         # PD-separated early-recv is active.  Its handle rides the READY
         # handshake so the executor can attach the reader.
         self.irecv_done_mq = getattr(self.worker, "irecv_done_mq", None)
+        if getattr(
+            vllm_config.parallel_config, "enable_edge_cloud", False
+        ) and self.local_rank == 0:
+            logger.info(
+                "[early-irecv] WorkerProc picked up irecv_done_mq writer: "
+                "%s",
+                "OK" if self.irecv_done_mq is not None else "NONE",
+            )
 
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
