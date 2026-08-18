@@ -634,6 +634,10 @@ class WorkerProcHandle:
     # `peer_worker_response_mqs[i]`
     peer_worker_response_mqs: list[MessageQueue | None]
     death_writer: Connection | None = None
+    # Reverse irecv-completion report channel (edge-cloud early-recv),
+    # written by the worker's comm thread; None when PD-separated
+    # early-recv is inactive.
+    irecv_done_mq: MessageQueue | None = None
 
     @classmethod
     def from_unready_handle(
@@ -641,6 +645,7 @@ class WorkerProcHandle:
         unready_handle: UnreadyWorkerProcHandle,
         worker_response_mq: MessageQueue | None,
         peer_worker_response_mqs: list[MessageQueue | None],
+        irecv_done_mq: MessageQueue | None = None,
     ) -> "WorkerProcHandle":
         return cls(
             proc=unready_handle.proc,
@@ -648,6 +653,7 @@ class WorkerProcHandle:
             worker_response_mq=worker_response_mq,
             peer_worker_response_mqs=peer_worker_response_mqs,
             death_writer=unready_handle.death_writer,
+            irecv_done_mq=irecv_done_mq,
         )
 
 
@@ -776,6 +782,12 @@ class WorkerProc:
         # (nnodes_within_dp > 1) require distributed groups to be initialized
         self._init_message_queues(input_shm_handle, vllm_config)
 
+        # Reverse irecv-completion channel for edge-cloud early-recv
+        # reporting: created (as writer) inside the NPUWorker when
+        # PD-separated early-recv is active.  Its handle rides the READY
+        # handshake so the executor can attach the reader.
+        self.irecv_done_mq = getattr(self.worker, "irecv_done_mq", None)
+
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
         enable_envs_cache()
@@ -848,10 +860,22 @@ class WorkerProc:
             else None
             for handle in peer_response_handles
         ]
+        # Reverse irecv-completion report channel (worker comm thread ->
+        # engine core).  The worker created it as writer; attach a reader.
+        irecv_done_handle = handles.get("irecv_done_handle")
+        irecv_done_mq: MessageQueue | None = None
+        if (
+            irecv_done_handle is not None
+            and len(irecv_done_handle.local_reader_ranks) > 0
+        ):
+            irecv_done_mq = MessageQueue.create_from_handle(
+                irecv_done_handle, 0
+            )
         return WorkerProcHandle.from_unready_handle(
             proc_handle,
             worker_response_mq,
             peer_worker_response_mqs=peer_worker_response_mqs,
+            irecv_done_mq=irecv_done_mq,
         )
 
     @staticmethod
@@ -1005,6 +1029,11 @@ class WorkerProc:
                         "status": WorkerProc.READY_STR,
                         "handle": worker.local_worker_response_mq.export_handle(),
                         "peer_response_handles": worker.local_peer_response_handles,
+                        "irecv_done_handle": (
+                            worker.irecv_done_mq.export_handle()
+                            if worker.irecv_done_mq is not None
+                            else None
+                        ),
                     }
                 )
             else:
@@ -1013,6 +1042,11 @@ class WorkerProc:
                         "status": WorkerProc.READY_STR,
                         "handle": worker.worker_response_mq.export_handle(),
                         "peer_response_handles": worker.peer_response_handles,
+                        "irecv_done_handle": (
+                            worker.irecv_done_mq.export_handle()
+                            if worker.irecv_done_mq is not None
+                            else None
+                        ),
                     }
                 )
 
