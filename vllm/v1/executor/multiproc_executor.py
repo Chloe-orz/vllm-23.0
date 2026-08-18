@@ -871,6 +871,12 @@ class WorkerProc:
         # Reverse irecv-completion report channel (worker comm thread ->
         # engine core).  The worker created it as writer; attach a reader.
         irecv_done_handle = handles.get("irecv_done_handle")
+        logger.info(
+            "[early-irecv] ready payload received: irecv_done_handle=%s "
+            "local_reader_ranks=%s",
+            "present" if irecv_done_handle is not None else "MISSING",
+            getattr(irecv_done_handle, "local_reader_ranks", None),
+        )
         irecv_done_mq: MessageQueue | None = None
         if (
             irecv_done_handle is not None
@@ -1026,6 +1032,11 @@ class WorkerProc:
                 numa_utils.log_current_affinity_state(f"Worker_{worker.rank}")
 
             worker.monitor_death_pipe(death_pipe, shutdown_requested)
+
+            logger.info(
+                "[early-irecv] worker_main before READY: irecv_done_mq=%s",
+                "set" if worker.irecv_done_mq is not None else "NONE",
+            )
 
             # Send READY once we know everything is loaded.
             # For non-leader PP rank with passive EngineCore, send local
