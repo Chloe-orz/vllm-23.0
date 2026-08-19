@@ -436,6 +436,13 @@ class SchedulerOutput:
     # any DRAFT_FIRST SO exists.  None when scheduled draft is inactive.
     draft_seqno_base: int | None = None
 
+    # True when every request covered by this draft chain has finished or
+    # been aborted.  Dead chains are never dropped (their comm seqnos were
+    # reserved and their recvs pre-posted): the edge worker sends dummy
+    # zero payloads instead of real draft outputs so the wire stays paired
+    # and the channel seqno sequence never has holes.
+    draft_chain_dead: bool = False
+
     # Rejection-corrected sampling state produced by the edge target step.
     # It is carried only by DRAFT_FIRST step 0 so the cloud can update its
     # target/draft state before running the independently scheduled draft.
