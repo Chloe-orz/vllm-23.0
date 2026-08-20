@@ -2035,8 +2035,8 @@ def initialize_model_parallel(
             paired: set[int] = set()
             for e_id in registry.edge_ids:
                 for c_id in registry.cloud_ids:
-                    e0 = registry.edge(e_id).npus[0]
-                    c0 = registry.cloud(c_id).npus[0]
+                    e0 = registry.edge(e_id).ranks[0]
+                    c0 = registry.cloud(c_id).ranks[0]
                     pair_rank_sets.append([e0, c0])
                     paired.add(e0)
                     paired.add(c0)
