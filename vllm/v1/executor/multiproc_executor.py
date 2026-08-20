@@ -189,11 +189,31 @@ class MultiprocExecutor(Executor):
         success = False
         try:
             if self.parallel_config.enable_edge_cloud:
-                global_start_rank = (
-                    0
-                    if self.parallel_config.is_edge_node
-                    else self.parallel_config.edge_npu_count
-                )
+                if self.parallel_config.role_registry:
+                    # Multi-instance (2E1C): this instance's global ranks come
+                    # from the registry, not from the edge/cloud formula.
+                    # E.g. E0 starts at 0, E1 at 1, cloud at 2 — without this,
+                    # every edge would compute start_rank=0 ("is_edge → 0")
+                    # and the second edge would collide with the first.
+                    import yaml as _yaml
+                    with open(self.parallel_config.role_registry,
+                              encoding="utf-8") as _f:
+                        _reg = _yaml.safe_load(_f)
+                    if self.parallel_config.is_edge_node:
+                        _eid = self.parallel_config.edge_id
+                        _entry = next(e for e in _reg["edges"]
+                                      if int(e["id"]) == _eid)
+                    else:
+                        _cid = self.parallel_config.cloud_id
+                        _entry = next(c for c in _reg["clouds"]
+                                      if int(c["id"]) == _cid)
+                    global_start_rank = int(_entry["ranks"][0])
+                else:
+                    global_start_rank = (
+                        0
+                        if self.parallel_config.is_edge_node
+                        else self.parallel_config.edge_npu_count
+                    )
             else:
                 global_start_rank = (
                     self.local_world_size * self.parallel_config.node_rank_within_dp

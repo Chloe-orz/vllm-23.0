@@ -567,9 +567,15 @@ class ParallelConfig:
         the total world size is
         ``1 + data_parallel_size * cloud_npu_count`` instead of the
         usual ``(1 + cloud_npu_count) * data_parallel_size``.
+
+        With a role registry (multi-instance 2E1C), the world covers all
+        registered edges+clouds and ``self.world_size`` already holds that
+        total (see __post_init__), so no dp multiplication is applied.
         """
         if self.is_shared_model_edge:
             return 1 + self.data_parallel_size * self.cloud_npu_count
+        if self.role_registry:
+            return self.world_size
         return self.world_size * self.data_parallel_size
 
     @property
@@ -938,6 +944,18 @@ class ParallelConfig:
             # applies to both topologies (the shared-model case
             # counts the single edge rank as ``1``).
             self.world_size = self.edge_npu_count + self.cloud_npu_count
+            # Multi-instance (2E1C): with a role registry, the world covers
+            # ALL edges and clouds — not just one of each.  E.g. 2 edges
+            # (1 rank each) + 1 cloud (4 ranks) => world_size 6, whereas the
+            # legacy formula above would yield 5 (one edge + one cloud) and
+            # silently drop the second edge from the world.
+            if self.role_registry:
+                import yaml as _yaml
+                with open(self.role_registry, encoding="utf-8") as _f:
+                    _reg = _yaml.safe_load(_f)
+                _total = sum(len(e["ranks"]) for e in _reg["edges"]) + sum(
+                    len(c["ranks"]) for c in _reg["clouds"])
+                self.world_size = _total
             self.pipeline_parallel_size = 2
             self.tensor_parallel_size = (
                 self.edge_npu_count if self.is_edge_node else self.cloud_npu_count
