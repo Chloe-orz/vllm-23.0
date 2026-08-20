@@ -315,7 +315,14 @@ class WorkerWrapperBase:
             self.worker = worker_class(**kwargs)
 
     def initialize_from_config(self, kv_cache_configs: list[Any]) -> None:
-        kv_cache_config = kv_cache_configs[self.global_rank]
+        # Multi-instance edge-cloud (2E1C): each instance's engine computes
+        # KV cache configs for its OWN workers only, so the list is indexed
+        # by the instance-local worker index.  Legacy mode keeps the
+        # world-sized list indexed by global rank.
+        if getattr(self.vllm_config.parallel_config, "role_registry", None):
+            kv_cache_config = kv_cache_configs[self.local_rank]
+        else:
+            kv_cache_config = kv_cache_configs[self.global_rank]
         assert self.vllm_config is not None
         with set_current_vllm_config(self.vllm_config):
             self.worker.initialize_from_config(kv_cache_config)  # type: ignore
