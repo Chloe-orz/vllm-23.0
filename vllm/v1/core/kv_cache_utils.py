@@ -2216,6 +2216,26 @@ def get_kv_cache_configs(
             )
         )
 
+    # Multi-instance edge-cloud (2E1C): capture the cloud's real num_blocks
+    # BEFORE the clamp-to-min below.  The em edge's own entry carries an
+    # empty kv_cache_groups and a placeholder num_blocks (=1 null block),
+    # which would otherwise drag the partition total to ~0/1.  The partition
+    # total must be the cloud's real pool size — the entry with actual kv
+    # groups.
+    _pc = vllm_config.parallel_config
+    _me_cloud_total: int | None = None
+    if getattr(_pc, "role_registry", None):
+        _real = [c.num_blocks for c in kv_cache_configs if c.kv_cache_groups]
+        if _real:
+            _me_cloud_total = max(_real)
+        # Diagnostic: the next run must show the cloud's entries present
+        # (non-zero groups) — if the list only contains the edge's own
+        # placeholder entry, the cross-instance gather didn't happen.
+        logger.info(
+            "[edge-cloud] kv_cache_configs topology: %s",
+            [(c.num_blocks, len(c.kv_cache_groups)) for c in kv_cache_configs],
+        )
+
     # Change the num_blocks of each rank to the smallest among all ranks.
     # We also need to shrink the tensor size proportionally to avoid
     # allocating unused memory.
@@ -2247,8 +2267,8 @@ def get_kv_cache_configs(
             _pc, "edge_id", None) is not None:
         from vllm_ascend.edge_cloud.role_registry import get_role_registry
         _registry = get_role_registry()
-        if _registry is not None:
-            _partition = _registry.resolve_kv_partition(min_num_blocks)
+        if _registry is not None and _me_cloud_total:
+            _partition = _registry.resolve_kv_partition(_me_cloud_total)
             _share = _partition.num_blocks_of(_pc.edge_id)
             for kv_cache_config in kv_cache_configs:
                 if kv_cache_config.num_blocks > _share:
