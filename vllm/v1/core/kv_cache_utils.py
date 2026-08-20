@@ -2235,29 +2235,31 @@ def get_kv_cache_configs(
             _report_kv_cache_config(vllm_config, kv_cache_config)
 
     # Multi-instance edge-cloud (2E1C): static KV partition.  Each edge's
-    # scheduler manages only its own half of the cloud pool (edge-local ids);
-    # the cloud translates at segment ingress.  Only the edge's own config is
-    # shrunk here; the cloud keeps the full pool.
+    # scheduler manages only its own share of the cloud pool (edge-local ids);
+    # the cloud translates at segment ingress.  The partition is ratio-based
+    # in the registry and resolved here against the unified (cloud-decided)
+    # block count.  Only the edge's own config is shrunk; the cloud keeps the
+    # full pool.
     _pc = vllm_config.parallel_config
     if getattr(_pc, "role_registry", None) and getattr(
             _pc, "edge_id", None) is not None:
         from vllm_ascend.edge_cloud.role_registry import get_role_registry
         _registry = get_role_registry()
         if _registry is not None:
-            _half = _registry.kv_partition.num_blocks_of(_pc.edge_id)
+            _partition = _registry.resolve_kv_partition(min_num_blocks)
+            _share = _partition.num_blocks_of(_pc.edge_id)
             for kv_cache_config in kv_cache_configs:
-                if kv_cache_config.num_blocks > _half:
+                if kv_cache_config.num_blocks > _share:
                     num_blocks_old = kv_cache_config.num_blocks
-                    kv_cache_config.num_blocks = _half
+                    kv_cache_config.num_blocks = _share
                     for tensor in kv_cache_config.kv_cache_tensors:
                         assert tensor.size % num_blocks_old == 0
                         tensor.size = (
-                            tensor.size // num_blocks_old * _half)
+                            tensor.size // num_blocks_old * _share)
             logger.info(
                 "[edge-cloud] KV partition: edge_id=%d num_blocks=%d "
                 "(of cloud total %d)",
-                _pc.edge_id, _half,
-                _registry.kv_partition.num_blocks_total,
+                _pc.edge_id, _share, min_num_blocks,
             )
 
     return kv_cache_configs
