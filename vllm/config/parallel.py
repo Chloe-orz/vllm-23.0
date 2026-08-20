@@ -220,6 +220,30 @@ class ParallelConfig:
     """
     is_edge_node: bool = False
     """Whether this engine process belongs to the edge node."""
+
+    edge_id: int | None = None
+    """Explicit edge instance id for multi-edge edge-cloud deployments.
+
+    Set via ``--edge-id``.  When set (requires a ``--role-registry`` file),
+    the instance role is taken from the registry instead of being derived
+    from ``--headless``.  ``None`` keeps the legacy single-pair behaviour.
+    """
+    cloud_id: int | None = None
+    """Explicit cloud instance id for multi-cloud edge-cloud deployments.
+
+    Set via ``--cloud-id``.  See :attr:`edge_id`.
+    """
+    role_registry: str | None = None
+    """Path to the shared role-registry YAML (multi-instance edge-cloud).
+
+    The registry is the single source of truth for instance membership,
+    addresses, ZMQ port planning and the (temporary) static KV partition.
+    """
+    edge_cloud_epoch: int = 0
+    """Instance epoch for (id, epoch) identity in multi-instance edge-cloud.
+    Phase-1 keeps it fixed at 0; the field exists so wire messages can carry
+    it and stale-state invalidation can be added later without schema change.
+    """
     is_shared_model_edge: bool = False
     """Whether the edge side of an edge-cloud configuration is in
     the shared-model topology.

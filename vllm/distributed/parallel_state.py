@@ -1987,6 +1987,122 @@ def initialize_model_parallel(
 
     # Edge-Cloud collaboration mode
     if parallel_config.enable_edge_cloud:
+        # Multi-instance (2E1C) layout: when a role registry is configured,
+        # the world layout is defined by the registry (each instance's npus
+        # list = its global ranks), not by the legacy contiguous
+        # [edge..., cloud...] per-dp-instance layout.
+        if getattr(parallel_config, "role_registry", None):
+            import vllm_ascend.edge_cloud.role_registry as _rr
+            registry = _rr.init_role_registry(parallel_config.role_registry)
+            world_size = torch.distributed.get_world_size()
+            rank = torch.distributed.get_rank()
+            backend = backend or torch.distributed.get_backend(
+                get_world_group().device_group
+            )
+            # Role from explicit instance identity.
+            _IS_EDGE_DEVICE = parallel_config.edge_id is not None
+            # Fail fast if the actual rank disagrees with the registry —
+            # pair/EP groups would otherwise be built over wrong processes.
+            if _IS_EDGE_DEVICE:
+                registry.assert_rank_membership(
+                    "edge", parallel_config.edge_id, rank)
+            else:
+                registry.assert_rank_membership(
+                    "cloud", parallel_config.cloud_id, rank)
+
+            # TP groups: one per instance (its npus form its TP group).
+            assert _TP is None, (
+                "tensor model parallel group is already initialized")
+            tp_groups = ([e.ranks for e in
+                          (registry.edge(i) for i in registry.edge_ids)] +
+                         [c.ranks for c in
+                          (registry.cloud(i) for i in registry.cloud_ids)])
+            _TP = init_model_parallel_group(
+                tp_groups,
+                get_world_group().local_rank,
+                backend,
+                use_message_queue_broadcaster=True,
+                group_name="tp",
+            )
+
+            # PP groups: per (edge, cloud) pair = [edge_npu0, cloud_npu0];
+            # every other rank gets a singleton group.  All ranks must call
+            # new_group in the same order, so emit pair groups in sorted
+            # order first, then singletons for the remaining ranks.
+            assert _PP is None, (
+                "pipeline model parallel group is already initialized")
+            pair_rank_sets: list[list[int]] = []
+            paired: set[int] = set()
+            for e_id in registry.edge_ids:
+                for c_id in registry.cloud_ids:
+                    e0 = registry.edge(e_id).npus[0]
+                    c0 = registry.cloud(c_id).npus[0]
+                    pair_rank_sets.append([e0, c0])
+                    paired.add(e0)
+                    paired.add(c0)
+            for r in range(world_size):
+                if r not in paired:
+                    pair_rank_sets.append([r])
+            _PP = init_model_parallel_group(
+                pair_rank_sets,
+                get_world_group().local_rank,
+                backend,
+                group_name="pp",
+            )
+
+            # DCP/PCP: singleton per rank (no context parallelism in 2E1C).
+            all_ranks = torch.arange(world_size)
+            singleton_groups = all_ranks.reshape(-1, 1).unbind(0)
+            singleton_groups = [x.tolist() for x in singleton_groups]
+            assert _DCP is None, (
+                "decode context model parallel group is already initialized")
+            _DCP = init_model_parallel_group(
+                singleton_groups,
+                get_world_group().local_rank,
+                backend,
+                use_message_queue_broadcaster=True,
+                group_name="dcp",
+            )
+            assert _PCP is None, (
+                "prefill context model parallel group is already initialized")
+            _PCP = init_model_parallel_group(
+                singleton_groups,
+                get_world_group().local_rank,
+                backend,
+                use_message_queue_broadcaster=True,
+                group_name="pcp",
+            )
+
+            # DP: each instance is its own DP domain in 2E1C (multi-DP is a
+            # later phase); singleton DP group per rank.
+            assert _DP is None, "data parallel group is already initialized"
+            _DP = init_model_parallel_group(
+                singleton_groups,
+                get_world_group().local_rank,
+                backend,
+                use_message_queue_broadcaster=True,
+                group_name="dp",
+            )
+
+            # EP: all edge workers one group, all cloud workers another
+            # (same semantics as the legacy edge-cloud layout).
+            assert _EP is None, (
+                "expert parallel group is already initialized")
+            ep_edge_ranks = [
+                r for i in registry.edge_ids
+                for r in registry.edge(i).ranks
+            ]
+            ep_cloud_ranks = [
+                r for i in registry.cloud_ids
+                for r in registry.cloud(i).ranks
+            ]
+            _EP = init_model_parallel_group(
+                [ep_edge_ranks, ep_cloud_ranks],
+                get_world_group().local_rank,
+                backend,
+                group_name="ep",
+            )
+            return
         world_size = torch.distributed.get_world_size()
         rank = torch.distributed.get_rank()
         backend = backend or torch.distributed.get_backend(
