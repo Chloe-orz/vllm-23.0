@@ -2234,49 +2234,35 @@ def get_kv_cache_configs(
         if len(kv_cache_config.kv_cache_groups) > 0:
             _report_kv_cache_config(vllm_config, kv_cache_config)
 
-    # Multi-instance edge-cloud (2E1C): static KV partition.
+    # Multi-instance edge-cloud (2E1C): static KV partition.  Each edge's
+    # scheduler manages only its own share of the cloud pool (edge-local ids);
+    # the cloud translates at segment ingress.  The partition is ratio-based
+    # in the registry and resolved here against the unified (cloud-decided)
+    # block count — the post-clamp ``min_num_blocks`` IS the cloud's real
+    # num_blocks (em edges report a virtual 1TiB so the clamp always takes
+    # the cloud's value), so no extra store/handshake is needed.  Only the
+    # edge's own config is shrunk; the cloud keeps the full pool.
     _pc = vllm_config.parallel_config
-    if getattr(_pc, "role_registry", None):
-        import torch.distributed as _dist
-        from datetime import timedelta as _td
+    if getattr(_pc, "role_registry", None) and getattr(
+            _pc, "edge_id", None) is not None:
         from vllm_ascend.edge_cloud.role_registry import get_role_registry
         _registry = get_role_registry()
         if _registry is not None:
-            _w = _registry.world
-            if getattr(_pc, "cloud_id", None) is not None:
-                # Cloud: publish its real num_blocks so edges can resolve
-                # their ratio-based shares of THIS cloud's pool.
-                _store = _dist.TCPStore(
-                    host_name=_w.master_addr, port=_w.master_port,
-                    is_master=False, timeout=_td(seconds=300))
-                _store.set(f"cloud_{_pc.cloud_id}_num_blocks",
-                           str(min_num_blocks))
-                logger.info(
-                    "[edge-cloud] published num_blocks=%d for cloud %d",
-                    min_num_blocks, _pc.cloud_id)
-            if getattr(_pc, "edge_id", None) is not None:
-                # Edge: read the cloud's real num_blocks, then resolve its
-                # ratio-based share of THAT total (the cloud physically owns
-                # the pool in 2E1C's static partition).
-                _store = _dist.TCPStore(
-                    host_name=_w.master_addr, port=_w.master_port,
-                    is_master=False, timeout=_td(seconds=300))
-                _cloud_total = int(_store.get("cloud_0_num_blocks"))
-                _partition = _registry.resolve_kv_partition(_cloud_total)
-                _share = _partition.num_blocks_of(_pc.edge_id)
-                for kv_cache_config in kv_cache_configs:
-                    if kv_cache_config.num_blocks > _share:
-                        num_blocks_old = kv_cache_config.num_blocks
-                        kv_cache_config.num_blocks = _share
-                        for tensor in kv_cache_config.kv_cache_tensors:
-                            assert tensor.size % num_blocks_old == 0
-                            tensor.size = (
-                                tensor.size // num_blocks_old * _share)
-                logger.info(
-                    "[edge-cloud] KV partition: edge_id=%d num_blocks=%d "
-                    "(cloud total %d)",
-                    _pc.edge_id, _share, _cloud_total,
-                )
+            _partition = _registry.resolve_kv_partition(min_num_blocks)
+            _share = _partition.num_blocks_of(_pc.edge_id)
+            for kv_cache_config in kv_cache_configs:
+                if kv_cache_config.num_blocks > _share:
+                    num_blocks_old = kv_cache_config.num_blocks
+                    kv_cache_config.num_blocks = _share
+                    for tensor in kv_cache_config.kv_cache_tensors:
+                        assert tensor.size % num_blocks_old == 0
+                        tensor.size = (
+                            tensor.size // num_blocks_old * _share)
+            logger.info(
+                "[edge-cloud] KV partition: edge_id=%d num_blocks=%d "
+                "(cloud total %d)",
+                _pc.edge_id, _share, min_num_blocks,
+            )
 
     return kv_cache_configs
 
