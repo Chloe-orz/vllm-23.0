@@ -2264,11 +2264,43 @@ def get_kv_cache_configs(
     # edge's own config is shrunk; the cloud keeps the full pool.
     _pc = vllm_config.parallel_config
     if getattr(_pc, "role_registry", None) and getattr(
-            _pc, "edge_id", None) is not None:
+            _pc, "cloud_id", None) is not None:
+        # Cloud: publish its real num_blocks so edges can resolve their
+        # ratio-based shares.  Per-instance KV sizing means edges never see
+        # the cloud's entry in their own config list — this store handoff is
+        # the only channel.
+        import torch.distributed as _dist
+        from datetime import timedelta as _td
         from vllm_ascend.edge_cloud.role_registry import get_role_registry
         _registry = get_role_registry()
-        if _registry is not None and _me_cloud_total:
-            _partition = _registry.resolve_kv_partition(_me_cloud_total)
+        if _registry is not None:
+            _w = _registry.world
+            _store = _dist.TCPStore(
+                host_name=_w.master_addr, port=_w.master_port,
+                is_master=False, timeout=_td(seconds=300))
+            _store.set(f"cloud_{_pc.cloud_id}_num_blocks",
+                       str(min_num_blocks))
+            logger.info(
+                "[edge-cloud] published num_blocks=%d for cloud %d",
+                min_num_blocks, _pc.cloud_id)
+
+    if getattr(_pc, "role_registry", None) and getattr(
+            _pc, "edge_id", None) is not None:
+        # Edge: the cloud's real num_blocks is NOT in this instance's local
+        # config list (per-instance sizing) — read it from the world store
+        # (published by the cloud branch above), then resolve the ratio-based
+        # share of THAT total.
+        import torch.distributed as _dist
+        from datetime import timedelta as _td
+        from vllm_ascend.edge_cloud.role_registry import get_role_registry
+        _registry = get_role_registry()
+        if _registry is not None:
+            _w = _registry.world
+            _store = _dist.TCPStore(
+                host_name=_w.master_addr, port=_w.master_port,
+                is_master=False, timeout=_td(seconds=300))
+            _cloud_total = int(_store.get("cloud_0_num_blocks"))
+            _partition = _registry.resolve_kv_partition(_cloud_total)
             _share = _partition.num_blocks_of(_pc.edge_id)
             for kv_cache_config in kv_cache_configs:
                 if kv_cache_config.num_blocks > _share:
