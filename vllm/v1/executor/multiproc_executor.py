@@ -681,6 +681,20 @@ class WorkerProc:
     def _init_message_queues(
         self, input_shm_handle: Handle, vllm_config: VllmConfig
     ) -> None:
+        # [2E1C-DIAG] temporary instrumentation for the multi-edge bring-up:
+        # log which MQ branch each worker takes and the handle wiring.
+        try:
+            from vllm.logger import init_logger as _il
+            _il(__name__).info(
+                "[2E1C-DIAG] _init_message_queues: rank=%s local_rank=%s "
+                "nnodes_within_dp=%s non_leader_env=%s input_shm_handle=%s",
+                getattr(self, "rank", None), getattr(self, "local_rank", None),
+                vllm_config.parallel_config.nnodes_within_dp,
+                envs.VLLM_PP_NON_LEADER_ENGINE_CORE,
+                "set" if input_shm_handle is not None else "None",
+            )
+        except Exception:
+            pass
         if vllm_config.parallel_config.nnodes_within_dp == 1:
             # Single-node: use local MQ
             self.rpc_broadcast_mq = MessageQueue.create_from_handle(

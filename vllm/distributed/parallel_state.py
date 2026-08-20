@@ -1742,15 +1742,7 @@ def init_distributed_environment(
             "world group already initialized with a different world size"
         )
     if config is not None and config.parallel_config.nnodes_within_dp > 1:
-        # Multi-instance (2E1C): the inner-dp-world group is the cross-
-        # instance gather/broadcast channel (edges' collective_rpc must reach
-        # cloud workers for KV sizing).  It was historically gated on
-        # data_parallel_size > 1, which 2E1C (dp=1) never satisfies — with a
-        # role registry, alias it to the whole world so the gather covers all
-        # edges+clouds.
-        if getattr(config.parallel_config, "role_registry", None):
-            _INNER_DP_WORLD = _WORLD
-        elif parallel_config.data_parallel_size > 1:
+        if parallel_config.data_parallel_size > 1:
             if config.parallel_config.is_shared_model_edge:
                 # 共享模型 edge-cloud：构造 group_ranks_full
                 # 每条子组 = [shared_edge_rank (=0)] + 该 dp_rank 的 c 个云 workers
