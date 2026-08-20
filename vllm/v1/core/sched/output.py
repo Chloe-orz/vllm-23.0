@@ -156,6 +156,10 @@ class NewRequestData:
     prompt_embeds: "torch.Tensor | None" = None
     prompt_is_token_ids: list[bool] | None = None
 
+    # Stable ID of the matching OpenAI control-plane stream. This differs
+    # from req_id because vLLM randomizes its internal request IDs.
+    edge_cloud_request_id: str | None = None
+
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
 
@@ -178,6 +182,7 @@ class NewRequestData:
             prompt_embeds=request.prompt_embeds,
             prompt_is_token_ids=request.prompt_is_token_ids,
             prefill_token_ids=prefill_token_ids,
+            edge_cloud_request_id=request.edge_cloud_request_id,
         )
 
     def __repr__(self) -> str:
@@ -296,6 +301,16 @@ class CachedRequestData:
         )
 
 
+@dataclass(frozen=True)
+class EdgeCloudFinishedRequest:
+    """Final accounting and opaque hash chain sent from edge to cloud."""
+
+    control_request_id: str
+    prompt_tokens: int
+    completion_tokens: int
+    full_block_hashes: tuple[bytes, ...]
+
+
 @dataclass
 class SchedulerOutput:
     # list of the requests that are scheduled for the first time.
@@ -407,6 +422,10 @@ class SchedulerOutput:
     # was already fully consumed) are listed, so purging cannot race an
     # in-flight DRAFT batch.
     cloud_draft_invalidate_task_ids: list[str] | None = None
+
+    # Populated only by an edge-cloud scheduler. It lets the cloud finalize
+    # usage and hash output-bearing blocks without receiving raw token IDs.
+    edge_cloud_finished_requests: dict[str, EdgeCloudFinishedRequest] | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

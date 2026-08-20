@@ -131,6 +131,11 @@ class EngineCoreRequest(
     # KV-transfer request is rejected on the D node before engine admission.
     abort_immediately: bool = False
 
+    # Edge-cloud prefix-cache coordination. The hit count is a hard upper
+    # bound on local prefix reuse: both sides must start from the same token.
+    edge_cloud_request_id: str | None = None
+    edge_cloud_prefix_hit_tokens: int | None = None
+
     @property
     def params(self) -> SamplingParams | PoolingParams:
         """Return the processed params (sampling or pooling)."""

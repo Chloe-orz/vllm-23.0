@@ -78,6 +78,8 @@ class Request:
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         abort_immediately: bool = False,
+        edge_cloud_request_id: str | None = None,
+        edge_cloud_prefix_hit_tokens: int | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -94,6 +96,13 @@ class Request:
                 reasoning_parser_kwargs
             )
         self.arrival_time = arrival_time if arrival_time is not None else time.time()
+        self.edge_cloud_request_id = edge_cloud_request_id
+        self.edge_cloud_prefix_hit_tokens = edge_cloud_prefix_hit_tokens
+        if (
+            edge_cloud_prefix_hit_tokens is not None
+            and edge_cloud_prefix_hit_tokens < 0
+        ):
+            raise ValueError("edge_cloud_prefix_hit_tokens must not be negative")
 
         self.status = RequestStatus.WAITING
         self.events: list[EngineCoreEvent] = []
@@ -131,6 +140,13 @@ class Request:
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             prompt_token_ids, prompt_embeds
         )
+        if (
+            self.edge_cloud_prefix_hit_tokens is not None
+            and self.edge_cloud_prefix_hit_tokens > self.num_prompt_tokens
+        ):
+            raise ValueError(
+                "edge_cloud_prefix_hit_tokens must not exceed prompt length"
+            )
         self._output_token_ids: list[int] = []
         self._all_token_ids: list[int] = (
             self.prompt_token_ids.copy()
@@ -223,6 +239,8 @@ class Request:
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
+            edge_cloud_request_id=request.edge_cloud_request_id,
+            edge_cloud_prefix_hit_tokens=request.edge_cloud_prefix_hit_tokens,
         )
 
     def append_output_token_ids(
