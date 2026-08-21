@@ -1220,7 +1220,10 @@ class WorkerProc:
                                 )
                         continue
                     self._execute_local_rpc(method, args, kwargs, output_rank)
-                    continue
+                    # Fall through to the cross-node queue after handling one
+                    # local control RPC. Cloud-side KV config polling is
+                    # continuous during startup and must not starve the
+                    # cross-node KV cache initialization RPC.
                 except Exception:
                     pass  # TimeoutError or empty queue
 

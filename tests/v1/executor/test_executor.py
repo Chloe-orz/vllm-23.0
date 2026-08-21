@@ -29,8 +29,10 @@ class ScriptedQueue:
     def __init__(self, *dequeue_results):
         self.dequeue_results = list(dequeue_results)
         self.enqueued = []
+        self.dequeue_count = 0
 
     def dequeue(self, timeout=None):
+        self.dequeue_count += 1
         result = self.dequeue_results.pop(0)
         if isinstance(result, BaseException):
             raise result
@@ -45,10 +47,9 @@ class LocalRPCWorker:
         return "cloud-kv-config"
 
 
-def test_worker_busy_loop_executes_local_control_rpc():
+def test_local_control_rpc_does_not_starve_cross_node_queue():
     local_input = ScriptedQueue(
         ("get_initialized_kv_cache_config", (), {}, None),
-        TimeoutError(),
     )
     cross_node_input = ScriptedQueue(SystemExit())
     local_output = ScriptedQueue()
@@ -68,6 +69,8 @@ def test_worker_busy_loop_executes_local_control_rpc():
     assert local_output.enqueued == [
         (WorkerProc.ResponseStatus.SUCCESS, "cloud-kv-config")
     ]
+    assert local_input.dequeue_count == 1
+    assert cross_node_input.dequeue_count == 1
 
 
 def test_supports_async_scheduling_base_executor():
