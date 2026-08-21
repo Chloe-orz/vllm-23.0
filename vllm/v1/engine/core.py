@@ -261,7 +261,22 @@ class EngineCore:
         kv_cache_specs = self.model_executor.get_kv_cache_specs()
 
         has_kv_cache = any(kv_cache_spec for kv_cache_spec in kv_cache_specs)
-        if has_kv_cache:
+        # Multi-instance (2E1C): a non-rank0 edge's instance-local spec
+        # collection sees only its own (empty, embedding-only) spec, so
+        # has_kv_cache is False and profiling would be skipped.  Profile
+        # anyway: the profile's _dummy_run is what creates the edge runner's
+        # persistent intermediate_tensors buffer (edge-cloud capture_model
+        # returns early, so warmup never dummy-runs), and every tail-segment
+        # (PL/DL) batch asserts on that buffer.  The profiled value itself is
+        # unused — the empty spec still yields the attention-free placeholder
+        # config.
+        _pc = vllm_config.parallel_config
+        _force_profile = bool(
+            getattr(_pc, "role_registry", None)
+            and getattr(_pc, "edge_id", None) is not None
+            and not has_kv_cache
+        )
+        if has_kv_cache or _force_profile:
             if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
                 # NOTE(yongji): should already be set
                 # during _eep_scale_up_before_kv_init
