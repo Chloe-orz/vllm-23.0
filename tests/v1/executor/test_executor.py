@@ -15,7 +15,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.llm_engine import LLMEngine
 from vllm.v1.executor.abstract import Executor
-from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+from vllm.v1.executor.multiproc_executor import MultiprocExecutor, WorkerProc
 from vllm.v1.executor.uniproc_executor import (
     ExecutorWithExternalLauncher,
     UniProcExecutor,
@@ -23,6 +23,51 @@ from vllm.v1.executor.uniproc_executor import (
 
 
 class Mock: ...
+
+
+class ScriptedQueue:
+    def __init__(self, *dequeue_results):
+        self.dequeue_results = list(dequeue_results)
+        self.enqueued = []
+
+    def dequeue(self, timeout=None):
+        result = self.dequeue_results.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    def enqueue(self, value):
+        self.enqueued.append(value)
+
+
+class LocalRPCWorker:
+    def get_initialized_kv_cache_config(self):
+        return "cloud-kv-config"
+
+
+def test_worker_busy_loop_executes_local_control_rpc():
+    local_input = ScriptedQueue(
+        ("get_initialized_kv_cache_config", (), {}, None),
+        TimeoutError(),
+    )
+    cross_node_input = ScriptedQueue(SystemExit())
+    local_output = ScriptedQueue()
+
+    worker_proc = object.__new__(WorkerProc)
+    worker_proc.rank = 1
+    worker_proc.local_rank = 0
+    worker_proc.worker = LocalRPCWorker()
+    worker_proc.local_rpc_broadcast_mq = local_input
+    worker_proc.rpc_broadcast_mq = cross_node_input
+    worker_proc.local_worker_response_mq = local_output
+    worker_proc.worker_response_mq = ScriptedQueue()
+
+    with pytest.raises(SystemExit):
+        worker_proc.worker_busy_loop()
+
+    assert local_output.enqueued == [
+        (WorkerProc.ResponseStatus.SUCCESS, "cloud-kv-config")
+    ]
 
 
 def test_supports_async_scheduling_base_executor():
