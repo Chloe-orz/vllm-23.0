@@ -315,12 +315,27 @@ class WorkerWrapperBase:
             self.worker = worker_class(**kwargs)
 
     def initialize_from_config(self, kv_cache_configs: list[Any]) -> None:
-        # Multi-instance edge-cloud (2E1C): each instance's engine computes
-        # KV cache configs covering ONLY its own local workers (proven by the
-        # 2E1C run where the edge's list had a single entry), so index by the
-        # instance-local rank.  Legacy 1-1 keeps the global-rank indexing.
-        if getattr(self.vllm_config.parallel_config, "role_registry", None):
-            kv_cache_config = kv_cache_configs[self.local_rank]
+        # Multi-instance edge-cloud (2E1C): config lists are NOT world-sized.
+        # - Edge workers: the list comes from their OWN engine and starts
+        #   with their instance's entries — index by instance-local rank.
+        #   (The rank0 edge's list is [its own workers, then cloud workers];
+        #   a non-rank0 edge's list holds only its own workers.)
+        # - Cloud workers: initialized by the rank0 edge's broadcast, whose
+        #   list ends with the cloud's workers in rank order — index from
+        #   the tail.
+        # Legacy 1-1 keeps the global-rank indexing of a world-sized list.
+        pc = self.vllm_config.parallel_config
+        if getattr(pc, "role_registry", None):
+            if getattr(pc, "is_edge_node", False):
+                idx = self.local_rank
+            else:
+                idx = (len(kv_cache_configs) - pc.local_world_size
+                       + self.local_rank)
+            assert 0 <= idx < len(kv_cache_configs), (
+                f"kv_cache_configs index {idx} out of range "
+                f"(list size {len(kv_cache_configs)}, "
+                f"local_rank {self.local_rank})")
+            kv_cache_config = kv_cache_configs[idx]
         else:
             kv_cache_config = kv_cache_configs[self.global_rank]
         assert self.vllm_config is not None

@@ -2216,21 +2216,12 @@ def get_kv_cache_configs(
             )
         )
 
-    # Multi-instance edge-cloud (2E1C): capture the cloud's real num_blocks
-    # BEFORE the clamp-to-min below.  The em edge's own entry carries an
-    # empty kv_cache_groups and a placeholder num_blocks (=1 null block),
-    # which would otherwise drag the partition total to ~0/1.  The partition
-    # total must be the cloud's real pool size — the entry with actual kv
-    # groups.
+    # Multi-instance edge-cloud (2E1C) diagnostic: the list must contain the
+    # cloud's entries (non-zero groups) on the rank0 edge — if it only holds
+    # the edge's own placeholder entry, the cross-instance gather didn't
+    # happen.
     _pc = vllm_config.parallel_config
-    _me_cloud_total: int | None = None
     if getattr(_pc, "role_registry", None):
-        _real = [c.num_blocks for c in kv_cache_configs if c.kv_cache_groups]
-        if _real:
-            _me_cloud_total = max(_real)
-        # Diagnostic: the next run must show the cloud's entries present
-        # (non-zero groups) — if the list only contains the edge's own
-        # placeholder entry, the cross-instance gather didn't happen.
         logger.info(
             "[edge-cloud] kv_cache_configs topology: %s",
             [(c.num_blocks, len(c.kv_cache_groups)) for c in kv_cache_configs],
@@ -2258,17 +2249,15 @@ def get_kv_cache_configs(
     # scheduler manages only its own share of the cloud pool (edge-local ids);
     # the cloud translates at segment ingress.  The partition is ratio-based
     # in the registry and resolved here against the unified (cloud-decided)
-    # block count — the post-clamp ``min_num_blocks`` IS the cloud's real
-    # num_blocks (em edges report a virtual 1TiB so the clamp always takes
-    # the cloud's value), so no extra store/handshake is needed.  Only the
-    # edge's own config is shrunk; the cloud keeps the full pool.
+    # block count.  Only the edge's own config is shrunk; the cloud keeps
+    # the full pool.
     _pc = vllm_config.parallel_config
     if getattr(_pc, "role_registry", None) and getattr(
             _pc, "cloud_id", None) is not None:
-        # Cloud: publish its real num_blocks so edges can resolve their
-        # ratio-based shares.  Per-instance KV sizing means edges never see
-        # the cloud's entry in their own config list — this store handoff is
-        # the only channel.
+        # Cloud: publish its real num_blocks as a fallback channel.  In the
+        # current topology the cloud runs a passive engine (no KV sizing
+        # path), so this branch normally never runs — the rank0 edge's
+        # sizing publishes the same value instead (edge branch below).
         import torch.distributed as _dist
         from datetime import timedelta as _td
         from vllm_ascend.edge_cloud.role_registry import get_role_registry
@@ -2286,10 +2275,14 @@ def get_kv_cache_configs(
 
     if getattr(_pc, "role_registry", None) and getattr(
             _pc, "edge_id", None) is not None:
-        # Edge: the cloud's real num_blocks is NOT in this instance's local
-        # config list (per-instance sizing) — read it from the world store
-        # (published by the cloud branch above), then resolve the ratio-based
-        # share of THAT total.
+        # Edge: resolve the ratio-based partition against the cloud's REAL
+        # pool size.  The rank0 edge's config list also covers the cloud
+        # workers (1-1-style world control plane), so the post-clamp
+        # min_num_blocks IS the cloud's real num_blocks (em edges report a
+        # virtual 1TiB so the clamp always takes the cloud's value) — it
+        # resolves locally and publishes for the other edges.  A non-rank0
+        # edge's list is instance-local (its own placeholder entry only), so
+        # it reads the published total from the world store.
         import torch.distributed as _dist
         from datetime import timedelta as _td
         from vllm_ascend.edge_cloud.role_registry import get_role_registry
@@ -2299,11 +2292,25 @@ def get_kv_cache_configs(
             _store = _dist.TCPStore(
                 host_name=_w.master_addr, port=_w.master_port,
                 is_master=False, timeout=_td(seconds=300))
-            _cloud_total = int(_store.get("cloud_0_num_blocks"))
+            if len(kv_cache_configs) > _pc.local_world_size:
+                _cloud_total = min_num_blocks
+                _store.set("cloud_0_num_blocks", str(_cloud_total))
+                logger.info(
+                    "[edge-cloud] published num_blocks=%d for cloud 0 "
+                    "(from rank0 edge sizing)", _cloud_total)
+            else:
+                _cloud_total = int(_store.get("cloud_0_num_blocks"))
             _partition = _registry.resolve_kv_partition(_cloud_total)
             _share = _partition.num_blocks_of(_pc.edge_id)
-            for kv_cache_config in kv_cache_configs:
-                if kv_cache_config.num_blocks > _share:
+            # Set ONLY this edge's own entries (its workers come first in the
+            # list) to its share — cloud entries in a rank0-edge broadcast
+            # must keep the full pool.  Unconditional assignment (not just
+            # shrinking): a non-rank0 edge's instance-local sizing only sees
+            # its own empty spec, yielding the attention-free placeholder
+            # (num_blocks=1) which must be GROWN to the share; its empty
+            # tensor list makes the proportional scaling a no-op there.
+            for kv_cache_config in kv_cache_configs[:_pc.local_world_size]:
+                if kv_cache_config.num_blocks != _share:
                     num_blocks_old = kv_cache_config.num_blocks
                     kv_cache_config.num_blocks = _share
                     for tensor in kv_cache_config.kv_cache_tensors:
@@ -2313,7 +2320,7 @@ def get_kv_cache_configs(
             logger.info(
                 "[edge-cloud] KV partition: edge_id=%d num_blocks=%d "
                 "(cloud total %d)",
-                _pc.edge_id, _share, min_num_blocks,
+                _pc.edge_id, _share, _cloud_total,
             )
 
     return kv_cache_configs
