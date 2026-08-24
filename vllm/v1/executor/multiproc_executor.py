@@ -1204,6 +1204,37 @@ class WorkerProc:
     def worker_busy_loop(self):
         """Main busy loop for Multiprocessing Workers"""
         assert self.rpc_broadcast_mq is not None
+        # [2E1C-TRACE] Observability: bracket every batch (START/DONE/SENT)
+        # and emit an idle heartbeat (~30s) so a hung worker's position is
+        # unambiguous from the log tail alone — idle-polling and
+        # stuck-in-batch look identical without it.
+        _tr_last = "none"
+        _tr_idle = 0
+
+        def _tr_heartbeat():
+            nonlocal _tr_idle
+            _tr_idle += 1
+            if _tr_idle >= 300:
+                _tr_idle = 0
+                logger.info(
+                    "[2E1C-TRACE] rank=%s idle ~30s (no batch); last batch: %s",
+                    self.rank, _tr_last,
+                )
+
+        def _tr_note(kind: str, so, extra: str = ""):
+            nonlocal _tr_last, _tr_idle
+            _tr_idle = 0
+            _bt = getattr(so, "batch_type", None)
+            _ht = getattr(so, "head_token", None)
+            _nt = getattr(so, "total_num_scheduled_tokens", None)
+            _tr_last = (
+                f"{kind} bt={_bt.value if _bt is not None else None} "
+                f"ht={_ht} ntokens={_nt} {extra}"
+            )
+            logger.info(
+                "[2E1C-TRACE] rank=%s %s", self.rank, _tr_last,
+            )
+
         while True:
             # Poll local MQ for pp scheduler output from passive
             # EngineCore (non-blocking).
@@ -1215,6 +1246,7 @@ class WorkerProc:
                     if isinstance(method, bytes) and method == b"pp_scheduler_output":
                         scheduler_output = args[0]
                         slice_info = args[1] if len(args) > 1 else None
+                        _tr_note("exec START (pp)", scheduler_output)
                         # Execute model with the received SchedulerOutput.
                         try:
                             func = getattr(self.worker, "execute_model")
@@ -1231,6 +1263,7 @@ class WorkerProc:
                             if output_rank is None or self.rank == output_rank:
                                 self.handle_output(e)
                             continue
+                        _tr_note("exec DONE (pp)", scheduler_output)
                         # For layer slicing: non-last slices produce
                         # no external output; keep polling local MQ for
                         # the next slice.  Last slice (or no slicing)
@@ -1257,8 +1290,10 @@ class WorkerProc:
                                 response_mq.enqueue(
                                     (WorkerProc.ResponseStatus.SUCCESS, ack)
                                 )
+                        _tr_note("resp SENT (pp)", scheduler_output)
                         continue
                 except Exception:
+                    _tr_heartbeat()
                     pass  # TimeoutError or empty queue
 
             # Poll cross-node MQ with short timeout so we can
@@ -1270,6 +1305,7 @@ class WorkerProc:
                 )
                 _dt_ms = (time.monotonic() - _t0) * 1000
             except TimeoutError:
+                _tr_heartbeat()
                 continue
 
             # Skip execute_model from cross-node MQ on pp rank1 workers.
@@ -1288,15 +1324,7 @@ class WorkerProc:
                 elif isinstance(method, bytes):
                     func = partial(cloudpickle.loads(method), self.worker)
                 if method == "execute_model":
-                    _bt = (
-                        getattr(args[0], "batch_type", None)
-                        if args else None
-                    )
-                    # logger.info(
-                    #     "[EDGE-DEQUEUE] dequeue took %.3f ms batch_type: %s",
-                    #     _dt_ms,
-                    #     _bt.value if _bt is not None else "N/A",
-                    # )
+                    _tr_note("exec START", args[0] if args else None)
                 output = func(*args, **kwargs)
             except Exception as e:
                 # Notes have been introduced in python 3.11
@@ -1309,8 +1337,12 @@ class WorkerProc:
                     self.handle_output(e)
                 continue
 
+            if method == "execute_model":
+                _tr_note("exec DONE", args[0] if args else None)
             if output_rank is None or self._matches_output_rank(output_rank):
                 self.handle_output(output)
+                if method == "execute_model":
+                    _tr_note("resp SENT", args[0] if args else None)
 
     # ------------------------------------------------------------------ #
     # [CHER] Cloud-side hidden early-receive guard thread.               #
