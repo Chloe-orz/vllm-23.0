@@ -258,7 +258,12 @@ class EngineCore:
         register_all_kvcache_specs(vllm_config)
 
         # Get all kv cache needed by the model
+        logger.info("[2E1C-TRACE] kv-init: get_kv_cache_specs start")
         kv_cache_specs = self.model_executor.get_kv_cache_specs()
+        logger.info(
+            "[2E1C-TRACE] kv-init: get_kv_cache_specs done, entries=%d",
+            len(kv_cache_specs),
+        )
 
         has_kv_cache = any(kv_cache_spec for kv_cache_spec in kv_cache_specs)
         # Multi-instance (2E1C): a non-rank0 edge's instance-local spec
@@ -287,7 +292,13 @@ class EngineCore:
             else:
                 # Profiles the peak memory usage of the model to determine how
                 # much memory can be allocated for kv cache.
+                logger.info(
+                    "[2E1C-TRACE] kv-init: determine_available_memory start")
                 available_gpu_memory = self.model_executor.determine_available_memory()
+                logger.info(
+                    "[2E1C-TRACE] kv-init: determine_available_memory done: %s",
+                    available_gpu_memory,
+                )
                 self.available_gpu_memory_for_kv_cache = available_gpu_memory[0]
         else:
             # Attention free models don't need memory for kv cache
@@ -402,7 +413,12 @@ class EngineCore:
         vllm_config.validate_block_size()
 
         # Initialize kv cache and warmup the execution
+        logger.info(
+            "[2E1C-TRACE] kv-init: initialize_from_config start, entries=%d",
+            len(kv_cache_configs),
+        )
         self.model_executor.initialize_from_config(kv_cache_configs)
+        logger.info("[2E1C-TRACE] kv-init: initialize_from_config done")
 
         elapsed = time.time() - start
         compile_time = vllm_config.compilation_config.compilation_time
