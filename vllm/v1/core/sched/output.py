@@ -27,6 +27,7 @@ else:
     SamplingParams = object
     Request = object
 
+
 class HiddenChannelType:
     """Data-plane hidden tensor channel for edge-cloud PD separation.
 
@@ -130,6 +131,7 @@ class BatchType(enum.Enum):
     - DRAFT_LAST:    edge-cloud speculative draft batch executing the edge
                      tail segment for one draft step
     """
+
     PD_MIX = "pd_mix"
     PURE_PREFILL = "pure_prefill"
     PURE_DECODE = "pure_decode"
@@ -310,11 +312,11 @@ class EdgeCloudFinishedRequest:
     completion_tokens: int
     full_block_hashes: tuple[bytes, ...]
     publish_cache: bool = True
-    """Whether the cloud should publish this request's blocks into the
-    Prefix Cache. ``False`` means the edge asks the cloud to complete
-    resource release and accounting without publishing any of the
-    request's blocks, for fail-closed cases such as a media identity
-    that cannot be reconstructed."""
+    """Whether FINISH may publish additional blocks into the Prefix Cache.
+
+    ``False`` still completes cloud resource release and accounting, but
+    does not revoke prompt blocks already published after worker ACKs.
+    """
 
 
 @dataclass
@@ -379,7 +381,7 @@ class SchedulerOutput:
     # The worker zeros the corresponding GPU memory before the blocks are used,
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
-    
+
     # Composition of the scheduled batch. Producers (schedulers) tag this
     # field so downstream consumers — notably the non-leader PP rank's
     # PassiveScheduler — can route the batch without re-inspecting per-request
@@ -423,10 +425,13 @@ class SchedulerOutput:
     # was dropped on the edge before the draft chain fully consumed the
     # cloud-side cached attention metadata (e.g. every request of the parent
     # verify batch finished). The cloud model runner purges the corresponding
-    # cache entries. Produced only by the edge scheduler and consumed only by
-    # the cloud model runner. Only tasks whose draft was never dispatched (or
-    # was already fully consumed) are listed, so purging cannot race an
-    # in-flight DRAFT batch.
+    # cache entries. The cloud KV manager also consumes these ids before
+    # FINISH, suppressing publication of target-only KV when the matching
+    # draft chain never completed. A control-only EMPTY may notify the KV
+    # manager first; a later worker-executed FIRST repeats the ids to purge
+    # runner metadata. Only tasks whose draft was never dispatched (or was
+    # already fully consumed) are listed, so purging cannot race an in-flight
+    # DRAFT batch.
     cloud_draft_invalidate_task_ids: list[str] | None = None
 
     # Populated only by an edge-cloud scheduler. It lets the cloud finalize
