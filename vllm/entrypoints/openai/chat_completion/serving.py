@@ -280,6 +280,28 @@ class OpenAIServingChat(OpenAIServing):
                 request_id if len(engine_inputs) == 1 else f"{request_id}_{i}"
             )
 
+            edge_cloud_prefix = None
+            if (
+                getattr(
+                    self.engine_client,
+                    "_edge_cloud_prefix_negotiation_enabled",
+                    False,
+                )
+                is True
+            ):
+                edge_cloud_prefix = (
+                    await self.engine_client.negotiate_edge_cloud_prefix(
+                        sub_request_id,
+                        prompt_token_ids or [],
+                        request.model_dump(mode="json", exclude_none=True),
+                    )
+                )
+            if edge_cloud_prefix is not None:
+                engine_input["edge_cloud_request_id"] = edge_cloud_prefix.request_id
+                engine_input["edge_cloud_prefix_hit_tokens"] = (
+                    edge_cloud_prefix.hit_tokens
+                )
+
             max_tokens = get_max_tokens(
                 max_model_len,
                 request.max_completion_tokens

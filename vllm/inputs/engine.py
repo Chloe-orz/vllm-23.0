@@ -25,6 +25,12 @@ class _InputOptions(TypedDict):
     cache_salt: NotRequired[str]
     """Optional cache salt to be used for prefix caching."""
 
+    edge_cloud_request_id: NotRequired[str]
+    """Control-plane request ID for edge-cloud prefix coordination."""
+
+    edge_cloud_prefix_hit_tokens: NotRequired[int]
+    """Maximum local prefix hit confirmed to exist on the selected cloud."""
+
 
 class TokensInput(_InputOptions):
     """Represents token-based input to the engine."""

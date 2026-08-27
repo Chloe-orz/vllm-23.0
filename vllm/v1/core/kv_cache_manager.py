@@ -193,12 +193,16 @@ class KVCacheManager:
         self.prefix_cache_stats = PrefixCacheStats()
         return stats
 
-    def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
+    def get_computed_blocks(
+        self, request: Request, max_cache_hit_length: int | None = None
+    ) -> tuple[KVCacheBlocks, int]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
 
         Args:
             request: The request to get the computed blocks.
+            max_cache_hit_length: Optional upper bound imposed by an external
+                cache peer. Local hits beyond this point are not reusable.
 
         Returns:
             A tuple containing:
@@ -218,7 +222,13 @@ class KVCacheManager:
         # the single last token, because allocate_slots() requires
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
-        max_cache_hit_length = request.num_tokens - 1
+        prompt_cache_hit_limit = request.num_tokens - 1
+        if max_cache_hit_length is None:
+            max_cache_hit_length = prompt_cache_hit_limit
+        else:
+            max_cache_hit_length = min(
+                max(0, max_cache_hit_length), prompt_cache_hit_limit
+            )
         computed_blocks, num_new_computed_tokens = (
             self.coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length

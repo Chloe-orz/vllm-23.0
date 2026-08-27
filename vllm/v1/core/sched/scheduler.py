@@ -616,7 +616,10 @@ class Scheduler(SchedulerInterface):
                 if request.num_computed_tokens == 0:
                     # Get locally-cached tokens.
                     new_computed_blocks, num_new_local_computed_tokens = (
-                        self.kv_cache_manager.get_computed_blocks(request)
+                        self.kv_cache_manager.get_computed_blocks(
+                            request,
+                            request.edge_cloud_prefix_hit_tokens,
+                        )
                     )
 
                     # Get externally-cached tokens if using a KVConnector.

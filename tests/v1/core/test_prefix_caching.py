@@ -343,6 +343,34 @@ def test_prefill(hash_fn):
     )
 
 
+def test_external_prefix_limit_caps_local_cache_hit():
+    block_size = 16
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(block_size, 16),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    token_ids = list(range(3 * block_size)) + [99]
+    original = make_request("original", token_ids, block_size, sha256)
+    blocks = manager.allocate_slots(original, len(token_ids))
+    assert blocks is not None
+    manager.free(original)
+
+    replay = make_request("replay", token_ids, block_size, sha256)
+    _, normal_hit = manager.get_computed_blocks(replay)
+    _, cloud_capped_hit = manager.get_computed_blocks(
+        replay, max_cache_hit_length=block_size
+    )
+    _, unaligned_cloud_cap = manager.get_computed_blocks(
+        replay, max_cache_hit_length=2 * block_size - 1
+    )
+
+    assert normal_hit == 3 * block_size
+    assert cloud_capped_hit == block_size
+    assert unaligned_cloud_cap == block_size
+
+
 def test_prefill_hybrid_model():
     block_size = 16
     manager = make_kv_cache_manager(

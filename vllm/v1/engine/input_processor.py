@@ -382,6 +382,10 @@ class InputProcessor:
             data_parallel_rank=data_parallel_rank,
             trace_headers=trace_headers,
             resumable=resumable,
+            edge_cloud_request_id=decoder_inputs.get("edge_cloud_request_id"),
+            edge_cloud_prefix_hit_tokens=decoder_inputs.get(
+                "edge_cloud_prefix_hit_tokens"
+            ),
         )
 
     def _validate_prompt_len(

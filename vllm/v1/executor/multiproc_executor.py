@@ -1057,7 +1057,10 @@ class WorkerProc:
             # For non-leader PP rank with passive EngineCore, send local
             # MQ handles (for passive enginecore handshake) instead of
             # cross-node MQ handles (used for actual work).
-            if envs.VLLM_PP_NON_LEADER_ENGINE_CORE and worker.local_worker_response_mq is not None:
+            if (
+                envs.VLLM_PP_NON_LEADER_ENGINE_CORE
+                and worker.local_worker_response_mq is not None
+            ):
                 ready_writer.send(
                     {
                         "status": WorkerProc.READY_STR,
@@ -1187,6 +1190,35 @@ class WorkerProc:
             return self.local_rank == output_rank
         return self.rank == output_rank
 
+    def _execute_local_rpc(self, method, args, kwargs, output_rank) -> None:
+        """Execute a control RPC received from the local EngineCore."""
+        try:
+            if isinstance(method, str):
+                func = getattr(self.worker, method)
+            elif isinstance(method, bytes):
+                func = partial(cloudpickle.loads(method), self.worker)
+            else:
+                raise TypeError(f"Unsupported RPC method type: {type(method)!r}")
+            output = func(*args, **kwargs)
+        except Exception as e:
+            if hasattr(e, "add_note"):
+                e.add_note(traceback.format_exc())
+            logger.exception("WorkerProc local RPC hit an exception.")
+            output = e
+
+        if output_rank is not None and not self._matches_output_rank(
+                output_rank):
+            return
+        if isinstance(output, Exception):
+            result = (WorkerProc.ResponseStatus.FAILURE, str(output))
+        else:
+            result = (WorkerProc.ResponseStatus.SUCCESS, output)
+        response_mq = self.local_worker_response_mq
+        if response_mq is None:
+            response_mq = self.worker_response_mq
+        if response_mq is not None:
+            response_mq.enqueue(result)
+
     def worker_busy_loop(self):
         """Main busy loop for Multiprocessing Workers"""
         assert self.rpc_broadcast_mq is not None
@@ -1203,7 +1235,7 @@ class WorkerProc:
                         slice_info = args[1] if len(args) > 1 else None
                         # Execute model with the received SchedulerOutput.
                         try:
-                            func = getattr(self.worker, "execute_model")
+                            func = self.worker.execute_model
                             output = func(
                                 scheduler_output,
                                 layer_slice_info=slice_info,
@@ -1227,7 +1259,9 @@ class WorkerProc:
                             "__pp_scheduler_ack__": True,
                             "batch_type": scheduler_output.batch_type,
                             "head_token": getattr(scheduler_output, "head_token", None),
-                            "hidden_channel": getattr(scheduler_output, "hidden_channel", None),
+                            "hidden_channel": getattr(
+                                scheduler_output, "hidden_channel", None
+                            ),
                         }
                         should_send_ack = (
                             (output_rank is None and self.local_rank == 0)
@@ -1244,6 +1278,11 @@ class WorkerProc:
                                     (WorkerProc.ResponseStatus.SUCCESS, ack)
                                 )
                         continue
+                    self._execute_local_rpc(method, args, kwargs, output_rank)
+                    # Fall through to the cross-node queue after handling one
+                    # local control RPC. Cloud-side KV config polling is
+                    # continuous during startup and must not starve the
+                    # cross-node KV cache initialization RPC.
                 except Exception:
                     pass  # TimeoutError or empty queue
 

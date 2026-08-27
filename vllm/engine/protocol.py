@@ -37,6 +37,16 @@ class StreamingInput:
     sampling_params: SamplingParams | None = None
 
 
+@dataclass(frozen=True)
+class EdgeCloudPrefixResult:
+    """Result of an optional edge-cloud prefix-cache negotiation."""
+
+    request_id: str
+    instance_id: str
+    block_size: int
+    hit_tokens: int
+
+
 class EngineClient(ABC):
     """Protocol class for Clients to Engine"""
 
@@ -82,6 +92,19 @@ class EngineClient(ABC):
     ) -> AsyncGenerator[RequestOutput, None]:
         """Generate outputs for a request."""
         ...
+
+    async def negotiate_edge_cloud_prefix(
+        self,
+        request_id: str,
+        prompt_token_ids: list[int],
+        openai_request: Mapping[str, Any],
+    ) -> EdgeCloudPrefixResult | None:
+        """Optionally reserve a common edge-cloud prefix before admission.
+
+        Platforms without an edge-cloud control plane return ``None`` and
+        retain the normal vLLM scheduling behavior.
+        """
+        return None
 
     @abstractmethod
     def encode(
