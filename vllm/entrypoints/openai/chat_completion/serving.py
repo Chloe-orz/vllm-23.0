@@ -13,7 +13,7 @@ import numpy as np
 import pybase64 as base64
 from fastapi import Request
 
-from vllm.engine.protocol import EngineClient
+from vllm.engine.protocol import EdgeCloudMediaItem, EngineClient
 from vllm.entrypoints.chat_utils import (
     ChatTemplateContentFormatOption,
     ConversationMessage,
@@ -78,6 +78,100 @@ if TYPE_CHECKING:
     from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 
 logger = init_logger(__name__)
+
+_EDGE_CLOUD_MEDIA_DIGEST_MAX_SIZE: Final = 64
+"""Maximum size in bytes of an edge-cloud media content digest.
+
+Digests of any deployed digest algorithm up to this size (e.g. 32-byte
+sha256 or 64-byte sha512) are accepted; the edge-cloud hash ABI
+normalizes them to 32 bytes downstream.
+"""
+
+
+def _extract_edge_cloud_media_items(
+    engine_input: EngineInput,
+    prompt_token_ids: list[int],
+) -> tuple[EdgeCloudMediaItem, ...]:
+    """Build media identity descriptors from a processed engine input.
+
+    Args:
+        engine_input: The processed engine input. For multi-modal inputs
+            the placeholder tokens are already expanded in
+            ``prompt_token_ids``.
+        prompt_token_ids: The processed prompt token IDs.
+
+    Returns:
+        Media identity descriptors for edge-cloud prefix negotiation,
+        ordered by modality name and item index. Empty for non-multi-modal
+        inputs.
+
+    Raises:
+        ValueError: If a digest is not a hex string, is empty, or exceeds
+            ``_EDGE_CLOUD_MEDIA_DIGEST_MAX_SIZE`` bytes, a placeholder
+            range is invalid, or hashes and placeholders disagree. The
+            negotiation fails closed instead of silently degrading to a
+            text-only description.
+    """
+    if engine_input["type"] != "multimodal":
+        return ()
+
+    num_tokens = len(prompt_token_ids)
+    mm_hashes = engine_input["mm_hashes"]
+    mm_placeholders = engine_input["mm_placeholders"]
+    if mm_hashes.keys() != mm_placeholders.keys():
+        raise ValueError(
+            "mm_hashes and mm_placeholders disagree on modalities: "
+            f"{sorted(mm_hashes)} != {sorted(mm_placeholders)}"
+        )
+
+    media_items: list[EdgeCloudMediaItem] = []
+    for modality in sorted(mm_hashes):
+        hashes = mm_hashes[modality]
+        placeholders = mm_placeholders[modality]
+        if len(hashes) != len(placeholders):
+            raise ValueError(
+                f"Modality {modality!r} has {len(hashes)} hashes but "
+                f"{len(placeholders)} placeholders"
+            )
+        for item_index, (hex_digest, placeholder) in enumerate(
+            zip(hashes, placeholders)
+        ):
+            try:
+                digest = bytes.fromhex(hex_digest)
+            except ValueError as e:
+                raise ValueError(
+                    f"Invalid media digest for {modality} item "
+                    f"{item_index}: not a hex string"
+                ) from e
+            if not digest:
+                raise ValueError(
+                    f"Invalid media digest for {modality} item "
+                    f"{item_index}: empty digest"
+                )
+            if len(digest) > _EDGE_CLOUD_MEDIA_DIGEST_MAX_SIZE:
+                raise ValueError(
+                    f"Invalid media digest for {modality} item "
+                    f"{item_index}: expected at most "
+                    f"{_EDGE_CLOUD_MEDIA_DIGEST_MAX_SIZE} bytes, "
+                    f"got {len(digest)}"
+                )
+            offset = placeholder.offset
+            length = placeholder.length
+            if offset < 0 or length <= 0 or offset + length > num_tokens:
+                raise ValueError(
+                    f"Invalid placeholder range for {modality} item "
+                    f"{item_index}: offset={offset}, length={length}, "
+                    f"num_prompt_tokens={num_tokens}"
+                )
+            media_items.append(
+                EdgeCloudMediaItem(
+                    modality=modality,
+                    digest=digest,
+                    offset=offset,
+                    length=length,
+                )
+            )
+    return tuple(media_items)
 
 
 class OpenAIServingChat(OpenAIServing):
@@ -280,28 +374,6 @@ class OpenAIServingChat(OpenAIServing):
                 request_id if len(engine_inputs) == 1 else f"{request_id}_{i}"
             )
 
-            edge_cloud_prefix = None
-            if (
-                getattr(
-                    self.engine_client,
-                    "_edge_cloud_prefix_negotiation_enabled",
-                    False,
-                )
-                is True
-            ):
-                edge_cloud_prefix = (
-                    await self.engine_client.negotiate_edge_cloud_prefix(
-                        sub_request_id,
-                        prompt_token_ids or [],
-                        request.model_dump(mode="json", exclude_none=True),
-                    )
-                )
-            if edge_cloud_prefix is not None:
-                engine_input["edge_cloud_request_id"] = edge_cloud_prefix.request_id
-                engine_input["edge_cloud_prefix_hit_tokens"] = (
-                    edge_cloud_prefix.hit_tokens
-                )
-
             max_tokens = get_max_tokens(
                 max_model_len,
                 request.max_completion_tokens
@@ -322,6 +394,34 @@ class OpenAIServingChat(OpenAIServing):
                 sampling_params = request.to_sampling_params(
                     max_tokens,
                     self.default_sampling_params,
+                )
+
+            # Negotiate the edge-cloud prefix only after the request has
+            # been fully validated and the sampling parameters are built,
+            # so that a rejected request never triggers a probe.
+            edge_cloud_prefix = None
+            if (
+                getattr(
+                    self.engine_client,
+                    "_edge_cloud_prefix_negotiation_enabled",
+                    False,
+                )
+                is True
+            ):
+                edge_cloud_prefix = (
+                    await self.engine_client.negotiate_edge_cloud_prefix(
+                        sub_request_id,
+                        prompt_token_ids or [],
+                        request.model_dump(mode="json", exclude_none=True),
+                        media_items=_extract_edge_cloud_media_items(
+                            engine_input, prompt_token_ids or []
+                        ),
+                    )
+                )
+            if edge_cloud_prefix is not None:
+                engine_input["edge_cloud_request_id"] = edge_cloud_prefix.request_id
+                engine_input["edge_cloud_prefix_hit_tokens"] = (
+                    edge_cloud_prefix.hit_tokens
                 )
 
             self._log_inputs(
