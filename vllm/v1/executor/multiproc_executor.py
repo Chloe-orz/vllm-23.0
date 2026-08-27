@@ -189,11 +189,31 @@ class MultiprocExecutor(Executor):
         success = False
         try:
             if self.parallel_config.enable_edge_cloud:
-                global_start_rank = (
-                    0
-                    if self.parallel_config.is_edge_node
-                    else self.parallel_config.edge_npu_count
-                )
+                if self.parallel_config.role_registry:
+                    # Multi-instance (2E1C): this instance's global ranks come
+                    # from the registry, not from the edge/cloud formula.
+                    # E.g. E0 starts at 0, E1 at 1, cloud at 2 — without this,
+                    # every edge would compute start_rank=0 ("is_edge → 0")
+                    # and the second edge would collide with the first.
+                    import yaml as _yaml
+                    with open(self.parallel_config.role_registry,
+                              encoding="utf-8") as _f:
+                        _reg = _yaml.safe_load(_f)
+                    if self.parallel_config.is_edge_node:
+                        _eid = self.parallel_config.edge_id
+                        _entry = next(e for e in _reg["edges"]
+                                      if int(e["id"]) == _eid)
+                    else:
+                        _cid = self.parallel_config.cloud_id
+                        _entry = next(c for c in _reg["clouds"]
+                                      if int(c["id"]) == _cid)
+                    global_start_rank = int(_entry["ranks"][0])
+                else:
+                    global_start_rank = (
+                        0
+                        if self.parallel_config.is_edge_node
+                        else self.parallel_config.edge_npu_count
+                    )
             else:
                 global_start_rank = (
                     self.local_world_size * self.parallel_config.node_rank_within_dp
@@ -713,6 +733,30 @@ class WorkerProc:
             )
             self.local_rpc_broadcast_mq = None
             self.local_worker_response_mq = None
+            # Multi-instance (2E1C): a non-rank0 edge's worker (E1) joins the
+            # world-group collectives above only for the handshake — E0's
+            # engine (the world-MQ writer) counts its subscription, and the
+            # response-handle gather is collective.  But its ACTUAL work
+            # source is its OWN engine's local MQ (each edge is an
+            # independent engine↔worker pipeline), so re-point both queues
+            # at this instance's handles.  The world-group reader is shelved
+            # (kept referenced so the socket stays alive): E0 never sends
+            # cross-node execute_model (local_only), and E0's response scope
+            # excludes this worker, so nothing is ever expected from it.
+            _pc = vllm_config.parallel_config
+            if (getattr(_pc, "role_registry", None)
+                    and getattr(_pc, "is_edge_node", False) and self.rank != 0):
+                self._shelved_world_mq = self.rpc_broadcast_mq
+                self._shelved_response_mq = self.worker_response_mq
+                self.rpc_broadcast_mq = MessageQueue.create_from_handle(
+                    input_shm_handle, self.local_rank
+                )
+                self.worker_response_mq = MessageQueue(1, 1)
+                self.peer_response_handles = []
+                # This worker serves only its own engine, whose output_rank
+                # is instance-local (0) while self.rank is the GLOBAL rank
+                # (1 for E1) — reply gating must compare the local rank.
+                self._reply_rank_is_local = True
 
     @instrument(span_name="Worker init")
     def __init__(
@@ -727,6 +771,9 @@ class WorkerProc:
     ):
         self.rank = rank
         self.local_rank = local_rank
+        # Multi-instance (2E1C): set by _init_message_queues for a non-rank0
+        # edge's worker — its engine's output_rank is instance-local.
+        self._reply_rank_is_local = False
         wrapper = WorkerWrapperBase(rpc_rank=local_rank, global_rank=rank)
         # TODO: move `init_worker` to executor level as a collective rpc call
         all_kwargs: list[dict] = [
@@ -1129,6 +1176,17 @@ class WorkerProc:
             output = self.async_output_queue.get()
             self.enqueue_output(output)
 
+    def _matches_output_rank(self, output_rank: int) -> bool:
+        """Whether this worker should reply for the given output_rank.
+
+        Normally output_rank is a global rank.  For a non-rank0 edge's
+        worker in multi-instance (2E1C) mode the engine's output_rank is
+        instance-local, so compare against local_rank instead.
+        """
+        if getattr(self, "_reply_rank_is_local", False):
+            return self.local_rank == output_rank
+        return self.rank == output_rank
+
     def worker_busy_loop(self):
         """Main busy loop for Multiprocessing Workers"""
         assert self.rpc_broadcast_mq is not None
@@ -1233,11 +1291,11 @@ class WorkerProc:
                 logger.exception("WorkerProc hit an exception.")
                 # exception might not be serializable, so we convert it to
                 # string, only for logging purpose.
-                if output_rank is None or self.rank == output_rank:
+                if output_rank is None or self._matches_output_rank(output_rank):
                     self.handle_output(e)
                 continue
 
-            if output_rank is None or self.rank == output_rank:
+            if output_rank is None or self._matches_output_rank(output_rank):
                 self.handle_output(output)
 
     # ------------------------------------------------------------------ #

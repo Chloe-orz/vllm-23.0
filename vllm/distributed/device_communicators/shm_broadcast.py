@@ -498,6 +498,17 @@ class MessageQueue:
             if handle.remote_addr_ipv6:
                 self.remote_socket.setsockopt(IPV6, 1)
             socket_addr = handle.remote_subscribe_addr
+            # [2E1C-DIAG] temporary: surface the exact address field before
+            # connect — a None here means the writer's MQ was created
+            # local-only (n_local_reader == n_reader) or the handle lost it.
+            logger.info(
+                "[2E1C-DIAG] create_from_handle: remote_subscribe_addr=%s "
+                "local_subscribe_addr=%s n_reader=%s n_local_reader=%s",
+                handle.remote_subscribe_addr,
+                getattr(handle, "local_subscribe_addr", None),
+                getattr(handle, "n_reader", None),
+                getattr(handle, "n_local_reader", None),
+            )
             logger.debug("Connecting to %s", socket_addr)
             self.remote_socket.connect(socket_addr)
             self._spin_condition = None  # type: ignore
