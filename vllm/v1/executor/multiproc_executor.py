@@ -634,6 +634,10 @@ class WorkerProcHandle:
     # `peer_worker_response_mqs[i]`
     peer_worker_response_mqs: list[MessageQueue | None]
     death_writer: Connection | None = None
+    # Reverse irecv-completion report channel (edge-cloud early-recv),
+    # written by the worker's comm thread; None when PD-separated
+    # early-recv is inactive.
+    irecv_done_mq: MessageQueue | None = None
 
     @classmethod
     def from_unready_handle(
@@ -641,6 +645,7 @@ class WorkerProcHandle:
         unready_handle: UnreadyWorkerProcHandle,
         worker_response_mq: MessageQueue | None,
         peer_worker_response_mqs: list[MessageQueue | None],
+        irecv_done_mq: MessageQueue | None = None,
     ) -> "WorkerProcHandle":
         return cls(
             proc=unready_handle.proc,
@@ -648,6 +653,7 @@ class WorkerProcHandle:
             worker_response_mq=worker_response_mq,
             peer_worker_response_mqs=peer_worker_response_mqs,
             death_writer=unready_handle.death_writer,
+            irecv_done_mq=irecv_done_mq,
         )
 
 
@@ -776,16 +782,19 @@ class WorkerProc:
         # (nnodes_within_dp > 1) require distributed groups to be initialized
         self._init_message_queues(input_shm_handle, vllm_config)
 
-        # [CHER] Cloud-side hidden early-receive: a built-in part of PD-separation
-        # masking.  When this cloud worker owns the sideband recv-hint MQ, start
-        # the early-irecv guard thread eagerly.  busy_loop is single-threaded and
-        # blocks inside execute_model for a long P-middle batch, so the guard
-        # thread (not busy_loop) owns cloud_recv_hint_mq: it drains recv-hints,
-        # posts irecv, and waits it to completion while busy_loop is blocked on
-        # the previous P-middle.  CHER does not gate scheduling (no ack), so the
-        # guard only posts + waits.
-        if getattr(self, "cloud_recv_hint_mq", None) is not None:
-            self._start_early_recv_guard()
+        # Reverse irecv-completion channel for edge-cloud early-recv
+        # reporting: created (as writer) inside the NPUWorker when
+        # PD-separated early-recv is active.  Its handle rides the READY
+        # handshake so the executor can attach the reader.
+        self.irecv_done_mq = getattr(self.worker, "irecv_done_mq", None)
+        if getattr(
+            vllm_config.parallel_config, "enable_edge_cloud", False
+        ) and self.local_rank == 0:
+            logger.info(
+                "[early-irecv] WorkerProc picked up irecv_done_mq writer: "
+                "%s",
+                "OK" if self.irecv_done_mq is not None else "NONE",
+            )
 
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
@@ -859,10 +868,28 @@ class WorkerProc:
             else None
             for handle in peer_response_handles
         ]
+        # Reverse irecv-completion report channel (worker comm thread ->
+        # engine core).  The worker created it as writer; attach a reader.
+        irecv_done_handle = handles.get("irecv_done_handle")
+        logger.info(
+            "[early-irecv] ready payload received: irecv_done_handle=%s "
+            "local_reader_ranks=%s",
+            "present" if irecv_done_handle is not None else "MISSING",
+            getattr(irecv_done_handle, "local_reader_ranks", None),
+        )
+        irecv_done_mq: MessageQueue | None = None
+        if (
+            irecv_done_handle is not None
+            and len(irecv_done_handle.local_reader_ranks) > 0
+        ):
+            irecv_done_mq = MessageQueue.create_from_handle(
+                irecv_done_handle, 0
+            )
         return WorkerProcHandle.from_unready_handle(
             proc_handle,
             worker_response_mq,
             peer_worker_response_mqs=peer_worker_response_mqs,
+            irecv_done_mq=irecv_done_mq,
         )
 
     @staticmethod
@@ -1006,6 +1033,11 @@ class WorkerProc:
 
             worker.monitor_death_pipe(death_pipe, shutdown_requested)
 
+            logger.info(
+                "[early-irecv] worker_main before READY: irecv_done_mq=%s",
+                "set" if worker.irecv_done_mq is not None else "NONE",
+            )
+
             # Send READY once we know everything is loaded.
             # For non-leader PP rank with passive EngineCore, send local
             # MQ handles (for passive enginecore handshake) instead of
@@ -1016,6 +1048,11 @@ class WorkerProc:
                         "status": WorkerProc.READY_STR,
                         "handle": worker.local_worker_response_mq.export_handle(),
                         "peer_response_handles": worker.local_peer_response_handles,
+                        "irecv_done_handle": (
+                            worker.irecv_done_mq.export_handle()
+                            if worker.irecv_done_mq is not None
+                            else None
+                        ),
                     }
                 )
             else:
@@ -1024,6 +1061,11 @@ class WorkerProc:
                         "status": WorkerProc.READY_STR,
                         "handle": worker.worker_response_mq.export_handle(),
                         "peer_response_handles": worker.peer_response_handles,
+                        "irecv_done_handle": (
+                            worker.irecv_done_mq.export_handle()
+                            if worker.irecv_done_mq is not None
+                            else None
+                        ),
                     }
                 )
 
@@ -1239,97 +1281,6 @@ class WorkerProc:
 
             if output_rank is None or self.rank == output_rank:
                 self.handle_output(output)
-
-    # ------------------------------------------------------------------ #
-    # [CHER] Cloud-side hidden early-receive guard thread.               #
-    # ------------------------------------------------------------------ #
-    def _start_early_recv_guard(self) -> None:
-        """Start the early-irecv guard thread (CHER, cloud-side only).
-
-        Cloud-side hidden early-receive is a built-in part of PD-separation
-        masking: the PassiveEC fires recv-hints on the sideband
-        ``cloud_recv_hint_mq``, and this guard thread (not busy_loop) owns that
-        MQ so irecv is posted even while busy_loop is blocked inside the
-        previous P-middle's execute_model.  The guard ONLY posts irecv
-        (start_early_irecv); it never wait()s -- waiting is left to
-        execute_model's wait_for_comm() on the busy_loop thread, since HCCL
-        does not tolerate a cross-thread wait() on a hidden-channel irecv while
-        busy_loop issues isend on that same channel (the wait blocks the isend
-        and deadlocks).  No gating/ack: scheduling is independent of hidden
-        arrival.
-        """
-        if getattr(self, "_early_recv_guard_started", False):
-            return
-        worker = getattr(self, "worker", None)
-        if worker is None or not hasattr(worker, "start_early_irecv"):
-            return
-        self._early_recv_guard_started = True
-        self._early_recv_guard_shutdown = False
-        self._early_recv_guard_thread = threading.Thread(
-            target=self._early_recv_guard_loop,
-            name="cher-early-recv-guard",
-            daemon=True,
-        )
-        self._early_recv_guard_thread.start()
-        logger.info("[CHER] early-irecv guard thread started")
-
-    def _early_recv_guard_loop(self) -> None:
-        """Drain recv-hints and post early irecv (NO wait).
-
-        Drains ``cloud_recv_hint_mq`` (a sideband MQ the PassiveEC writes
-        fire-and-forget recv-hints to) and calls ``start_early_irecv`` so the
-        edge->cloud hidden irecv is posted ahead of the batch's execute_model.
-        busy_loop is single-threaded and blocks inside execute_model for a long
-        P-middle batch, so a hint queued on rpc_broadcast_mq would not be
-        dequeued until that batch finishes -- this guard thread owns the
-        sideband MQ to defeat that.
-
-        This thread ONLY posts the irecv; it does NOT wait() the handles.
-        Waiting is left to execute_model's wait_for_comm() on the busy_loop
-        thread.  Rationale: HCCL does not tolerate a cross-thread wait() on a
-        hidden-channel irecv while busy_loop issues isend on that same channel
-        (the P-middle result send-back) -- the wait blocks the isend and
-        deadlocks the pipeline (no ack -> no POST_OUT -> edge gets no P-tail).
-        Posting alone is safe (it just enqueues a recv op); busy_loop then
-        wait()+isend on its own thread, identical to the synchronous recv path.
-        """
-        try:
-            from vllm.platforms import current_platform
-            worker = getattr(self, "worker", None)
-            if worker is not None and hasattr(worker, "device"):
-                current_platform.set_device(worker.device)
-        except Exception:
-            logger.exception("[CHER] guard thread failed to set device")
-
-        hint_mq = getattr(self, "cloud_recv_hint_mq", None)
-
-        while not getattr(self, "_early_recv_guard_shutdown", False):
-            posted = False
-            # [CHER] Post any new recv-hints that arrived on the sideband MQ.
-            # Non-blocking: post only, never wait here (see docstring).
-            if hint_mq is not None:
-                while True:
-                    try:
-                        method, args, _kwargs, _output_rank = (
-                            hint_mq.dequeue(timeout=0)
-                        )
-                    except TimeoutError:
-                        break
-                    except Exception:
-                        # Anything other than TimeoutError (e.g. a torn-down
-                        # MQ at shutdown) -> stop draining this round.
-                        logger.exception("[CHER] guard dequeue error")
-                        break
-                    if method == b"pp_recv_hint" and args:
-                        try:
-                            self.worker.start_early_irecv(args[0])
-                            posted = True
-                        except Exception:
-                            logger.exception(
-                                "[CHER] start_early_irecv failed"
-                            )
-            if not posted:
-                time.sleep(0.0001)
 
     @staticmethod
     def setup_proc_title_and_log_prefix(enable_ep: bool) -> None:
