@@ -2035,8 +2035,8 @@ def initialize_model_parallel(
             paired: set[int] = set()
             for e_id in registry.edge_ids:
                 for c_id in registry.cloud_ids:
-                    e0 = registry.edge(e_id).npus[0]
-                    c0 = registry.cloud(c_id).npus[0]
+                    e0 = registry.edge(e_id).ranks[0]
+                    c0 = registry.cloud(c_id).ranks[0]
                     pair_rank_sets.append([e0, c0])
                     paired.add(e0)
                     paired.add(c0)
@@ -2635,7 +2635,22 @@ def in_the_same_node_as_edge_cloud(
     cloud_npu_count = parallel_config.cloud_npu_count
     is_shared = parallel_config.is_shared_model_edge
 
-    if is_shared:
+    # Multi-instance (2E1C): membership comes from the registry's rank
+    # lists — legacy arithmetic (r < edge_npu_count) mislabels the second
+    # edge as cloud.
+    if getattr(parallel_config, "role_registry", None):
+        from vllm_ascend.edge_cloud.role_registry import get_role_registry
+        registry = get_role_registry()
+        if registry is not None:
+            edge_ranks = {r for i in registry.edge_ids
+                          for r in registry.edge(i).ranks}
+
+            def is_edge(r: int) -> bool:
+                return r in edge_ranks
+        else:
+            def is_edge(r: int) -> bool:  # registry not loaded: legacy rule
+                return r < edge_npu_count
+    elif is_shared:
         # ``rank == 0`` is the shared edge rank; every other
         # rank is a cloud rank.
         def is_edge(r: int) -> bool:

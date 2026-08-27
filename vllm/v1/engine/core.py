@@ -258,10 +258,30 @@ class EngineCore:
         register_all_kvcache_specs(vllm_config)
 
         # Get all kv cache needed by the model
+        logger.info("[2E1C-TRACE] kv-init: get_kv_cache_specs start")
         kv_cache_specs = self.model_executor.get_kv_cache_specs()
+        logger.info(
+            "[2E1C-TRACE] kv-init: get_kv_cache_specs done, entries=%d",
+            len(kv_cache_specs),
+        )
 
         has_kv_cache = any(kv_cache_spec for kv_cache_spec in kv_cache_specs)
-        if has_kv_cache:
+        # Multi-instance (2E1C): a non-rank0 edge's instance-local spec
+        # collection sees only its own (empty, embedding-only) spec, so
+        # has_kv_cache is False and profiling would be skipped.  Profile
+        # anyway: the profile's _dummy_run is what creates the edge runner's
+        # persistent intermediate_tensors buffer (edge-cloud capture_model
+        # returns early, so warmup never dummy-runs), and every tail-segment
+        # (PL/DL) batch asserts on that buffer.  The profiled value itself is
+        # unused — the empty spec still yields the attention-free placeholder
+        # config.
+        _pc = vllm_config.parallel_config
+        _force_profile = bool(
+            getattr(_pc, "role_registry", None)
+            and getattr(_pc, "edge_id", None) is not None
+            and not has_kv_cache
+        )
+        if has_kv_cache or _force_profile:
             if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
                 # NOTE(yongji): should already be set
                 # during _eep_scale_up_before_kv_init
@@ -272,7 +292,13 @@ class EngineCore:
             else:
                 # Profiles the peak memory usage of the model to determine how
                 # much memory can be allocated for kv cache.
+                logger.info(
+                    "[2E1C-TRACE] kv-init: determine_available_memory start")
                 available_gpu_memory = self.model_executor.determine_available_memory()
+                logger.info(
+                    "[2E1C-TRACE] kv-init: determine_available_memory done: %s",
+                    available_gpu_memory,
+                )
                 self.available_gpu_memory_for_kv_cache = available_gpu_memory[0]
         else:
             # Attention free models don't need memory for kv cache
@@ -295,13 +321,86 @@ class EngineCore:
             self.collective_rpc("update_max_model_len", args=(max_model_len_after,))
 
         if vllm_config.parallel_config.enable_edge_cloud:
-            max_group_idx = max(
-                range(len(kv_cache_configs)),
-                key=lambda i: len(kv_cache_configs[i].kv_cache_groups),
-            )
-            scheduler_kv_cache_config = generate_scheduler_kv_cache_config(
-                [kv_cache_configs[max_group_idx]]
-            )
+            _pc = vllm_config.parallel_config
+            if (getattr(_pc, "role_registry", None)
+                    and getattr(_pc, "edge_id", None) is not None):
+                # Multi-instance (2E1C) edge.  The rank0 edge's config list
+                # also covers the cloud workers (world control plane), so it
+                # derives the scheduler config normally (full-model groups,
+                # num_blocks already shrunk to its share by the partition
+                # logic in get_kv_cache_configs) and publishes it.  A
+                # non-rank0 edge's instance-local sizing only sees its own
+                # empty spec — an attention-free placeholder WITHOUT the
+                # full-model groups its scheduler still needs — so it reuses
+                # the rank0 edge's published scheduler config with its OWN
+                # share substituted (same groups, same block_size).
+                import base64
+                import pickle
+                from datetime import timedelta as _td
+
+                import torch.distributed as _dist
+
+                from vllm_ascend.edge_cloud.role_registry import (
+                    get_role_registry,
+                )
+                _registry = get_role_registry()
+                assert _registry is not None
+                _store = _dist.TCPStore(
+                    host_name=_registry.world.master_addr,
+                    port=_registry.world.master_port,
+                    is_master=False,
+                    timeout=_td(seconds=300),
+                )
+                if len(kv_cache_configs) > _pc.local_world_size:
+                    # Rank0 edge.
+                    max_group_idx = max(
+                        range(len(kv_cache_configs)),
+                        key=lambda i: len(kv_cache_configs[i].kv_cache_groups),
+                    )
+                    scheduler_kv_cache_config = (
+                        generate_scheduler_kv_cache_config(
+                            [kv_cache_configs[max_group_idx]]
+                        )
+                    )
+                    _store.set(
+                        "edge0_scheduler_kv_config",
+                        base64.b64encode(
+                            pickle.dumps(scheduler_kv_cache_config)
+                        ).decode(),
+                    )
+                    logger.info(
+                        "[edge-cloud] published scheduler kv config "
+                        "(groups=%d num_blocks=%d) for non-rank0 edges",
+                        len(scheduler_kv_cache_config.kv_cache_groups),
+                        scheduler_kv_cache_config.num_blocks,
+                    )
+                else:
+                    # Non-rank0 edge: blocks until the rank0 edge publishes
+                    # (its sizing never depends on this edge — no cycle).
+                    scheduler_kv_cache_config = pickle.loads(
+                        base64.b64decode(
+                            _store.get("edge0_scheduler_kv_config")
+                        )
+                    )
+                    _share = _registry.kv_partition.num_blocks_of(
+                        _pc.edge_id
+                    )
+                    scheduler_kv_cache_config.num_blocks = _share
+                    logger.info(
+                        "[edge-cloud] scheduler kv config from rank0 edge: "
+                        "edge_id=%d groups=%d num_blocks=%d",
+                        _pc.edge_id,
+                        len(scheduler_kv_cache_config.kv_cache_groups),
+                        _share,
+                    )
+            else:
+                max_group_idx = max(
+                    range(len(kv_cache_configs)),
+                    key=lambda i: len(kv_cache_configs[i].kv_cache_groups),
+                )
+                scheduler_kv_cache_config = generate_scheduler_kv_cache_config(
+                    [kv_cache_configs[max_group_idx]]
+                )
         else:
             scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
         vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks
@@ -314,7 +413,12 @@ class EngineCore:
         vllm_config.validate_block_size()
 
         # Initialize kv cache and warmup the execution
+        logger.info(
+            "[2E1C-TRACE] kv-init: initialize_from_config start, entries=%d",
+            len(kv_cache_configs),
+        )
         self.model_executor.initialize_from_config(kv_cache_configs)
+        logger.info("[2E1C-TRACE] kv-init: initialize_from_config done")
 
         elapsed = time.time() - start
         compile_time = vllm_config.compilation_config.compilation_time

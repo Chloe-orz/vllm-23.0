@@ -189,11 +189,31 @@ class MultiprocExecutor(Executor):
         success = False
         try:
             if self.parallel_config.enable_edge_cloud:
-                global_start_rank = (
-                    0
-                    if self.parallel_config.is_edge_node
-                    else self.parallel_config.edge_npu_count
-                )
+                if self.parallel_config.role_registry:
+                    # Multi-instance (2E1C): this instance's global ranks come
+                    # from the registry, not from the edge/cloud formula.
+                    # E.g. E0 starts at 0, E1 at 1, cloud at 2 — without this,
+                    # every edge would compute start_rank=0 ("is_edge → 0")
+                    # and the second edge would collide with the first.
+                    import yaml as _yaml
+                    with open(self.parallel_config.role_registry,
+                              encoding="utf-8") as _f:
+                        _reg = _yaml.safe_load(_f)
+                    if self.parallel_config.is_edge_node:
+                        _eid = self.parallel_config.edge_id
+                        _entry = next(e for e in _reg["edges"]
+                                      if int(e["id"]) == _eid)
+                    else:
+                        _cid = self.parallel_config.cloud_id
+                        _entry = next(c for c in _reg["clouds"]
+                                      if int(c["id"]) == _cid)
+                    global_start_rank = int(_entry["ranks"][0])
+                else:
+                    global_start_rank = (
+                        0
+                        if self.parallel_config.is_edge_node
+                        else self.parallel_config.edge_npu_count
+                    )
             else:
                 global_start_rank = (
                     self.local_world_size * self.parallel_config.node_rank_within_dp
@@ -661,6 +681,20 @@ class WorkerProc:
     def _init_message_queues(
         self, input_shm_handle: Handle, vllm_config: VllmConfig
     ) -> None:
+        # [2E1C-DIAG] temporary instrumentation for the multi-edge bring-up:
+        # log which MQ branch each worker takes and the handle wiring.
+        try:
+            from vllm.logger import init_logger as _il
+            _il(__name__).info(
+                "[2E1C-DIAG] _init_message_queues: rank=%s local_rank=%s "
+                "nnodes_within_dp=%s non_leader_env=%s input_shm_handle=%s",
+                getattr(self, "rank", None), getattr(self, "local_rank", None),
+                vllm_config.parallel_config.nnodes_within_dp,
+                envs.VLLM_PP_NON_LEADER_ENGINE_CORE,
+                "set" if input_shm_handle is not None else "None",
+            )
+        except Exception:
+            pass
         if vllm_config.parallel_config.nnodes_within_dp == 1:
             # Single-node: use local MQ
             self.rpc_broadcast_mq = MessageQueue.create_from_handle(
@@ -713,6 +747,30 @@ class WorkerProc:
             )
             self.local_rpc_broadcast_mq = None
             self.local_worker_response_mq = None
+            # Multi-instance (2E1C): a non-rank0 edge's worker (E1) joins the
+            # world-group collectives above only for the handshake — E0's
+            # engine (the world-MQ writer) counts its subscription, and the
+            # response-handle gather is collective.  But its ACTUAL work
+            # source is its OWN engine's local MQ (each edge is an
+            # independent engine↔worker pipeline), so re-point both queues
+            # at this instance's handles.  The world-group reader is shelved
+            # (kept referenced so the socket stays alive): E0 never sends
+            # cross-node execute_model (local_only), and E0's response scope
+            # excludes this worker, so nothing is ever expected from it.
+            _pc = vllm_config.parallel_config
+            if (getattr(_pc, "role_registry", None)
+                    and getattr(_pc, "is_edge_node", False) and self.rank != 0):
+                self._shelved_world_mq = self.rpc_broadcast_mq
+                self._shelved_response_mq = self.worker_response_mq
+                self.rpc_broadcast_mq = MessageQueue.create_from_handle(
+                    input_shm_handle, self.local_rank
+                )
+                self.worker_response_mq = MessageQueue(1, 1)
+                self.peer_response_handles = []
+                # This worker serves only its own engine, whose output_rank
+                # is instance-local (0) while self.rank is the GLOBAL rank
+                # (1 for E1) — reply gating must compare the local rank.
+                self._reply_rank_is_local = True
 
     @instrument(span_name="Worker init")
     def __init__(
@@ -727,6 +785,9 @@ class WorkerProc:
     ):
         self.rank = rank
         self.local_rank = local_rank
+        # Multi-instance (2E1C): set by _init_message_queues for a non-rank0
+        # edge's worker — its engine's output_rank is instance-local.
+        self._reply_rank_is_local = False
         wrapper = WorkerWrapperBase(rpc_rank=local_rank, global_rank=rank)
         # TODO: move `init_worker` to executor level as a collective rpc call
         all_kwargs: list[dict] = [
@@ -1129,9 +1190,51 @@ class WorkerProc:
             output = self.async_output_queue.get()
             self.enqueue_output(output)
 
+    def _matches_output_rank(self, output_rank: int) -> bool:
+        """Whether this worker should reply for the given output_rank.
+
+        Normally output_rank is a global rank.  For a non-rank0 edge's
+        worker in multi-instance (2E1C) mode the engine's output_rank is
+        instance-local, so compare against local_rank instead.
+        """
+        if getattr(self, "_reply_rank_is_local", False):
+            return self.local_rank == output_rank
+        return self.rank == output_rank
+
     def worker_busy_loop(self):
         """Main busy loop for Multiprocessing Workers"""
         assert self.rpc_broadcast_mq is not None
+        # [2E1C-TRACE] Observability: bracket every batch (START/DONE/SENT)
+        # and emit an idle heartbeat (~30s) so a hung worker's position is
+        # unambiguous from the log tail alone — idle-polling and
+        # stuck-in-batch look identical without it.
+        _tr_last = "none"
+        _tr_idle = 0
+
+        def _tr_heartbeat():
+            nonlocal _tr_idle
+            _tr_idle += 1
+            if _tr_idle >= 300:
+                _tr_idle = 0
+                logger.info(
+                    "[2E1C-TRACE] rank=%s idle ~30s (no batch); last batch: %s",
+                    self.rank, _tr_last,
+                )
+
+        def _tr_note(kind: str, so, extra: str = ""):
+            nonlocal _tr_last, _tr_idle
+            _tr_idle = 0
+            _bt = getattr(so, "batch_type", None)
+            _ht = getattr(so, "head_token", None)
+            _nt = getattr(so, "total_num_scheduled_tokens", None)
+            _tr_last = (
+                f"{kind} bt={_bt.value if _bt is not None else None} "
+                f"ht={_ht} ntokens={_nt} {extra}"
+            )
+            logger.info(
+                "[2E1C-TRACE] rank=%s %s", self.rank, _tr_last,
+            )
+
         while True:
             # Poll local MQ for pp scheduler output from passive
             # EngineCore (non-blocking).
@@ -1143,6 +1246,7 @@ class WorkerProc:
                     if isinstance(method, bytes) and method == b"pp_scheduler_output":
                         scheduler_output = args[0]
                         slice_info = args[1] if len(args) > 1 else None
+                        _tr_note("exec START (pp)", scheduler_output)
                         # Execute model with the received SchedulerOutput.
                         try:
                             func = getattr(self.worker, "execute_model")
@@ -1159,6 +1263,7 @@ class WorkerProc:
                             if output_rank is None or self.rank == output_rank:
                                 self.handle_output(e)
                             continue
+                        _tr_note("exec DONE (pp)", scheduler_output)
                         # For layer slicing: non-last slices produce
                         # no external output; keep polling local MQ for
                         # the next slice.  Last slice (or no slicing)
@@ -1185,8 +1290,10 @@ class WorkerProc:
                                 response_mq.enqueue(
                                     (WorkerProc.ResponseStatus.SUCCESS, ack)
                                 )
+                        _tr_note("resp SENT (pp)", scheduler_output)
                         continue
                 except Exception:
+                    _tr_heartbeat()
                     pass  # TimeoutError or empty queue
 
             # Poll cross-node MQ with short timeout so we can
@@ -1198,6 +1305,7 @@ class WorkerProc:
                 )
                 _dt_ms = (time.monotonic() - _t0) * 1000
             except TimeoutError:
+                _tr_heartbeat()
                 continue
 
             # Skip execute_model from cross-node MQ on pp rank1 workers.
@@ -1216,15 +1324,7 @@ class WorkerProc:
                 elif isinstance(method, bytes):
                     func = partial(cloudpickle.loads(method), self.worker)
                 if method == "execute_model":
-                    _bt = (
-                        getattr(args[0], "batch_type", None)
-                        if args else None
-                    )
-                    # logger.info(
-                    #     "[EDGE-DEQUEUE] dequeue took %.3f ms batch_type: %s",
-                    #     _dt_ms,
-                    #     _bt.value if _bt is not None else "N/A",
-                    # )
+                    _tr_note("exec START", args[0] if args else None)
                 output = func(*args, **kwargs)
             except Exception as e:
                 # Notes have been introduced in python 3.11
@@ -1233,12 +1333,16 @@ class WorkerProc:
                 logger.exception("WorkerProc hit an exception.")
                 # exception might not be serializable, so we convert it to
                 # string, only for logging purpose.
-                if output_rank is None or self.rank == output_rank:
+                if output_rank is None or self._matches_output_rank(output_rank):
                     self.handle_output(e)
                 continue
 
-            if output_rank is None or self.rank == output_rank:
+            if method == "execute_model":
+                _tr_note("exec DONE", args[0] if args else None)
+            if output_rank is None or self._matches_output_rank(output_rank):
                 self.handle_output(output)
+                if method == "execute_model":
+                    _tr_note("resp SENT", args[0] if args else None)
 
     # ------------------------------------------------------------------ #
     # [CHER] Cloud-side hidden early-receive guard thread.               #

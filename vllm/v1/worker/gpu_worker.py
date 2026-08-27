@@ -100,8 +100,17 @@ class AsyncIntermediateTensors(IntermediateTensors):
         if self._comm_waited:
             return
         if self._comm_handles:
+            # [2E1C-TRACE] bracket the cross-node recv wait: on a hang, the
+            # gap between "recv wait start" and "recv wait done" is the wire
+            # stall itself, and the identity of the in-flight op comes from
+            # the preceding edge_cloud_broadcast_recv post log.
+            logger.info(
+                "[2E1C-TRACE] recv wait start (handles=%d)",
+                len(self._comm_handles),
+            )
             for handle in self._comm_handles:
                 handle.wait()
+            logger.info("[2E1C-TRACE] recv wait done")
         if self._comm_postprocess:
             for fn in self._comm_postprocess:
                 fn()
