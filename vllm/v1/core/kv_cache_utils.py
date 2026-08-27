@@ -2251,7 +2251,21 @@ def get_kv_cache_configs(
     # in the registry and resolved here against the unified (cloud-decided)
     # block count.  Only the edge's own config is shrunk; the cloud keeps
     # the full pool.
+    #
+    # Prefix-cache coordination supersedes the static split: the cloud
+    # manages its whole pool itself (CloudKVRequestManager, replacing
+    # edge-sent block tables with cloud-owned allocations), so each edge
+    # sizes to the FULL cloud pool instead of a static share — edge-sent
+    # block ids are discarded at cloud ingress, and matching the cloud's
+    # capacity keeps the edge scheduler from over-subscribing it.
     _pc = vllm_config.parallel_config
+    _ac = getattr(vllm_config, "additional_config", None) or {}
+    _ec_cfg = (_ac.get("edge_cloud_config", {})
+               if isinstance(_ac, dict) else {})
+    _pcc = (_ec_cfg.get("prefix_cache_coordination", {})
+            if isinstance(_ec_cfg, dict) else {})
+    _static_partition_enabled = not (
+        isinstance(_pcc, dict) and _pcc.get("enabled", False))
     if getattr(_pc, "role_registry", None) and getattr(
             _pc, "cloud_id", None) is not None:
         # Cloud: publish its real num_blocks as a fallback channel.  In the
@@ -2300,8 +2314,13 @@ def get_kv_cache_configs(
                     "(from rank0 edge sizing)", _cloud_total)
             else:
                 _cloud_total = int(_store.get("cloud_0_num_blocks"))
-            _partition = _registry.resolve_kv_partition(_cloud_total)
-            _share = _partition.num_blocks_of(_pc.edge_id)
+            if _static_partition_enabled:
+                _share = _registry.resolve_kv_partition(
+                    _cloud_total).num_blocks_of(_pc.edge_id)
+            else:
+                # Coordination: the cloud owns the whole pool, so the edge
+                # sizes to the full cloud pool (see header comment above).
+                _share = _cloud_total
             # Set ONLY this edge's own entries (its workers come first in the
             # list) to its share — cloud entries in a rank0-edge broadcast
             # must keep the full pool.  Unconditional assignment (not just
@@ -2318,8 +2337,10 @@ def get_kv_cache_configs(
                         tensor.size = (
                             tensor.size // num_blocks_old * _share)
             logger.info(
-                "[edge-cloud] KV partition: edge_id=%d num_blocks=%d "
+                "[edge-cloud] KV %s: edge_id=%d num_blocks=%d "
                 "(cloud total %d)",
+                "partition" if _static_partition_enabled
+                else "shared-pool (coordination)",
                 _pc.edge_id, _share, _cloud_total,
             )
 

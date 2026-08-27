@@ -316,13 +316,14 @@ class EngineCore:
                 # Multi-instance (2E1C) edge.  The rank0 edge's config list
                 # also covers the cloud workers (world control plane), so it
                 # derives the scheduler config normally (full-model groups,
-                # num_blocks already shrunk to its share by the partition
-                # logic in get_kv_cache_configs) and publishes it.  A
+                # num_blocks already set by get_kv_cache_configs — its static
+                # share, or the full cloud pool when prefix-cache
+                # coordination is enabled) and publishes it.  A
                 # non-rank0 edge's instance-local sizing only sees its own
                 # empty spec — an attention-free placeholder WITHOUT the
                 # full-model groups its scheduler still needs — so it reuses
-                # the rank0 edge's published scheduler config with its OWN
-                # share substituted (same groups, same block_size).
+                # the rank0 edge's published scheduler config, substituting
+                # its OWN share in static-partition mode only.
                 import base64
                 import pickle
                 from datetime import timedelta as _td
@@ -371,16 +372,28 @@ class EngineCore:
                             _store.get("edge0_scheduler_kv_config")
                         )
                     )
-                    _share = _registry.kv_partition.num_blocks_of(
-                        _pc.edge_id
-                    )
-                    scheduler_kv_cache_config.num_blocks = _share
+                    # With prefix-cache coordination the cloud owns the
+                    # whole pool and the rank0 edge's published num_blocks
+                    # already IS the full cloud pool (no static share), so
+                    # keep it.  Only the legacy static-partition mode
+                    # substitutes this edge's own share.
+                    _ac = getattr(vllm_config, "additional_config", None) or {}
+                    _ec_cfg = (_ac.get("edge_cloud_config", {})
+                               if isinstance(_ac, dict) else {})
+                    _pcc = (_ec_cfg.get("prefix_cache_coordination", {})
+                            if isinstance(_ec_cfg, dict) else {})
+                    if not (isinstance(_pcc, dict)
+                            and _pcc.get("enabled", False)):
+                        _share = _registry.kv_partition.num_blocks_of(
+                            _pc.edge_id
+                        )
+                        scheduler_kv_cache_config.num_blocks = _share
                     logger.info(
                         "[edge-cloud] scheduler kv config from rank0 edge: "
                         "edge_id=%d groups=%d num_blocks=%d",
                         _pc.edge_id,
                         len(scheduler_kv_cache_config.kv_cache_groups),
-                        _share,
+                        scheduler_kv_cache_config.num_blocks,
                     )
             else:
                 max_group_idx = max(
