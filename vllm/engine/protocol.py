@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from abc import ABC, abstractmethod
-from collections.abc import AsyncGenerator, Iterable, Mapping
+from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -45,6 +45,33 @@ class EdgeCloudPrefixResult:
     instance_id: str
     block_size: int
     hit_tokens: int
+
+
+@dataclass(frozen=True)
+class EdgeCloudMediaItem:
+    """Media identity descriptor for edge-cloud prefix-cache negotiation.
+
+    It describes where a media item's placeholder sits in the processed
+    prompt and how to identify the media content, without carrying the
+    media data itself.
+    """
+
+    modality: str
+    """The modality of the media item, e.g. ``"image"``."""
+
+    digest: bytes
+    """The raw content digest of the media item (hex-decoded value).
+
+    Its length depends on the digest algorithm deployed (e.g. 32 bytes
+    for sha256, 64 bytes for sha512); the edge-cloud hash ABI normalizes
+    it to 32 bytes.
+    """
+
+    offset: int
+    """The start token index of the placeholder in the prompt."""
+
+    length: int
+    """The number of placeholder tokens in the prompt."""
 
 
 class EngineClient(ABC):
@@ -98,8 +125,18 @@ class EngineClient(ABC):
         request_id: str,
         prompt_token_ids: list[int],
         openai_request: Mapping[str, Any],
+        *,
+        media_items: Sequence[EdgeCloudMediaItem] = (),
     ) -> EdgeCloudPrefixResult | None:
         """Optionally reserve a common edge-cloud prefix before admission.
+
+        Args:
+            request_id: The unique id of the (sub-)request.
+            prompt_token_ids: The processed prompt token IDs, with
+                multi-modal placeholders already expanded.
+            openai_request: The original OpenAI request as a JSON mapping.
+            media_items: Media identity descriptors derived from the
+                processed multi-modal input. Empty for text-only requests.
 
         Platforms without an edge-cloud control plane return ``None`` and
         retain the normal vLLM scheduling behavior.

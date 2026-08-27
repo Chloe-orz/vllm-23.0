@@ -309,6 +309,12 @@ class EdgeCloudFinishedRequest:
     prompt_tokens: int
     completion_tokens: int
     full_block_hashes: tuple[bytes, ...]
+    publish_cache: bool = True
+    """Whether the cloud should publish this request's blocks into the
+    Prefix Cache. ``False`` means the edge asks the cloud to complete
+    resource release and accounting without publishing any of the
+    request's blocks, for fail-closed cases such as a media identity
+    that cannot be reconstructed."""
 
 
 @dataclass
