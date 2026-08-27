@@ -79,13 +79,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-_EDGE_CLOUD_MEDIA_DIGEST_MAX_SIZE: Final = 64
-"""Maximum size in bytes of an edge-cloud media content digest.
-
-Digests of any deployed digest algorithm up to this size (e.g. 32-byte
-sha256 or 64-byte sha512) are accepted; the edge-cloud hash ABI
-normalizes them to 32 bytes downstream.
-"""
+_EDGE_CLOUD_MEDIA_DIGEST_SIZE: Final = 32
+"""Required size in bytes of an edge-cloud media content digest."""
 
 
 def _extract_edge_cloud_media_items(
@@ -106,11 +101,10 @@ def _extract_edge_cloud_media_items(
         inputs.
 
     Raises:
-        ValueError: If a digest is not a hex string, is empty, or exceeds
-            ``_EDGE_CLOUD_MEDIA_DIGEST_MAX_SIZE`` bytes, a placeholder
-            range is invalid, or hashes and placeholders disagree. The
-            negotiation fails closed instead of silently degrading to a
-            text-only description.
+        ValueError: If a digest is not a hex-encoded 32-byte value, a
+            placeholder range is invalid, or hashes and placeholders
+            disagree. The negotiation fails closed instead of silently
+            degrading to a text-only description.
     """
     if engine_input["type"] != "multimodal":
         return ()
@@ -143,16 +137,11 @@ def _extract_edge_cloud_media_items(
                     f"Invalid media digest for {modality} item "
                     f"{item_index}: not a hex string"
                 ) from e
-            if not digest:
+            if len(digest) != _EDGE_CLOUD_MEDIA_DIGEST_SIZE:
                 raise ValueError(
                     f"Invalid media digest for {modality} item "
-                    f"{item_index}: empty digest"
-                )
-            if len(digest) > _EDGE_CLOUD_MEDIA_DIGEST_MAX_SIZE:
-                raise ValueError(
-                    f"Invalid media digest for {modality} item "
-                    f"{item_index}: expected at most "
-                    f"{_EDGE_CLOUD_MEDIA_DIGEST_MAX_SIZE} bytes, "
+                    f"{item_index}: expected "
+                    f"{_EDGE_CLOUD_MEDIA_DIGEST_SIZE} bytes, "
                     f"got {len(digest)}"
                 )
             offset = placeholder.offset

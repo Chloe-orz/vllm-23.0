@@ -88,49 +88,14 @@ def test_rejects_non_hex_digest():
         _extract_edge_cloud_media_items(engine_input, engine_input["prompt_token_ids"])
 
 
-def test_accepts_sha512_digest():
+@pytest.mark.parametrize("digest_size", [0, 16, 64])
+def test_rejects_media_digest_that_is_not_32_bytes(digest_size):
     engine_input = _make_mm_input(
         10,
-        {"image": ["ab" * 64]},
+        {"image": ["ab" * digest_size]},
         {"image": [PlaceholderRange(offset=0, length=4)]},
     )
-    items = _extract_edge_cloud_media_items(
-        engine_input, engine_input["prompt_token_ids"]
-    )
-    assert len(items) == 1
-    assert items[0].digest == bytes([0xAB] * 64)
-
-
-def test_accepts_short_digest():
-    engine_input = _make_mm_input(
-        10,
-        {"image": ["ab" * 16]},
-        {"image": [PlaceholderRange(offset=0, length=4)]},
-    )
-    items = _extract_edge_cloud_media_items(
-        engine_input, engine_input["prompt_token_ids"]
-    )
-    assert len(items) == 1
-    assert items[0].digest == bytes([0xAB] * 16)
-
-
-def test_rejects_empty_digest():
-    engine_input = _make_mm_input(
-        10,
-        {"image": [""]},
-        {"image": [PlaceholderRange(offset=0, length=4)]},
-    )
-    with pytest.raises(ValueError, match="empty digest"):
-        _extract_edge_cloud_media_items(engine_input, engine_input["prompt_token_ids"])
-
-
-def test_rejects_too_long_digest():
-    engine_input = _make_mm_input(
-        10,
-        {"image": ["ab" * 65]},
-        {"image": [PlaceholderRange(offset=0, length=4)]},
-    )
-    with pytest.raises(ValueError, match="expected at most 64 bytes"):
+    with pytest.raises(ValueError, match="expected 32 bytes"):
         _extract_edge_cloud_media_items(engine_input, engine_input["prompt_token_ids"])
 
 

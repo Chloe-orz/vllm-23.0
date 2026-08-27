@@ -62,9 +62,8 @@ class EdgeCloudMediaItem:
     digest: bytes
     """The raw content digest of the media item (hex-decoded value).
 
-    Its length depends on the digest algorithm deployed (e.g. 32 bytes
-    for sha256, 64 bytes for sha512); the edge-cloud hash ABI normalizes
-    it to 32 bytes.
+    The edge-cloud hash ABI requires a 32-byte digest. Deployments must
+    reject hash algorithms with a different digest size at startup.
     """
 
     offset: int
