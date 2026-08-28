@@ -644,6 +644,20 @@ class Scheduler(SchedulerInterface):
                             request.num_tokens - num_new_local_computed_tokens
                         )
                         connector_prefix_cache_hits = num_external_computed_tokens
+                    elif (
+                        getattr(self, "_edge_cloud_prefix_as_external", False)
+                        and request.edge_cloud_prefix_hit_tokens
+                    ):
+                        # Embedding-only edge-cloud mode: the edge owns no KV
+                        # at all, so the cloud-confirmed prefix hit counts as
+                        # externally computed tokens (KV lives on the cloud).
+                        # The edge only embeds and ships the suffix, and the
+                        # cloud resumes from its reservation.
+                        num_external_computed_tokens = max(
+                            0,
+                            request.edge_cloud_prefix_hit_tokens
+                            - num_new_local_computed_tokens,
+                        )
 
                     # Total computed tokens (local + external).
                     num_computed_tokens = (

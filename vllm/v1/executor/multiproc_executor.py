@@ -1246,7 +1246,7 @@ class WorkerProc:
                             logger.exception(
                                 "PP worker execute_model failed."
                             )
-                            if output_rank is None or self.rank == output_rank:
+                            if output_rank is None or self._matches_output_rank(output_rank):
                                 self.handle_output(e)
                             continue
                         # For layer slicing: non-last slices produce
@@ -1265,7 +1265,7 @@ class WorkerProc:
                         }
                         should_send_ack = (
                             (output_rank is None and self.local_rank == 0)
-                            or self.rank == output_rank
+                            or self._matches_output_rank(output_rank)
                         )
                         if should_send_ack:
                             response_mq = (
