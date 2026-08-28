@@ -6,6 +6,8 @@ import copy
 import hashlib
 import math
 import os
+
+import torch
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
