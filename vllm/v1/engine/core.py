@@ -372,22 +372,9 @@ class EngineCore:
                             _store.get("edge0_scheduler_kv_config")
                         )
                     )
-                    # With prefix-cache coordination the cloud owns the
-                    # whole pool and the rank0 edge's published num_blocks
-                    # already IS the full cloud pool (no static share), so
-                    # keep it.  Only the legacy static-partition mode
-                    # substitutes this edge's own share.
-                    _ac = getattr(vllm_config, "additional_config", None) or {}
-                    _ec_cfg = (_ac.get("edge_cloud_config", {})
-                               if isinstance(_ac, dict) else {})
-                    _pcc = (_ec_cfg.get("prefix_cache_coordination", {})
-                            if isinstance(_ec_cfg, dict) else {})
-                    if not (isinstance(_pcc, dict)
-                            and _pcc.get("enabled", False)):
-                        _share = _registry.kv_partition.num_blocks_of(
-                            _pc.edge_id
-                        )
-                        scheduler_kv_cache_config.num_blocks = _share
+                    # The cloud owns the whole pool (CloudKVRequestManager)
+                    # and the rank0 edge's published num_blocks already IS
+                    # the full cloud pool, so keep it as-is.
                     logger.info(
                         "[edge-cloud] scheduler kv config from rank0 edge: "
                         "edge_id=%d groups=%d num_blocks=%d",
