@@ -767,6 +767,12 @@ class MessageQueue:
         )
         if self.n_local_reader > 0:
             if total_bytes + len(all_buffers[0]) >= self.buffer.max_chunk_bytes:
+                logger.debug(
+                    "[MQ-OVERFLOW] payload %d bytes >= max_chunk_bytes %d; "
+                    "going through the XPUB/SUB sideband",
+                    total_bytes + len(all_buffers[0]),
+                    self.buffer.max_chunk_bytes,
+                )
                 with self.acquire_write(timeout) as buf:
                     buf[0] = 1  # overflow
                 self.local_socket.send_multipart(all_buffers, copy=False)
@@ -811,7 +817,26 @@ class MessageQueue:
                         all_buffers.append(buf[buf_offset:offset])
                     obj = pickle.loads(all_buffers[0], buffers=all_buffers[1:])
             if overflow:
-                obj = MessageQueue.recv(self.local_socket, timeout)
+                # The shm slot has already been consumed by this reader at
+                # this point (read flag set, current_idx advanced in
+                # acquire_read), so the sideband recv MUST NOT use the
+                # caller's poll timeout: a timeout here loses the message
+                # for THIS reader only (other readers get it), silently
+                # desynchronizing TP groups.  Block until the payload
+                # arrives -- the writer publishes it immediately after the
+                # overflow marker, so this can only hang if the writer is
+                # dead, in which case the worker is doomed anyway.
+                try:
+                    obj = MessageQueue.recv(self.local_socket, None)
+                except Exception:
+                    logger.exception(
+                        "[MQ-OVERFLOW-LOST] local reader_rank=%d failed to "
+                        "recv overflow payload for slot=%d; the message is "
+                        "LOST for this reader only",
+                        self.local_reader_rank,
+                        (self.current_idx - 1) % self.buffer.max_chunks,
+                    )
+                    raise
         elif self._is_remote_reader:
             obj = MessageQueue.recv(self.remote_socket, timeout)
         else:
