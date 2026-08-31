@@ -94,6 +94,13 @@ logger = init_logger(__name__)
 #
 # The function `init_none_hash` initializes this variable globally.
 NONE_HASH: BlockHash
+
+# Logical pool size for embedding-only edges (2E1C): the edge owns no KV,
+# so this pool is pure block accounting — deliberately far larger than any
+# real cloud pool so the edge scheduler is never the bottleneck (real
+# admission control is the sender-side concurrency limit plus the cloud's
+# own allocation).
+EDGE_CLOUD_LOGICAL_NUM_BLOCKS = 1_000_000
 _CBOR_HASH_FUNCTIONS = frozenset({sha256_cbor, xxhash_cbor})
 
 
@@ -2185,9 +2192,14 @@ def get_kv_cache_configs(
         available_memory = adjusted_memory
 
     if vllm_config.model_config.original_max_model_len == -1:
-        _auto_fit_max_model_len(
-            vllm_config, projected_groups_per_worker, available_memory
-        )
+        # Multi-instance edge-cloud (2E1C): auto-fit would run independently
+        # on each instance and could diverge (different available memory),
+        # breaking edge/cloud max_model_len agreement.  Keep the configured
+        # (or model-derived, identical everywhere) value instead.
+        if not getattr(vllm_config.parallel_config, "role_registry", None):
+            _auto_fit_max_model_len(
+                vllm_config, projected_groups_per_worker, available_memory
+            )
 
     # Check if the available memory is enough per worker.
     for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
@@ -2247,83 +2259,38 @@ def get_kv_cache_configs(
         if len(kv_cache_config.kv_cache_groups) > 0:
             _report_kv_cache_config(vllm_config, kv_cache_config)
 
-    # Multi-instance edge-cloud (2E1C): prefix-cache coordination owns the
-    # whole cloud pool (CloudKVRequestManager, replacing edge-sent block
-    # tables with cloud-owned allocations), so each edge sizes to the FULL
-    # cloud pool — edge-sent block ids are discarded at cloud ingress, and
-    # matching the cloud's capacity keeps the edge scheduler from
-    # over-subscribing it.
+    # Multi-instance edge-cloud (2E1C): edge and cloud KV pools are sized
+    # INDEPENDENTLY.  The cloud manages its own pool (CloudKVRequestManager)
+    # and edge-sent block tables are discarded at cloud ingress, so the
+    # edge's pool size never needs to track the cloud's.  A head/tail edge
+    # sizes purely from its own workers' memory (the unified local value
+    # above, untouched).  An embedding-only edge owns no KV at all: its
+    # attention-free placeholder (num_blocks=1) is bumped to a large
+    # logical pool used purely for edge-side block accounting — real
+    # admission control is the sender-side concurrency limit plus the
+    # cloud's own allocation.
     _pc = vllm_config.parallel_config
     if getattr(_pc, "role_registry", None) and getattr(
-            _pc, "cloud_id", None) is not None:
-        # Cloud: publish its real num_blocks as a fallback channel.  In the
-        # current topology the cloud runs a passive engine (no KV sizing
-        # path), so this branch normally never runs — the rank0 edge's
-        # sizing publishes the same value instead (edge branch below).
-        import torch.distributed as _dist
-        from datetime import timedelta as _td
-        from vllm_ascend.edge_cloud.role_registry import get_role_registry
-        _registry = get_role_registry()
-        if _registry is not None:
-            _w = _registry.world
-            _store = _dist.TCPStore(
-                host_name=_w.master_addr, port=_w.master_port,
-                is_master=False, timeout=_td(seconds=300))
-            _store.set(f"cloud_{_pc.cloud_id}_num_blocks",
-                       str(min_num_blocks))
-            logger.info(
-                "[edge-cloud] published num_blocks=%d for cloud %d",
-                min_num_blocks, _pc.cloud_id)
-
-    if getattr(_pc, "role_registry", None) and getattr(
             _pc, "edge_id", None) is not None:
-        # Edge: resolve the ratio-based partition against the cloud's REAL
-        # pool size.  The rank0 edge's config list also covers the cloud
-        # workers (1-1-style world control plane), so the post-clamp
-        # min_num_blocks IS the cloud's real num_blocks (em edges report a
-        # virtual 1TiB so the clamp always takes the cloud's value) — it
-        # resolves locally and publishes for the other edges.  A non-rank0
-        # edge's list is instance-local (its own placeholder entry only), so
-        # it reads the published total from the world store.
-        import torch.distributed as _dist
-        from datetime import timedelta as _td
-        from vllm_ascend.edge_cloud.role_registry import get_role_registry
-        _registry = get_role_registry()
-        if _registry is not None:
-            _w = _registry.world
-            _store = _dist.TCPStore(
-                host_name=_w.master_addr, port=_w.master_port,
-                is_master=False, timeout=_td(seconds=300))
-            if len(kv_cache_configs) > _pc.local_world_size:
-                _cloud_total = min_num_blocks
-                _store.set("cloud_0_num_blocks", str(_cloud_total))
-                logger.info(
-                    "[edge-cloud] published num_blocks=%d for cloud 0 "
-                    "(from rank0 edge sizing)", _cloud_total)
-            else:
-                _cloud_total = int(_store.get("cloud_0_num_blocks"))
-            # The cloud owns the whole pool, so the edge sizes to the full
-            # cloud pool (see header comment above).
-            _share = _cloud_total
-            # Set ONLY this edge's own entries (its workers come first in the
-            # list) to its share — cloud entries in a rank0-edge broadcast
-            # must keep the full pool.  Unconditional assignment (not just
-            # shrinking): a non-rank0 edge's instance-local sizing only sees
-            # its own empty spec, yielding the attention-free placeholder
-            # (num_blocks=1) which must be GROWN to the share; its empty
-            # tensor list makes the proportional scaling a no-op there.
+        _has_local_kv = any(spec for spec in kv_cache_specs)
+        if not _has_local_kv:
             for kv_cache_config in kv_cache_configs[:_pc.local_world_size]:
-                if kv_cache_config.num_blocks != _share:
+                if (
+                    kv_cache_config.num_blocks
+                    != EDGE_CLOUD_LOGICAL_NUM_BLOCKS
+                ):
                     num_blocks_old = kv_cache_config.num_blocks
-                    kv_cache_config.num_blocks = _share
+                    kv_cache_config.num_blocks = EDGE_CLOUD_LOGICAL_NUM_BLOCKS
                     for tensor in kv_cache_config.kv_cache_tensors:
                         assert tensor.size % num_blocks_old == 0
                         tensor.size = (
-                            tensor.size // num_blocks_old * _share)
+                            tensor.size // num_blocks_old
+                            * EDGE_CLOUD_LOGICAL_NUM_BLOCKS
+                        )
             logger.info(
-                "[edge-cloud] KV shared-pool (coordination): edge_id=%d "
-                "num_blocks=%d (cloud total %d)",
-                _pc.edge_id, _share, _cloud_total,
+                "[edge-cloud] KV independent pools: edge_id=%d "
+                "logical num_blocks=%d (embedding-only, no local KV)",
+                _pc.edge_id, EDGE_CLOUD_LOGICAL_NUM_BLOCKS,
             )
 
     return kv_cache_configs

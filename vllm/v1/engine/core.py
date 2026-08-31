@@ -313,71 +313,94 @@ class EngineCore:
             _pc = vllm_config.parallel_config
             if (getattr(_pc, "role_registry", None)
                     and getattr(_pc, "edge_id", None) is not None):
-                # Multi-instance (2E1C) edge.  The rank0 edge's config list
-                # also covers the cloud workers (world control plane), so it
-                # derives the scheduler config normally (full-model groups,
-                # num_blocks already set by get_kv_cache_configs — its static
-                # share, or the full cloud pool when prefix-cache
-                # coordination is enabled) and publishes it.  A
-                # non-rank0 edge's instance-local sizing only sees its own
-                # empty spec — an attention-free placeholder WITHOUT the
-                # full-model groups its scheduler still needs — so it reuses
-                # the rank0 edge's published scheduler config, substituting
-                # its OWN share in static-partition mode only.
-                import base64
-                import pickle
-                from datetime import timedelta as _td
-
-                import torch.distributed as _dist
-
-                from vllm_ascend.edge_cloud.role_registry import (
-                    get_role_registry,
+                # Multi-instance (2E1C) edge with INDEPENDENT KV pools.
+                # A head/tail edge manages real edge-local KV and derives
+                # its scheduler config from its own workers.  An
+                # embedding-only edge owns no KV: it only needs the
+                # full-model group LAYOUT (model structure, not capacity)
+                # plus a large logical pool for edge-side block accounting —
+                # real admission control is the sender-side concurrency
+                # limit plus the cloud's own allocation, so the pool size
+                # here is deliberately decoupled from the cloud's.
+                from vllm.v1.core.kv_cache_utils import (
+                    EDGE_CLOUD_LOGICAL_NUM_BLOCKS,
                 )
-                _registry = get_role_registry()
-                assert _registry is not None
-                _store = _dist.TCPStore(
-                    host_name=_registry.world.master_addr,
-                    port=_registry.world.master_port,
-                    is_master=False,
-                    timeout=_td(seconds=300),
-                )
-                if len(kv_cache_configs) > _pc.local_world_size:
-                    # Rank0 edge.
-                    max_group_idx = max(
-                        range(len(kv_cache_configs)),
-                        key=lambda i: len(kv_cache_configs[i].kv_cache_groups),
-                    )
+                if has_kv_cache:
                     scheduler_kv_cache_config = (
                         generate_scheduler_kv_cache_config(
-                            [kv_cache_configs[max_group_idx]]
+                            kv_cache_configs[:_pc.local_world_size]
                         )
                     )
-                    _store.set(
-                        "edge0_scheduler_kv_config",
-                        base64.b64encode(
-                            pickle.dumps(scheduler_kv_cache_config)
-                        ).decode(),
-                    )
                     logger.info(
-                        "[edge-cloud] published scheduler kv config "
-                        "(groups=%d num_blocks=%d) for non-rank0 edges",
+                        "[edge-cloud] scheduler kv config (local): "
+                        "edge_id=%d groups=%d num_blocks=%d",
+                        _pc.edge_id,
                         len(scheduler_kv_cache_config.kv_cache_groups),
                         scheduler_kv_cache_config.num_blocks,
                     )
                 else:
-                    # Non-rank0 edge: blocks until the rank0 edge publishes
-                    # (its sizing never depends on this edge — no cycle).
-                    scheduler_kv_cache_config = pickle.loads(
-                        base64.b64decode(
-                            _store.get("edge0_scheduler_kv_config")
-                        )
+                    import base64
+                    import pickle
+                    from datetime import timedelta as _td
+
+                    import torch.distributed as _dist
+
+                    from vllm_ascend.edge_cloud.role_registry import (
+                        get_role_registry,
                     )
-                    # The cloud owns the whole pool (CloudKVRequestManager)
-                    # and the rank0 edge's published num_blocks already IS
-                    # the full cloud pool, so keep it as-is.
+                    _registry = get_role_registry()
+                    assert _registry is not None
+                    _store = _dist.TCPStore(
+                        host_name=_registry.world.master_addr,
+                        port=_registry.world.master_port,
+                        is_master=False,
+                        timeout=_td(seconds=300),
+                    )
+                    if len(kv_cache_configs) > _pc.local_world_size:
+                        # Rank0 edge: its config list also covers the cloud
+                        # workers (world control plane), so it takes the
+                        # full-model group layout and publishes it for
+                        # non-rank0 embedding-only edges (layout only —
+                        # capacity is overridden below).
+                        max_group_idx = max(
+                            range(len(kv_cache_configs)),
+                            key=lambda i: len(
+                                kv_cache_configs[i].kv_cache_groups),
+                        )
+                        scheduler_kv_cache_config = (
+                            generate_scheduler_kv_cache_config(
+                                [kv_cache_configs[max_group_idx]]
+                            )
+                        )
+                        scheduler_kv_cache_config.num_blocks = (
+                            EDGE_CLOUD_LOGICAL_NUM_BLOCKS
+                        )
+                        _store.set(
+                            "edge0_scheduler_kv_config",
+                            base64.b64encode(
+                                pickle.dumps(scheduler_kv_cache_config)
+                            ).decode(),
+                        )
+                        logger.info(
+                            "[edge-cloud] published scheduler kv layout "
+                            "(groups=%d) for non-rank0 edges",
+                            len(scheduler_kv_cache_config.kv_cache_groups),
+                        )
+                    else:
+                        # Non-rank0 edge: blocks until the rank0 edge
+                        # publishes the group layout (its sizing never
+                        # depends on this edge — no cycle).
+                        scheduler_kv_cache_config = pickle.loads(
+                            base64.b64decode(
+                                _store.get("edge0_scheduler_kv_config")
+                            )
+                        )
+                        scheduler_kv_cache_config.num_blocks = (
+                            EDGE_CLOUD_LOGICAL_NUM_BLOCKS
+                        )
                     logger.info(
-                        "[edge-cloud] scheduler kv config from rank0 edge: "
-                        "edge_id=%d groups=%d num_blocks=%d",
+                        "[edge-cloud] scheduler kv config (embedding-only): "
+                        "edge_id=%d groups=%d logical num_blocks=%d",
                         _pc.edge_id,
                         len(scheduler_kv_cache_config.kv_cache_groups),
                         scheduler_kv_cache_config.num_blocks,
