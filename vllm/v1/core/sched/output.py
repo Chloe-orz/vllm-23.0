@@ -316,6 +316,10 @@ class EdgeCloudFinishedRequest:
     request's blocks, for fail-closed cases such as a media identity
     that cannot be reconstructed."""
 
+    epoch: int | None = None
+    """Incarnation epoch of the request (void-run drain protocol).  None
+    for legacy / non-edge-cloud traffic."""
+
 
 @dataclass
 class SchedulerOutput:
@@ -432,6 +436,10 @@ class SchedulerOutput:
     # Populated only by an edge-cloud scheduler. It lets the cloud finalize
     # usage and hash output-bearing blocks without receiving raw token IDs.
     edge_cloud_finished_requests: dict[str, EdgeCloudFinishedRequest] | None = None
+
+    edge_cloud_epoch_by_req: dict[str, int] | None = None
+    """Per-request incarnation epoch for the void-run drain protocol.
+    Optional; None for legacy / non-edge-cloud traffic."""
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
