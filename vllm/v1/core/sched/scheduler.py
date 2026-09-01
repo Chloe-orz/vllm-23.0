@@ -60,6 +60,7 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+PD_TRACE_PREFIX = "[PD-TRACE]"
 
 
 class Scheduler(SchedulerInterface):
@@ -812,6 +813,21 @@ class Scheduler(SchedulerInterface):
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+                    logger.info(
+                        "%s internal_request_id=%s stage=d_scheduler "
+                        "event=waiting_for_remote_kv external_tokens=%d "
+                        "computed_tokens=%d allocated_block_counts=%s",
+                        PD_TRACE_PREFIX,
+                        request.request_id,
+                        num_external_computed_tokens,
+                        num_computed_tokens,
+                        [
+                            len(group)
+                            for group in self.kv_cache_manager.get_block_ids(
+                                request.request_id
+                            )
+                        ],
+                    )
                     step_skipped_waiting.prepend_request(request)
                     # Set num_computed_tokens even though KVs are not yet loaded.
                     # request.num_computed_tokens will not be used anywhere until
@@ -2210,7 +2226,8 @@ class Scheduler(SchedulerInterface):
         """
         assert self.connector is not None
 
-        if request.request_id in self.failed_recving_kv_req_ids:
+        load_failed = request.request_id in self.failed_recving_kv_req_ids
+        if load_failed:
             # Request had KV load failures; num_computed_tokens was already
             # updated in _update_requests_with_invalid_blocks
             if request.num_computed_tokens:
@@ -2233,6 +2250,15 @@ class Scheduler(SchedulerInterface):
                 request.num_computed_tokens = request.num_tokens - 1
 
         self.finished_recving_kv_req_ids.remove(request.request_id)
+        logger.info(
+            "%s internal_request_id=%s stage=d_scheduler event=remote_kv_ready "
+            "success=%s computed_tokens=%d prompt_tokens=%d",
+            PD_TRACE_PREFIX,
+            request.request_id,
+            not load_failed,
+            request.num_computed_tokens,
+            request.num_prompt_tokens,
+        )
 
     def _try_promote_blocked_waiting_request(self, request: Request) -> bool:
         """
@@ -2283,7 +2309,12 @@ class Scheduler(SchedulerInterface):
 
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():
-            logger.debug("Finished recving KV transfer for request %s", req_id)
+            logger.info(
+                "%s internal_request_id=%s stage=d_scheduler "
+                "event=remote_kv_signal_received",
+                PD_TRACE_PREFIX,
+                req_id,
+            )
             assert req_id in self.requests
             req = self.requests[req_id]
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:

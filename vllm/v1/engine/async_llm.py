@@ -53,6 +53,7 @@ from vllm.v1.metrics.prometheus import shutdown_prometheus
 from vllm.v1.metrics.stats import IterationStats
 
 logger = init_logger(__name__)
+PD_TRACE_PREFIX = "[PD-TRACE]"
 
 
 class InputStreamError(Exception):
@@ -366,6 +367,37 @@ class AsyncLLM(EngineClient):
             request.reasoning_parser_kwargs = reasoning_parser_kwargs
 
         self.input_processor.assign_request_id(request)
+        if (
+            request.sampling_params is not None
+            and request.sampling_params.extra_args is not None
+            and (
+                kv_transfer_params := request.sampling_params.extra_args.get(
+                    "kv_transfer_params"
+                )
+            )
+        ):
+            pd_role = (
+                "D"
+                if kv_transfer_params.get("do_remote_prefill")
+                else "P"
+                if kv_transfer_params.get("do_remote_decode")
+                else "unknown"
+            )
+            logger.info(
+                "%s request_id=%s internal_request_id=%s stage=engine "
+                "event=pd_request_admitted role=%s do_remote_prefill=%s "
+                "do_remote_decode=%s remote_engine_id=%s remote_host=%s "
+                "remote_port=%s",
+                PD_TRACE_PREFIX,
+                request.external_req_id,
+                request.request_id,
+                pd_role,
+                kv_transfer_params.get("do_remote_prefill"),
+                kv_transfer_params.get("do_remote_decode"),
+                kv_transfer_params.get("remote_engine_id"),
+                kv_transfer_params.get("remote_host"),
+                kv_transfer_params.get("remote_port"),
+            )
 
         # We start the output_handler on the first call to add_request() so
         # we can call __init__ before the event loop, which enables us
