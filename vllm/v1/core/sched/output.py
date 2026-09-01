@@ -441,6 +441,15 @@ class SchedulerOutput:
     """Per-request incarnation epoch for the void-run drain protocol.
     Optional; None for legacy / non-edge-cloud traffic."""
 
+    cloud_void_req_ids: list[str] | None = None
+    """Request ids the cloud rewrite projected onto the void-run pool for
+    this batch (defined-removal members: preempted / finished / aborted).
+    Set only by the cloud-side KV rewrite; consumed by the cloud worker to
+    (a) skip speculative-correction accounting, (b) pad their KV slots, and
+    (c) short-circuit fully-void batches into a zero-payload comm shell.
+    Their outputs are discarded by epoch rules on the edge."""
+
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(
