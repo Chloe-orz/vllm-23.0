@@ -832,11 +832,12 @@ class ParallelConfig:
                     "edge_npu_count and cloud_npu_count must be positive "
                     "when enable_edge_cloud is True."
                 )
-            if self.edge_npu_count >= self.cloud_npu_count:
+            if self.edge_npu_count > self.cloud_npu_count:
                 raise ValueError(
-                    f"edge_npu_count ({self.edge_npu_count}) must be less than "
+                    f"edge_npu_count ({self.edge_npu_count}) must not exceed "
                     f"cloud_npu_count ({self.cloud_npu_count}) for edge-cloud "
-                    "collaboration."
+                    "collaboration. Equal-sized edge/cloud stages are a "
+                    "supported topology."
                 )
             if self.pipeline_parallel_size != 1 or self.tensor_parallel_size != 1:
                 raise ValueError(
