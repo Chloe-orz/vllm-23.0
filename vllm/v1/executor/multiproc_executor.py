@@ -426,10 +426,34 @@ class MultiprocExecutor(Executor):
         deadline = None if timeout is None else time.monotonic() + timeout
         kwargs = kwargs or {}
 
+        local_worker_ranks: tuple[int, ...] | None = None
+        local_response_mqs: tuple[MessageQueue, ...] | None = None
+        if local_only:
+            # Remote workers do not receive a local-only RPC, so they cannot
+            # produce responses. This matters when KV aggregation clears
+            # output_rank below and would otherwise wait on every global MQ.
+            local_worker_ranks = tuple(worker.rank for worker in self.workers)
+            worker_response_mqs = []
+            for worker in self.workers:
+                response_mq = worker.worker_response_mq
+                assert response_mq is not None
+                worker_response_mqs.append(response_mq)
+            local_response_mqs = tuple(worker_response_mqs)
+
         if kv_output_aggregator is not None:
             output_rank = None
+            aggregate_output_rank = unique_reply_rank or 0
+            if local_worker_ranks is not None:
+                if aggregate_output_rank not in local_worker_ranks:
+                    raise ValueError(
+                        f"Output rank {aggregate_output_rank} is not a local "
+                        f"worker rank: {local_worker_ranks}"
+                    )
+                aggregate_output_rank = local_worker_ranks.index(
+                    aggregate_output_rank
+                )
             aggregate: Callable[[Any], Any] = partial(
-                kv_output_aggregator.aggregate, output_rank=unique_reply_rank or 0
+                kv_output_aggregator.aggregate, output_rank=aggregate_output_rank
             )
         else:
             output_rank = unique_reply_rank
@@ -462,7 +486,19 @@ class MultiprocExecutor(Executor):
         # )
 
         response_mqs: Sequence[MessageQueue] = self.response_mqs
-        if output_rank is not None:
+        if local_response_mqs is not None:
+            response_mqs = local_response_mqs
+            if output_rank is not None:
+                assert local_worker_ranks is not None
+                if output_rank not in local_worker_ranks:
+                    raise ValueError(
+                        f"Output rank {output_rank} is not a local worker "
+                        f"rank: {local_worker_ranks}"
+                    )
+                response_mqs = (
+                    response_mqs[local_worker_ranks.index(output_rank)],
+                )
+        elif output_rank is not None:
             response_mqs = (response_mqs[output_rank],)
 
         def get_response():
