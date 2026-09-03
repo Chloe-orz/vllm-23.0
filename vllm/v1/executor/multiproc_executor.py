@@ -1223,6 +1223,19 @@ class WorkerProc:
         """Main busy loop for Multiprocessing Workers"""
         assert self.rpc_broadcast_mq is not None
         while True:
+            # Edge-cloud multi-edge: retry deferred batches whose payload
+            # has arrived since.  All TP workers call this every iteration;
+            # the retry decision itself is TP-broadcast inside, keeping the
+            # workers in lockstep.
+            _ec_retry = getattr(self.worker, "ec_retry_deferred", None)
+            if _ec_retry is not None:
+                _ack = _ec_retry()
+                if _ack is not None and self.local_rank == 0:
+                    _rmq = (self.local_worker_response_mq
+                            if self.local_worker_response_mq is not None
+                            else self.worker_response_mq)
+                    if _rmq is not None:
+                        _rmq.enqueue((WorkerProc.ResponseStatus.SUCCESS, _ack))
             # Poll local MQ for pp scheduler output from passive
             # EngineCore (non-blocking).
             if self.local_rpc_broadcast_mq is not None:
@@ -1248,6 +1261,11 @@ class WorkerProc:
                             )
                             if output_rank is None or self._matches_output_rank(output_rank):
                                 self.handle_output(e)
+                            continue
+                        # Edge-cloud multi-edge: the batch was deferred
+                        # (payload not ready); skip the ack — it is reported
+                        # when ec_retry_deferred() actually executes it.
+                        if getattr(output, "__ec_deferred__", False):
                             continue
                         # For layer slicing: non-last slices produce
                         # no external output; keep polling local MQ for
