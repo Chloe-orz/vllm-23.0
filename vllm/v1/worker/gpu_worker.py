@@ -100,8 +100,35 @@ class AsyncIntermediateTensors(IntermediateTensors):
         if self._comm_waited:
             return
         if self._comm_handles:
-            for handle in self._comm_handles:
-                handle.wait()
+            # Edge-cloud diagnostics: a stalled P2P rendezvous blocks here.
+            # If the wait exceeds 30s, dump each handle's is_completed() so
+            # the hang can be attributed (op never launched vs payload lost
+            # in transport).  The wait itself is unchanged.
+            import threading
+
+            from vllm.logger import logger
+            _cancel = threading.Event()
+
+            def _watch() -> None:
+                while not _cancel.wait(30.0):
+                    states = []
+                    for h in self._comm_handles:
+                        try:
+                            states.append(h.is_completed())
+                        except Exception:
+                            states.append(None)
+                    logger.error(
+                        "[EC-COMM-STALL] wait_for_comm blocked; handle "
+                        "is_completed=%s", states)
+
+            _watcher = threading.Thread(
+                target=_watch, daemon=True, name="ec-comm-watchdog")
+            _watcher.start()
+            try:
+                for handle in self._comm_handles:
+                    handle.wait()
+            finally:
+                _cancel.set()
         if self._comm_postprocess:
             for fn in self._comm_postprocess:
                 fn()
