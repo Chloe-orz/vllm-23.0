@@ -831,7 +831,12 @@ class WorkerProc:
         # posts irecv, and waits it to completion while busy_loop is blocked on
         # the previous P-middle.  CHER does not gate scheduling (no ack), so the
         # guard only posts + waits.
-        if getattr(self, "cloud_recv_hint_mq", None) is not None:
+        if (getattr(self, "cloud_recv_hint_mq", None) is not None
+                # VLLM_ASCEND_EC_CHER=0 disables the whole CHER pipeline;
+                # starting the guard without the busy_loop consume path
+                # would post orphan irecvs that eat payloads meant for the
+                # synchronous fallback recv.
+                and os.environ.get("VLLM_ASCEND_EC_CHER", "1") != "0"):
             self._start_early_recv_guard()
 
         # Enable environment variable cache (e.g. assume no more
