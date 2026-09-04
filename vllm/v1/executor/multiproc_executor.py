@@ -1238,6 +1238,14 @@ class WorkerProc:
                     if isinstance(method, bytes) and method == b"pp_scheduler_output":
                         scheduler_output = args[0]
                         slice_info = args[1] if len(args) > 1 else None
+                        # Stage log (multi-edge hang triage): the pipeline
+                        # after CLOUD-ENQUEUE is dequeue → exec_begin → recv
+                        # → exec_model_done → reply send → reap → ack.
+                        logger.info(
+                            "[PD] cloud_worker_dequeue: bt=%s ht=%s",
+                            scheduler_output.batch_type,
+                            getattr(scheduler_output, "head_token", None),
+                        )
                         # Execute model with the received SchedulerOutput.
                         try:
                             func = self.worker.execute_model
@@ -1282,7 +1290,12 @@ class WorkerProc:
                                 response_mq.enqueue(
                                     (WorkerProc.ResponseStatus.SUCCESS, ack)
                                 )
-                        continue
+                                logger.info(
+                                    "[PD] cloud_worker_ack: bt=%s ht=%s",
+                                    ack.get("batch_type"),
+                                    ack.get("head_token"),
+                                )
+                            continue
                     self._execute_local_rpc(method, args, kwargs, output_rank)
                     # Fall through to the cross-node queue after handling one
                     # local control RPC. Cloud-side KV config polling is
