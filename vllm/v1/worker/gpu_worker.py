@@ -129,6 +129,12 @@ class AsyncIntermediateTensors(IntermediateTensors):
                     handle.wait()
             finally:
                 _cancel.set()
+            # Edge-cloud diagnostics: pair with the post log
+            # (edge_cloud_irecv*) via the stashed ht tag — every actual recv
+            # completion closes the loop.
+            _tag = getattr(self, "_ec_comm_tag", None)
+            if _tag is not None:
+                logger.info("[PD] edge_cloud_irecv_done: tag=%s", _tag)
         if self._comm_postprocess:
             for fn in self._comm_postprocess:
                 fn()
