@@ -532,3 +532,23 @@ class LwdCloudSchedulerView(Protocol):   # 只读快照,3 方法
 - `LwdEnginePort` 增补 `lwd_drain_embed_acks()`(边侧回执取回)。
 - 端口-适配器模式保留于:LwdEnginePort/LwdEnginePortAdapter 与调度器视图;
   前端 executor 侧不再有 Lwd 适配层。
+
+### 9.12 范围裁剪:只保留控制面(2026-09-07 迭代修订)
+
+- **删除数据面文件**:`lwd_edge_embed.py`(嵌入前向 + isend)与
+  `lwd_cloud_embeds.py`(按需 recv/段仓/retain/消费释放/fill 视图)整体移出;
+  数据面另行落位,经既有接缝对接:
+  - 边侧:`LwdEdgeScheduler.lwd_edge_update_progress`(执行量来源);
+  - 云侧:`LwdCloudCore._lwd_handle_embed_notify`(接收登记)与
+    `_lwd_cloud_admit_request`(请求侧挂载点)。
+- **删除 dispatcher**:`LwdEdgeDispatcher` 职责完全并入
+  `LwdEdgeScheduler`(notify 发布 / abort / seqno 单调分配),
+  publisher 经装配期 partial 注入调度器;边侧控制面出口唯一化。
+- 连带清理:`LwdEdgeEmbedAck`/`LwdEnginePort.lwd_drain_embed_acks`、
+  `LwdConfig.debug_wire`、`LwdLog.wire`、`LWD_WIRE_TAG_BASE`、
+  云侧 core 的 retain/消费释放私有段(embeds 仓依赖);
+  `tools/lwd_check_budget.py` 的 torch.distributed 文件数检查移除
+  (本目录零数据面,该检查移交数据面落位侧)。
+- 目录现状:16 个文件,全部为控制面(调度器×2 + 准入策略 + step 载体×2 +
+  通道×2 + 消息 + 装配×2 + 支撑×4 + 台账)。
+- v3 架构图含 worker/embedstore 节点,属数据面时代快照,经确认后刷新。

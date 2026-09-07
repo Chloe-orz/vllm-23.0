@@ -7,19 +7,16 @@ from dataclasses import dataclass
 # 控制面 ZMQ 端口(单向边->云;env 可覆盖,§3/§9)
 LWD_PRE_OUT_PORT = 5558
 
-LWD_DEBUG_WIRE_ENV = "VLLM_LWD_DEBUG_WIRE"
-
 
 @dataclass(frozen=True)
 class LwdConfig:
     """装配期一次成型,内核各模块只收 plain 值(零 env/零 getattr)。
 
     分块大小不自造(§9.9):沿用上游 scheduler_config 的 chunked prefill
-    配置(max_num_batched_tokens);本配置只保留通道与调试开关。
+    配置;本目录仅控制面(§9.12),只剩通道端点一项。
     """
 
     pre_out_endpoint: str
-    debug_wire: bool
 
     @classmethod
     def from_env_and_config(cls, vllm_config) -> LwdConfig:

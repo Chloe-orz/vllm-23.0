@@ -1,12 +1,11 @@
-"""Lwd 线上消息:仅依赖 msgspec,不携带 tensor(§2.7/§9.9)。
+"""Lwd 线上消息:仅依赖 msgspec,不携带 tensor(§2.7/§9,控制面专用,§9.12)。
 
-分块决策复用上游 Scheduler.schedule() 的原生 chunked prefill;
-本模块只承载通知与回执,seqno 由边侧分配、随 notify 先于数据发出。
+数据面不在本目录范围(§9.12):notify 只承载调度决策预告,
+实际张量传输与落位由数据面另行对接。
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import msgspec
@@ -16,17 +15,13 @@ if TYPE_CHECKING:
     # (白名单,§7.2)
     from vllm.v1.engine import EngineCoreOutputs  # noqa: F401
 
-# torch.distributed 直传 tag 基数:tag = LWD_WIRE_TAG_BASE + seqno(§8.3,
-# tag 匹配天然乱序安全;seqno 由 dispatcher 分配,worker/云侧按 notify 对齐)
-LWD_WIRE_TAG_BASE = 10_000
-
 
 class LwdEmbedNotify(msgspec.Struct, gc=False):
-    """边->云嵌入预告(PRE_OUT);发布先于数据面 isend。
+    """边->云嵌入预告(PRE_OUT);发布先于任何数据面动作。
 
     offset/num_tokens 直接取自原生 SchedulerOutput 的调度决策
-    (chunked prefill 的 num_computed/num_scheduled);云侧据此预登记
-    recv 范围并推导张量形状。
+    (chunked prefill 的 num_computed/num_scheduled);云侧登记
+    seqno->request 映射,数据面落位后由此对接接收。
     """
 
     request_id: str
@@ -36,14 +31,6 @@ class LwdEmbedNotify(msgspec.Struct, gc=False):
 
 
 class LwdAbortSignal(msgspec.Struct, gc=False):
-    """边->云 abort(PRE_OUT);云侧丢弃已收/在途 embeds 并清理请求。"""
+    """边->云 abort(PRE_OUT);云侧清理请求登记。"""
 
     request_id: str
-
-
-@dataclass
-class LwdEdgeEmbedAck:
-    """worker->dispatcher 完成回执(边进程内,调度器进度更新的依据)。"""
-
-    request_id: str
-    num_tokens: int

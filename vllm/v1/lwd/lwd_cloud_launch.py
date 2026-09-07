@@ -29,10 +29,9 @@ class LwdCloudSchedulerViewAdapter:
 def _lwd_cloud_admit_request(
     port: LwdEnginePort, request, config: LwdConfig
 ) -> None:
-    """唯一准入交互点:Request 构建/block_hasher/远程 embed 视图挂载全收于此(§7.3-C1)。
+    """唯一准入交互点:Request 构建/block_hasher 全收于此(§7.3-C1)。
 
-    挂载的 prompt_embeds 即 LwdCloudRemoteEmbeds 惰性视图(对齐上游
-    fill 访问面),上游填充循环零改动(§9.5)。
+    数据面挂载(prompt_embeds 视图)由数据面落位侧在此对接(§9.12)。
     """
     ...
 

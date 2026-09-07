@@ -1,7 +1,8 @@
-"""云侧执行类:唯一接口 step_with_batch_queue,由 core.py 守卫委托(§9.8/§9.9)。
+"""云侧执行类:唯一接口 step_with_batch_queue,由 core.py 守卫委托(§9.8/§9.12)。
 
 不再继承 EngineCore:真实 EngineCore 实例照常装配(worker/scheduler/batch_queue),
 本类只替换其 step 语义;对 EngineCore 的触达一律经 LwdEnginePort(§7.3-C1)。
+数据面(接收/落位/消费释放)不在本层,落位后经登记回调对接(§9.12)。
 """
 
 from __future__ import annotations
@@ -13,14 +14,13 @@ from vllm.v1.lwd.lwd_step_core import LwdStepCore
 if TYPE_CHECKING:
     from vllm.v1.lwd.lwd_cloud_admission import LwdCloudAdmissionPolicy
     from vllm.v1.lwd.lwd_cloud_channel import LwdCloudControlSubscriber
-    from vllm.v1.lwd.lwd_cloud_embeds import LwdCloudEmbedStore
     from vllm.v1.lwd.lwd_config import LwdConfig
     from vllm.v1.lwd.lwd_message import EngineCoreOutputs, LwdEmbedNotify
     from vllm.v1.lwd.lwd_ports import LwdEnginePort
 
 
 class LwdCloudCore(LwdStepCore):
-    """云侧 prefill_only core:控制面 drain -> 相位调度执行 -> 步后释放。
+    """云侧 prefill_only core:控制面 drain -> 相位调度执行 -> 步后记账。
 
     调度器是装配期注入的 LwdCloudPhaseScheduler 实例(scheduler_cls 经
     lwd_cloud_scheduler_cls() 选取):分块决策走其原生 AsyncScheduler 语义
@@ -32,7 +32,6 @@ class LwdCloudCore(LwdStepCore):
     def __init__(
         self,
         subscriber: LwdCloudControlSubscriber,
-        embed_store: LwdCloudEmbedStore,
         admission_policy: LwdCloudAdmissionPolicy,
         engine_port: LwdEnginePort,
         config: LwdConfig,
@@ -51,28 +50,20 @@ class LwdCloudCore(LwdStepCore):
         ...
 
     def _lwd_handle_embed_notify(self, notify: LwdEmbedNotify) -> None:
-        """登记 seqno->request 并转投 embeds 仓预登记。"""
+        """登记 seqno->request;数据面落位后在此转投接收侧(§9.12)。"""
         ...
 
     def _lwd_handle_add_request(self, request) -> None:
         ...
 
     def _lwd_handle_abort(self, request_id: str) -> None:
-        """abort:embeds 仓丢弃 + 登记清理,在途 recv 的 tag 无人认领作废。"""
+        """abort:清请求登记(数据面清理由其落位侧对接)。"""
         ...
 
     # ---- 步进内部 ----
 
     def _lwd_apply_scheduling_policy(self) -> None:
         """准入策略(经 scheduler view 快照)决定本步可调度的 waiting 集合。"""
-        ...
-
-    def _lwd_update_retain_requests(self) -> None:
-        """由调度器被抢占集合刷新 embeds 仓 retain(重计算候选,§9.2)。"""
-        ...
-
-    def _lwd_release_consumed(self) -> None:
-        """释放已消费 embeds(retain 集合跳过);fill 重放依赖保留缓存。"""
         ...
 
     def _lwd_collect_finished(self) -> None:

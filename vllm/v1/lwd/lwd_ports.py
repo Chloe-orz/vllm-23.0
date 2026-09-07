@@ -1,15 +1,12 @@
-"""端口协议(端口-适配器/六边形):内核只依赖协议,不触达 EngineCore/executor 内部(§7.3/§9.8)。
+"""端口协议(端口-适配器/六边形):内核只依赖协议,不触达 EngineCore 内部(§7.3/§9.8)。
 
-分块决策复用原生 schedule()(§9.9),端口只承载步进编排所需的最小触达面;
-执行经原生 executor 路径(worker 按角色守卫路由),无独立执行器端口(§9.11)。
+分块决策复用原生 schedule()(§9.9),端口只承载 step 编排所需的最小触达面;
+本目录仅控制面(§9.12),数据面不经过端口。
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Iterable, Protocol
-
-if TYPE_CHECKING:
-    from vllm.v1.lwd.lwd_message import LwdEdgeEmbedAck
+from typing import Iterable, Protocol
 
 
 class LwdEnginePort(Protocol):
@@ -26,10 +23,6 @@ class LwdEnginePort(Protocol):
         ...
 
     def lwd_execute_model(self, scheduler_output):
-        ...
-
-    def lwd_drain_embed_acks(self) -> "list[LwdEdgeEmbedAck]":
-        """边侧:取回 worker 嵌入回执(驱动调度器进度更新)。"""
         ...
 
 

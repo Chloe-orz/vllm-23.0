@@ -4,7 +4,7 @@ from __future__ import annotations
 
 
 class LwdLog:
-    """日志/统计外观(Facade);wire 采样受 debug_wire 门控,默认关闭 NPU->CPU 同步。"""
+    """日志/统计外观(Facade):phase/admission/zombie/memory 四类事件统一出口。"""
 
     def phase(self, event: str, **fields) -> None:
         """相位推进类事件(原 [PO-*] phases)。"""
@@ -19,11 +19,7 @@ class LwdLog:
         ...
 
     def memory(self, stats: dict) -> None:
-        """embeds 仓内存统计(原 [PO-MEM],数据来自 lwd_stats() 只读接口;单向无水位,这是云侧内存唯一观测口)。"""
-        ...
-
-    def wire(self, name: str, tensor) -> None:
-        """数据面张量采样(absmean/head8);仅 debug_wire 开启时执行。"""
+        """内存/积压统计(原 [PO-MEM];数据面统计由其落位侧提供,§9.12)。"""
         ...
 
 
