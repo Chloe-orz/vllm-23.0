@@ -16,7 +16,8 @@ if TYPE_CHECKING:
 def lwd_edge_try_assemble(engine_core) -> bool:
     """装配点(core.py __init__ 尾守卫调用):非 PO 立即返回 False,零副作用。
 
-    PO 时建通道/dispatcher/LwdEdgeCore,并把 edge_core 赋给
+    PO 时:scheduler_cls 注入 LwdEdgeScheduler(纯 prefill,§9.10),
+    建通道/dispatcher/LwdEdgeCore,并把 edge_core 赋给
     engine_core.step_wrapper(core.py step 守卫的唯一委托对象,§9.8)。
     """
     ...

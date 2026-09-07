@@ -13,10 +13,11 @@
   决策(num_scheduled_tokens/max_num_batched_tokens);内核只做通知/传输/落位。
 
 分层(依赖严格单向,L3 -> L2 -> L1):
-  L3 装配: lwd_edge_assemble / lwd_cloud_launch / lwd_edge_executor_adapter
+  L3 装配: lwd_edge_assemble / lwd_cloud_launch
   L2 内核: lwd_step_core <- lwd_edge_core / lwd_cloud_core;
            lwd_message <- lwd_edge_channel / lwd_cloud_channel <- dispatcher;
-           lwd_cloud_phase_scheduler / lwd_cloud_embeds
+           lwd_edge_scheduler / lwd_cloud_phase_scheduler / lwd_cloud_embeds;
+           lwd_edge_embed(模块函数:worker 嵌入 + isend)
   支撑:    lwd_mode / lwd_config / lwd_diagnostics / lwd_ports
 
 import 白名单与交互预算(唯一事实源为设计文档 §7/§8.4/§9,变更先改台账再改代码):
@@ -25,9 +26,11 @@ import 白名单与交互预算(唯一事实源为设计文档 §7/§8.4/§9,变
     getattr 与 os.environ 预算为 0
   - vllm.v1.engine 仅 lwd_message(线上类型 re-export:EngineCoreRequest/
     EngineCoreOutputs)
-  - vllm.v1.core.sched.output / async_scheduler 仅 lwd_cloud_phase_scheduler
+  - vllm.v1.core.sched.output / async_scheduler 仅两个调度器文件
+    (lwd_cloud_phase_scheduler / lwd_edge_scheduler)
   - torch.distributed 仅 lwd_edge_embed / lwd_cloud_embeds
-  - 继承例外仅剩 1 个:lwd_cloud_phase_scheduler 继承 AsyncScheduler(§7.5);
-    §9.8 后内核不再继承 EngineCore(边/云 core 经 LwdEnginePort 触达,
-    适配器 LwdEnginePortAdapter 是台账登记的属性容忍点)
+  - 继承例外共 2 个:lwd_cloud_phase_scheduler 与 lwd_edge_scheduler
+    均继承 AsyncScheduler(§7.5/§9.10);§9.8 后内核不再继承 EngineCore
+    (边/云 core 经 LwdEnginePort 触达,适配器 LwdEnginePortAdapter
+    是台账登记的属性容忍点)
 """

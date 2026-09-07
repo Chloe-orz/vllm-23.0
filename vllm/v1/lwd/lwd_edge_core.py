@@ -35,13 +35,13 @@ class LwdEdgeCore(LwdStepCore):
         ...
 
     def _lwd_edge_step_schedule(self) -> "object | None":
-        """取原生分块决策(无请求时返回 None,步进空转)。"""
+        """取分块决策;调度器为装配期注入的 LwdEdgeScheduler(纯 prefill,§9.10)。"""
         ...
 
     def _lwd_edge_step_dispatch(self) -> None:
-        """发 LwdEmbedNotify + 经执行器端口提交原生 SO(队满则本轮放弃)。"""
+        """发 LwdEmbedNotify + 经 engine_port.lwd_execute_model 提交原生 SO(队满则本轮放弃)。"""
         ...
 
     def _lwd_edge_step_poll_acks(self) -> None:
-        """取回 worker 回执并更新调度器进度(update_from_output 语义)。"""
+        """engine_port.lwd_drain_embed_acks 取回执,经 lwd_edge_update_progress 推进并终结。"""
         ...

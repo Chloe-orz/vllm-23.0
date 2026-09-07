@@ -1,6 +1,7 @@
 """端口协议(端口-适配器/六边形):内核只依赖协议,不触达 EngineCore/executor 内部(§7.3/§9.8)。
 
-分块决策复用原生 schedule()(§9.9),端口只承载步进编排所需的最小触达面。
+分块决策复用原生 schedule()(§9.9),端口只承载步进编排所需的最小触达面;
+执行经原生 executor 路径(worker 按角色守卫路由),无独立执行器端口(§9.11)。
 """
 
 from __future__ import annotations
@@ -11,26 +12,24 @@ if TYPE_CHECKING:
     from vllm.v1.lwd.lwd_message import LwdEdgeEmbedAck
 
 
-class LwdFuture(Protocol):
-    """嵌入提交结果的 future 抽象。"""
+class LwdEnginePort(Protocol):
+    """边/云 step 编排对 EngineCore 的最小触达面(§7.3-C1/§9.8,两侧共用)。
 
-    def lwd_is_done(self) -> bool:
-        ...
-
-    def lwd_result(self):
-        ...
-
-
-class LwdEdgeExecutorPort(Protocol):
-    """边侧执行器端口:原生 SchedulerOutput 原样过本地环 MQ 送 worker。
-
-    不构造自定义 BatchType/SO 字段;worker_base 按角色守卫路由(§9.3/§9.9)。
+    step_wrapper 模式下专用 core 不继承 EngineCore,scheduler/executor
+    一律经本端口方法触达;方法集以 S2 step 实现实际所需为准收敛定稿。
     """
 
-    def lwd_submit_embeds(self, scheduler_output) -> LwdFuture:
+    def lwd_vllm_config(self):
         ...
 
-    def lwd_drain_acks(self) -> "list[LwdEdgeEmbedAck]":
+    def lwd_scheduler(self):
+        ...
+
+    def lwd_execute_model(self, scheduler_output):
+        ...
+
+    def lwd_drain_embed_acks(self) -> "list[LwdEdgeEmbedAck]":
+        """边侧:取回 worker 嵌入回执(驱动调度器进度更新)。"""
         ...
 
 

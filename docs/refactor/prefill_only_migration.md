@@ -505,3 +505,30 @@ class LwdCloudSchedulerView(Protocol):   # 只读快照,3 方法
   (request, 已发次数) 本地推演同一 seqno,云侧按 notify 登记。
 - 词汇表更新:数据单元=调度范围(range),张量内容=embeds;segment 一词全仓移除。
 - 2026-09-07 版架构/时序图为 segment 时代快照,经确认后刷新。
+
+### 9.10 边侧调度器补位:LwdEdgeScheduler(2026-09-07 迭代修订)
+
+- **问题**:9.9 的"边侧复用原生 AsyncScheduler"只覆盖分块这一半;原生调度器
+  的两个前提在边侧不成立——prompt 算完会转 decode 调度、请求只能由模型输出
+  终结(边侧无模型执行且只发不收)。
+- **新增** `lwd_edge_scheduler.py`:`LwdEdgeScheduler(AsyncScheduler)`
+  - `schedule()` = 纯 prefill 调度(分块复用原生),不进 decode;
+  - `lwd_edge_update_progress(acks)` = 回执推进 num_computed,
+    prompt 全部嵌入完成即本地终结(不依赖任何模型输出,与原生
+    update_from_output 的唯一语义差)。
+- **接线**:lwd_edge_try_assemble 注入 scheduler_cls=LwdEdgeScheduler,
+  与云侧(scheduler_cls=相位调度器)同款方式。
+- 继承例外恢复为 2 个(两个调度器文件);纯 prefill 原语与云侧
+  _lwd_schedule_pure_prefill 同源,S2 实现时评估下沉公共基类。
+
+### 9.11 空壳类清理:删执行器适配器,embed 降为模块函数(2026-09-07 迭代修订)
+
+- **删除**:`lwd_edge_executor_adapter.py` 整文件、`LwdEdgeExecutorPort`、
+  `LwdFuture`——§9.9 后该适配层已零转换(原生 SO 原样过 MQ),
+  `LwdEnginePort.lwd_execute_model` 完全覆盖,独立端口成空壳。
+- **类降函数**:`LwdEdgeEmbedHandler` 类删除,`lwd_edge_embed.py` 改为模块函数
+  `lwd_edge_execute_embeds(model, scheduler_output)`(+两个私有子函数),
+  worker_base 按角色守卫直接调用;torch.distributed 白名单文件不变。
+- `LwdEnginePort` 增补 `lwd_drain_embed_acks()`(边侧回执取回)。
+- 端口-适配器模式保留于:LwdEnginePort/LwdEnginePortAdapter 与调度器视图;
+  前端 executor 侧不再有 Lwd 适配层。
