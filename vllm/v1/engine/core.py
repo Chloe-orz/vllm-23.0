@@ -118,6 +118,9 @@ class EngineCore:
 
         self.log_stats = log_stats
 
+        # Lwd prefill-only step delegation target (None = native, docs/refactor).
+        self.step_wrapper = None
+
         # Setup Model.
         self.model_executor = executor_class(vllm_config)
         if executor_fail_callback is not None:
@@ -231,6 +234,11 @@ class EngineCore:
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
         enable_envs_cache()
+
+        # Lwd prefill-only assembly point: no-op unless the mode is enabled.
+        from vllm.v1.lwd_control import lwd_try_assemble
+
+        lwd_try_assemble(self)
 
     @instrument(span_name="Prepare model")
     def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
@@ -497,6 +505,9 @@ class EngineCore:
         batch in the job queue is finished.
         3. Update the scheduler from the output.
         """
+        # Lwd prefill-only step delegation: the wrapper replaces step semantics.
+        if self.step_wrapper is not None:
+            return self.step_wrapper.step_with_batch_queue()
 
         batch_queue = self.batch_queue
         assert batch_queue is not None
@@ -609,6 +620,11 @@ class EngineCore:
 
     def shutdown(self):
         logger.debug_once("[shutdown] EngineCore: tearing down local resources")
+        # Lwd prefill-only channel teardown (no-op unless assembled).
+        if self.step_wrapper is not None:
+            from vllm.v1.lwd_control import lwd_shutdown
+
+            lwd_shutdown(self)
         self.structured_output_manager.clear_backend()
         if self.model_executor:
             self.model_executor.shutdown()

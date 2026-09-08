@@ -2,56 +2,152 @@
 
 原生 AsyncScheduler 的两个前提在边侧不成立:prompt 算完会转 decode、
 请求只能由模型输出终结;边侧无本地解码,故需专用调度器。
+
+纯 prefill 的实现依据:schedule() 全量复用原生——边侧请求从不产生
+输出 token(num_tokens_with_spec 恒等于 num_prompt_tokens),且 prompt
+嵌入完成的当步即被 lwd_edge_update_progress 本地终结,原生 RUNNING 段
+每步只会调度剩余 prefill,decode 分支不可达。
 """
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING
 
+from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.lwd_control.control_communication.lwd_message import (
+    LwdAbortNotify,
+    LwdRangeNotify,
+    LwdRequestNotify,
+)
+from vllm.v1.request import RequestStatus
 
 if TYPE_CHECKING:
-    from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
+        LwdControlPublisher,
+    )
 
-    from vllm.v1.lwd.lwd_edge_channel import LwdEdgeControlPublisher
+logger = init_logger(__name__)
+
+_LWD_ADD_RETRY_STEPS = 3
+_LWD_ADD_RETRY_INTERVAL_S = 0.1
 
 
 class LwdEdgeScheduler(AsyncScheduler):
-    """纯 prefill 语义 + notify/abort/seqno(唯一控制面出口)。
+    """纯 prefill 语义 + notify/abort/seqno(边侧唯一控制面出口,§9.12)。"""
 
-    纯 prefill 调度原语与云侧 LwdCloudPhaseScheduler 同源
-    (_lwd_schedule_pure_prefill),S2 实现时评估下沉公共基类避免两处复制。
-    """
-
-    def __init__(self, *args, publisher: LwdEdgeControlPublisher | None = None,
-                 **kwargs) -> None:
+    def __init__(
+        self,
+        *args,
+        publisher: LwdControlPublisher | None = None,
+        **kwargs,
+    ) -> None:
         """publisher 经装配期注入(scheduler_cls 以 partial 携带通道)。"""
-        ...
+        super().__init__(*args, **kwargs)
+        self.lwd_edge_publisher = publisher
+        self._lwd_seqno = 0
+        self._lwd_last_scheduled: dict[str, int] = {}
 
     def schedule(self) -> SchedulerOutput:
-        """只调度 prefill 范围(分块复用原生);已完 prefill 的请求不进 decode。"""
-        ...
+        """全量复用原生分块决策;记录本步调度量供进度对账(§2.4 未派发重试)。"""
+        scheduler_output = super().schedule()
+        self._lwd_last_scheduled = dict(scheduler_output.num_scheduled_tokens)
+        return scheduler_output
 
     def lwd_edge_notify(self, scheduler_output: SchedulerOutput) -> bool:
-        """对新调度的 prefill 发 LwdEmbedNotify(seqno 先行)。
+        """对新调度的 prefill 发 LwdRangeNotify(seqno 先行)。
 
         publish 队满返回 False,调用方本步视为未派发、下一步重试
-        (原生 SO 由调度器自然复现,无需回滚)。
+        (原生 SO 由调度器自然复现,无需回滚;重复预告在云侧按
+        (request_id, offset) 幂等登记)。
         """
-        ...
+        publisher = self.lwd_edge_publisher
+        if publisher is None:
+            logger.error("[Lwd] edge scheduler assembled without publisher")
+            return False
+        for request_id, num_tokens in scheduler_output.num_scheduled_tokens.items():
+            request = self.requests.get(request_id)
+            if request is None:
+                continue
+            # _update_after_schedule 已乐观推进 num_computed,起点需回退本步量
+            notify = LwdRangeNotify(
+                request_id=request_id,
+                offset=request.num_computed_tokens - num_tokens,
+                num_tokens=num_tokens,
+                seqno=self._lwd_edge_next_seqno(),
+            )
+            if not publisher.publish(notify):
+                return False
+        return True
 
-    def lwd_edge_abort(self, request_ids: "list[str]") -> None:
-        """发 LwdAbortSignal。"""
-        ...
+    def lwd_edge_notify_request(
+        self, request_id: str, num_prompt_tokens: int, max_tokens: int = 16
+    ) -> None:
+        """发 LwdRequestNotify(EngineCore.add_request 守卫的出口,§9.12)。
 
-    def lwd_edge_update_progress(self, executed: "dict[str, int]") -> None:
-        """步末按已执行量推进 num_computed;prompt 全部完成即本地终结请求。
+        add 语义不可丢也不可挡本地调度:队满时短退避重试,超限告警放行,
+        云侧 zombie 检测兜底(§8.3-2 无自动回压)。
+        """
+        publisher = self.lwd_edge_publisher
+        if publisher is None:
+            return
+        message = LwdRequestNotify(
+            request_id=request_id,
+            num_prompt_tokens=num_prompt_tokens,
+            max_tokens=max_tokens,
+        )
+        for attempt in range(_LWD_ADD_RETRY_STEPS):
+            if publisher.publish(message):
+                return
+            time.sleep(_LWD_ADD_RETRY_INTERVAL_S * (attempt + 1))
+        logger.warning(
+            "[Lwd] drop add-request notify for %s: publish queue full", request_id
+        )
 
-        终结不依赖任何模型输出,这是与原生 update_from_output 的唯一语义差;
+    def lwd_edge_abort(self, request_ids: list[str]) -> None:
+        """发 LwdAbortNotify;本地终结走原生 abort 路径,此处只管出口。"""
+        publisher = self.lwd_edge_publisher
+        if publisher is None:
+            return
+        for request_id in request_ids:
+            if not publisher.publish(LwdAbortNotify(request_id=request_id)):
+                logger.warning(
+                    "[Lwd] drop abort signal for %s: publish queue full", request_id
+                )
+
+    def lwd_edge_update_progress(self, executed: dict[str, int]) -> None:
+        """步末对账实际执行量;prompt 全部嵌入完成即本地终结(§9.10)。
+
+        原生 _update_after_schedule 在调度时已乐观推进 num_computed,
+        此处按 executed 回退未执行部分(与 update_from_output 的拒绝回退
+        同款语义);终结不依赖任何模型输出,这是与原生路径的唯一语义差。
         executed 的实际来源由数据面落位时对接(§9.12)。
         """
-        ...
+        finished_ids: list[str] = []
+        for request_id, num_executed in executed.items():
+            request = self.requests.get(request_id)
+            if request is None:
+                continue
+            self._lwd_reconcile_progress(request, request_id, num_executed)
+            if request.num_computed_tokens >= request.num_prompt_tokens:
+                finished_ids.append(request_id)
+        if finished_ids:
+            self.finish_requests(finished_ids, RequestStatus.FINISHED_STOPPED)
+        self._lwd_last_scheduled = {}
+
+    def _lwd_reconcile_progress(
+        self, request, request_id: str, num_executed: int
+    ) -> None:
+        """回退本步未执行量;未派发重试(num_executed=0)即全量回退。"""
+        num_undone = self._lwd_last_scheduled.get(request_id, 0) - num_executed
+        if num_undone > 0:
+            request.num_computed_tokens -= num_undone
+            request.is_prefill_chunk = True
 
     def _lwd_edge_next_seqno(self) -> int:
         """seqno 单调分配;控制面登记与数据面 tag 都由它派生。"""
-        ...
+        current = self._lwd_seqno
+        self._lwd_seqno += 1
+        return current
