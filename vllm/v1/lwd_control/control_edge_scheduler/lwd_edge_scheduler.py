@@ -159,6 +159,12 @@ class LwdEdgeScheduler(AsyncScheduler):
         if num_undone > 0:
             request.num_computed_tokens -= num_undone
             request.is_prefill_chunk = True
+            # 最后一段排程时 _update_after_schedule 已为"预期采样输出帧"
+            # +1 占位符;边侧无采样,回退到未完成态时一并归零——否则重试
+            # 排程再次 +1,原生 running 循环按 num_tokens_with_spec + 占位
+            # 符 - num_computed 算出超出 prompt 的幻影 token。边侧从无
+            # 输出帧在途,归零即陈述事实。
+            request.num_output_placeholders = 0
 
     def _lwd_edge_next_seqno(self) -> int:
         """seqno 单调分配;控制面登记与数据面 tag 都由它派生。"""
