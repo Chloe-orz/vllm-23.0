@@ -1209,8 +1209,9 @@ class WorkerProc:
                     # capture what we actually got before raising.
                     logger.error(
                         "[EC-RPC-CORRUPT] local_rank=%d corrupt control RPC: "
-                        "method_len=%d head=%s args_len=%s",
+                        "method_type=%s method_len=%d head=%s args_len=%s",
                         self.local_rank,
+                        type(method).__name__,
                         len(method),
                         bytes(method[:48]).hex(),
                         [len(a) if isinstance(a, (bytes, bytearray)) else None
@@ -1250,7 +1251,16 @@ class WorkerProc:
                     method, args, kwargs, output_rank = (
                         self.local_rpc_broadcast_mq.dequeue(timeout=0.1)
                     )
-                    if isinstance(method, bytes) and method == b"pp_scheduler_output":
+                    # Route by CONTENT, not container type: depending on the
+                    # reader's shm/overflow path the marker can arrive as
+                    # bytes, bytearray or memoryview; isinstance(method,
+                    # bytes) alone would misroute those to the control-RPC
+                    # branch and blow up in cloudpickle.loads.
+                    _is_pp_sched = (
+                        isinstance(method, (bytes, bytearray, memoryview))
+                        and bytes(method) == b"pp_scheduler_output"
+                    )
+                    if _is_pp_sched:
                         scheduler_output = args[0]
                         slice_info = args[1] if len(args) > 1 else None
                         # Stage log (multi-edge hang triage): the pipeline
