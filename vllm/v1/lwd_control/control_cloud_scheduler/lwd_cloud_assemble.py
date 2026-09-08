@@ -16,6 +16,7 @@ from concurrent.futures import Future
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.utils.system_utils import set_process_title
+from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_phase_scheduler import (
     LwdCloudPhaseScheduler,
@@ -205,11 +206,21 @@ def _lwd_cloud_connect_planes(config: LwdConfig) -> LwdControlSubscriber:
 def _lwd_cloud_build_request(engine_core) -> Callable[[LwdRequestNotify], Request]:
     """唯一请求构建点:Request 构建/block_hasher 全收于此(§7.3-C1)。
 
-    数据面挂载(prompt_embeds 视图)由数据面落位侧在此对接(§9.12);
-    产物经提升出口进 input_queue,循环线程原生 ADD 分发到调度器暂存
-    (§10.10/§10.12)。
+    哈希链获取(§10.13):云 prompt token 是占位零值,本地算不出真实
+    链 —— prompt 首建直接用边侧预告里的 block_hashes,decode 续算回
+    本地 hasher;边侧未提供或长度不符回退本地(占位链,命中无效但不
+    崩)。数据面挂载(prompt_embeds 视图)由数据面落位侧在此对接
+    (§9.12);产物经提升出口进 input_queue,循环线程原生 ADD 分发到
+    调度器暂存(§10.10/§10.12)。
     """
-    block_hasher = engine_core.request_block_hasher
+    local_hasher = engine_core.request_block_hasher
+    if local_hasher is not None:
+        # 与 core.py 构造期同函数同输入,结果确定一致
+        _, hash_block_size = resolve_kv_cache_block_sizes(
+            engine_core.scheduler.kv_cache_config, engine_core.vllm_config
+        )
+    else:
+        hash_block_size = 0
 
     def _build(wire: LwdRequestNotify) -> Request:
         return Request(
@@ -218,10 +229,30 @@ def _lwd_cloud_build_request(engine_core) -> Callable[[LwdRequestNotify], Reques
             prompt_token_ids=[0] * wire.num_prompt_tokens,
             sampling_params=SamplingParams(max_tokens=wire.max_tokens),
             pooling_params=None,
-            block_hasher=block_hasher,
+            block_hasher=(
+                _lwd_cloud_wire_hasher(wire, local_hasher, hash_block_size)
+                if local_hasher is not None
+                else None
+            ),
         )
 
     return _build
+
+
+def _lwd_cloud_wire_hasher(
+    wire: LwdRequestNotify, local_hasher: Callable, hash_block_size: int
+) -> Callable[[Request], list[bytes]]:
+    """wire 链优先的请求 hasher:prompt 首建用边侧预告链,decode 续算
+    回本地 hasher;边侧未提供或长度不符回退本地(fail-open,§10.13)。"""
+
+    def hasher(request: Request) -> list[bytes]:
+        if len(request.block_hashes) == 0 and request.num_output_tokens == 0:
+            expected = request.num_prompt_tokens // hash_block_size
+            if len(wire.block_hashes) == expected:
+                return wire.block_hashes
+        return local_hasher(request)
+
+    return hasher
 
 
 def _lwd_cloud_admit_sink(engine_core) -> Callable[[Request], None]:

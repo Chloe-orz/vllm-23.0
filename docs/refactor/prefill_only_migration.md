@@ -960,3 +960,38 @@ docs/refactor/lwd_control_communication_composition.md):
   暂存/abort 走 sink/shutdown 转发停桥且幂等);推演核对的运行时项
   (input_queue 唤醒、finally 关停链、原生 ADD 校验轻量)以行号记录
   于推演记录,真机双进程冒烟仍随 §10.6 backlog。
+
+### 10.13 外部 block_hash 接入适配:链随预告下发(2026-09-08)
+
+> 依据:《外部block_hash接入修改清单》(v0.23.0_ori)+ 用户澄清:
+> 哈希链的真实数据源是边侧 ZMQ 预告消息的成员变量,不存在 HTTP 外部
+> 服务(方案文档的 HTTP 客户端变体不落位)。core.py 零改动。
+
+- **云侧为什么需要**:云 prompt token 是占位零值,本地哈希算不出真实
+  链 —— 链随边侧预告下发,云侧前缀缓存按真实内容命中(边云同源)。
+- **线上消息**(`LwdRequestNotify` 增 `block_hashes: list[bytes] = []`,
+  缺省空,msgspec 缺省字段旧格式解码兼容):边侧本地算好的 prompt 全量
+  满块链,自位置 0 起,`len == num_prompt_tokens // hash_block_size`,
+  字节语义与本地 sha256 算法一致(边侧本地 hasher 的产物,同一性由
+  构造保证)。边侧出口 `lwd_edge_notify_request` 增参透传;调用方随
+  边 add 路径落位时传入 Request.block_hashes(挂账,当前无调用方)。
+- **云侧获取**(`_lwd_cloud_build_request` 工厂内,wire hasher 闭包):
+  prompt 首建(链空 + 无输出)且边侧链长度与期望满块数一致 → 直接用
+  wire 链;decode 续算回本地 hasher,外链末块即本地续算 parent
+  (append-only 无缝衔接);边侧未提供/长度不符回退本地(占位链,命中
+  无效但不崩,fail-open)。prefix caching 未启用(无 hasher)时请求
+  不挂 hasher,整链机制不激活。原方案的 env/HTTP 客户端/长度重推
+  (get_hash_fn_by_name 链路)不落位。
+- **落位**:链的获取逻辑住云装配请求工厂(哈希链是请求构建期知识,
+  非调度决策);`vllm/v1/external_block_hash.py` HTTP 变体已建即删
+  (被 wire 方案取代,记录在案);预算无新增例外(kv_cache_utils
+  例外已在)。
+- **对比原方案**:取数时机从"输入线程首次建链"变为"边侧预告时已定、
+  云构建即用"(桥线程零网络等待);接口 key 仍为 prompt token ids
+  的哈希链;部署契约不变(§5:全量满块链/字节一致/hash_block_size
+  对齐)。wire 体积:每请求 32B × 满块数(8k prompt/16 块粒度 ≈
+  16KB),PRE_OUT 有界队列(1000)语义不变。
+- **验证**:静态套件全绿;wire 冒烟(新字段往返/旧格式缺省兼容/其它
+  消息类型不受影响);原方案 §6 清单的哈希逻辑分支(链长校验/续算
+  本地/缺失回退)由工厂闭包逐条对齐;真机项 = 边云同源 prefix cache
+  命中观察,随 §10.6 backlog。

@@ -36,11 +36,16 @@ class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):
 
     结果不回边(§9.1),线上只带调度决策所需字段;max_tokens 供云侧
     调度器判定终结,采样参数等扩展由数据面/后续迭代按需增补(additive)。
+    block_hashes:边侧本地算好的 prompt 全量满块链(自位置 0 起,
+    len == num_prompt_tokens // hash_block_size)—— 云 prompt token 是
+    占位零值,本地哈希算不出真实链,链随预告下发让云侧前缀缓存按真实
+    内容命中;缺省空 = 边侧未提供,云侧回退本地(占位链,不影响正确性)。
     """
 
     request_id: str
     num_prompt_tokens: int
     max_tokens: int = 16
+    block_hashes: list[bytes] = []
 
 
 class LwdAbortNotify(msgspec.Struct, gc=False, tag=True):

@@ -83,10 +83,17 @@ class LwdEdgeScheduler(AsyncScheduler):
         return True
 
     def lwd_edge_notify_request(
-        self, request_id: str, num_prompt_tokens: int, max_tokens: int = 16
+        self,
+        request_id: str,
+        num_prompt_tokens: int,
+        max_tokens: int = 16,
+        block_hashes: list[bytes] | None = None,
     ) -> None:
         """发 LwdRequestNotify(EngineCore.add_request 守卫的出口,§9.12)。
 
+        block_hashes = 边侧本地请求的 prompt 全量满块链(Request.block_hashes,
+        自位置 0 起)—— 云侧 prompt token 是占位零值,靠这条链按真实内容
+        命中前缀缓存(§10.13);缺省空 = 不提供,云侧回退本地占位链。
         add 语义不可丢也不可挡本地调度:队满时短退避重试,超限告警放行,
         云侧 zombie 检测兜底(§8.3-2 无自动回压)。
         """
@@ -97,6 +104,7 @@ class LwdEdgeScheduler(AsyncScheduler):
             request_id=request_id,
             num_prompt_tokens=num_prompt_tokens,
             max_tokens=max_tokens,
+            block_hashes=block_hashes if block_hashes is not None else [],
         )
         for attempt in range(_LWD_ADD_RETRY_STEPS):
             if publisher.publish(message):
