@@ -128,16 +128,22 @@ class LwdEdgeScheduler(AsyncScheduler):
     def lwd_edge_update_progress(self, executed: dict[str, int]) -> None:
         """步末对账实际执行量;prompt 全部嵌入完成即本地终结(§9.10)。
 
-        原生 _update_after_schedule 在调度时已乐观推进 num_computed,
-        此处按 executed 回退未执行部分(与 update_from_output 的拒绝回退
-        同款语义);终结不依赖任何模型输出,这是与原生路径的唯一语义差。
-        executed 的实际来源由数据面落位时对接(§9.12)。
+        对账基准是本步排程登记(_lwd_last_scheduled)而非 executed:原生
+        _update_after_schedule 在调度时已乐观推进 num_computed,步末必须
+        回退未派发的部分——notify 队满时 executed 缺项即全量回退(与
+        update_from_output 的拒绝回退同款语义),步末后 num_computed ==
+        本步实际派发水位,下一步原生调度自然复现同一范围。executed 必须
+        是本步排程集的子集(同步执行接缝保证;数据面落位时按 §9.12
+        重定义此接缝)。终结不依赖任何模型输出,这是与原生路径的唯一
+        语义差。
         """
         finished_ids: list[str] = []
-        for request_id, num_executed in executed.items():
+        for request_id in self._lwd_last_scheduled:
             request = self.requests.get(request_id)
             if request is None:
+                # 本步内已终结(abort/更早完成):迟到的对账无对象。
                 continue
+            num_executed = executed.get(request_id, 0)
             self._lwd_reconcile_progress(request, request_id, num_executed)
             if request.num_computed_tokens >= request.num_prompt_tokens:
                 finished_ids.append(request_id)
