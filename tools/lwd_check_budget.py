@@ -14,14 +14,15 @@ from pathlib import Path
 # 台账例外:文件名 -> 允许的额外 import 片段(正则);布局依 §10.3/§10.7
 _LWD_FILE_EXCEPTIONS = {
     "lwd_notify.py": (r"from vllm\.v1\.engine import",),
-    "lwd_cloud_core.py": (r"from vllm\.v1\.outputs import",),
     "lwd_edge_scheduler.py": (r"from vllm\.v1\.request import",),
     "lwd_cloud_phase_scheduler.py": (r"from vllm\.v1\.request import",),
     "lwd_edge_assemble.py": (r"from vllm\.v1\.core\.kv_cache_utils import",),
     "lwd_cloud_assemble.py": (
         r"from vllm\.v1\.core\.kv_cache_utils import",
         r"from vllm\.v1\.request import",
+        r"from vllm\.v1\.outputs import",
         r"from vllm\.sampling_params import",
+        r"from vllm\.v1\.engine import",
     ),
 }
 
@@ -79,8 +80,6 @@ def check_import_whitelist(lwd_root: Path) -> list[str]:
 _LWD_GETATTR_TOLERANT_FILES = {
     "lwd_edge_assemble.py",
     "lwd_cloud_assemble.py",
-    # 源类全方法照搬(§10.8):hint_mq 探测等防御式访问暂存,改造收敛时清零
-    "lwd_cloud_core.py",
 }
 
 

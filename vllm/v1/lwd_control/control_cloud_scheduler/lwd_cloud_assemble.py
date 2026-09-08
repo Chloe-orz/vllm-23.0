@@ -1,140 +1,196 @@
-"""云侧 L3 装配:进程入口 + 请求准入装配(违禁 import 只允许本文件,§7.2/§9.8)。
+"""云侧 L3 装配:空批契约垫片 + PRE_OUT 桥线程 + 请求构建(§10.12)。
 
-EngineCore 的构建仍走原生 headless 路径(serve.py 守卫负责),本文件
-在真实 EngineCore 建成后完成 Lwd 装配;云侧端口适配器与调度器视图
-适配器落位本文件(§10.3),LwdConfig/模式判定复用 lwd_edge_assemble。
+EngineCore 的构建仍走原生 headless 路径(serve.py 守卫负责),本文件在
+真实 EngineCore 建成后完成 Lwd 装配;step_wrapper 不再使用 —— 步体走
+原生(垫片恢复空批契约),泵由桥线程承担,调度语义全在相位调度器。
+LwdConfig/模式判定复用 lwd_edge_assemble;违禁 import 只允许本文件
+(§7.2:vllm.v1.engine 请求元组类型 / v1.outputs 契约值 / Request 构建)。
 """
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
+from concurrent.futures import Future
 
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.utils.system_utils import set_process_title
-from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_core import LwdCloudCore
+from vllm.v1.engine import EngineCoreRequestType
+from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_phase_scheduler import (
+    LwdCloudPhaseScheduler,
+)
 from vllm.v1.lwd_control.control_communication.lwd_control_subscriber import (
     LwdControlSubscriber,
 )
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
+    LwdAbortNotify,
+    LwdRangeNotify,
     LwdRequestNotify,
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import (
     LwdConfig,
     is_lwd_prefill_only,
 )
-from vllm.v1.lwd_control.control_edge_scheduler.lwd_step_core import (
-    LwdCloudSchedulerView,
-)
+from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
 
 
-class LwdCloudEnginePortAdapter:
-    """云侧端口适配器(§10.3 落位装配文件):engine_core 触达 + abort + 视图。
+class LwdCloudBridge:
+    """PRE_OUT 桥线程(§10.12,方案 §2.4 桥 A;POST_OUT 桥随 §9.1 裁)。
 
-    增强步体(lwd_cloud_core.lwd_native_step_bq_prefill_only)直接以
-    engine_core 为入参,不回调原生步体、无 wrapper 翻转(§10.8)。
-    台账登记的 engine_core 属性容忍点(§7.3-C5)。
+    两线程分工:桥线程独占门状态变更与数据面接缝(seqno/hint/drop);
+    调度状态只经 input_queue 的 ADD/ABORT 原生分发在循环线程变更 ——
+    跨线程直改调度器内部即竞态,零锁的代价是这条纪律。
     """
 
-    def __init__(self, engine_core) -> None:
-        self._engine_core = engine_core
+    _LWD_IDLE_SLEEP_SECONDS = 0.001
 
-    def lwd_engine_core(self):
-        """增强步体的 EngineCore 触达(LwdCloudCore._process_engine_step 用)。"""
-        return self._engine_core
-
-    def lwd_abort_requests(self, request_ids: list[str]) -> None:
-        self._engine_core.abort_requests(request_ids)
-
-    def lwd_scheduler_view(self) -> LwdCloudSchedulerView:
-        return LwdCloudSchedulerViewAdapter(self._engine_core.scheduler)
-
-
-class LwdCloudSchedulerViewAdapter:
-    """包住 engine_core.scheduler 的只读快照(§7.3-C1,准入策略输入)。
-
-    台账登记的调度器内部容忍点:只读 waiting/skipped_waiting/requests
-    三个公共容器,不触碰调度器私有状态。
-    """
-
-    def __init__(self, scheduler) -> None:
+    def __init__(
+        self,
+        subscriber: LwdControlSubscriber,
+        scheduler: LwdCloudPhaseScheduler,
+        engine_core,
+    ) -> None:
+        self._subscriber = subscriber
         self._scheduler = scheduler
+        self._engine_core = engine_core
+        self._hint_missing_warned = False
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(
+            target=self._pump, name="lwd-cloud-bridge", daemon=True
+        )
 
-    def lwd_unfinished_count(self) -> int:
-        return self._scheduler.get_num_unfinished_requests()
+    def start(self) -> None:
+        self._thread.start()
 
-    def lwd_waiting_count(self) -> int:
-        return len(self._scheduler.waiting) + len(self._scheduler.skipped_waiting)
+    def stop(self) -> None:
+        """幂等停桥:停泵后关停订阅通道(S1 关停幂等)。"""
+        self._stop_event.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+        self._subscriber.shutdown()
 
-    def lwd_request_progress(self):
-        """产出 (request_id, num_computed_tokens, num_prompt_tokens)。"""
-        for request in self._scheduler.requests.values():
-            if not request.is_finished():
-                yield (
-                    request.request_id,
-                    request.num_computed_tokens,
-                    request.num_prompt_tokens,
+    def _pump(self) -> None:
+        while not self._stop_event.is_set():
+            for msg in self._subscriber.drain():
+                try:
+                    self._dispatch(msg)
+                except Exception:
+                    # 泵线程不允许带病退出:单条翻译失败记日志丢消息,
+                    # 上层超时/abort 路径兜底(源 zombie 观测同语义)。
+                    logger.exception("[Lwd] cloud bridge dispatch failed")
+            self._stop_event.wait(self._LWD_IDLE_SLEEP_SECONDS)
+
+    def _dispatch(self, msg) -> None:
+        if isinstance(msg, LwdRangeNotify):
+            self._on_range_notify(msg)
+        elif isinstance(msg, LwdAbortNotify):
+            self._on_abort_notify(msg.request_id)
+        else:
+            self._scheduler.lwd_cloud_on_request_notify(msg)
+
+    def _on_range_notify(self, notify: LwdRangeNotify) -> None:
+        # 数据面接缝(§10.1):seqno 接收登记 + hint 转发
+        registry = self._engine_core._po_chunk_seqnos
+        seqnos = registry.get(notify.request_id)
+        if seqnos is None:
+            seqnos = []
+            registry[notify.request_id] = seqnos
+        seqnos.append(notify.seqno)
+        self._forward_hint(notify)
+        if notify.offset == 0:
+            # 首预告门判定属线上语义(offset==0 = 派发首块),留桥侧
+            self._scheduler.lwd_cloud_on_range_notify(notify.request_id)
+
+    def _on_abort_notify(self, request_id: str) -> None:
+        self._scheduler.lwd_cloud_on_abort_notify(request_id)
+        self._engine_core._po_chunk_seqnos.pop(request_id, None)
+        self._forward_drop(request_id)
+
+    def _forward_hint(self, notify: LwdRangeNotify) -> None:
+        hint_mq = getattr(self._engine_core.model_executor, "cloud_recv_hint_mq", None)
+        if hint_mq is None:
+            if not self._hint_missing_warned:
+                logger.warning(
+                    "[Lwd] chunk notifications arriving but cloud_recv_hint_mq "
+                    "is not wired (worker recv manager pending)"
                 )
+                self._hint_missing_warned = True
+            return
+        hint = {
+            "prefill_only": True,
+            "request_id": notify.request_id,
+            "seqno": notify.seqno,
+            "num_tokens": notify.num_tokens,
+        }
+        hint_mq.enqueue((b"irecv_hint", (hint,), {}, None))
+
+    def _forward_drop(self, request_id: str) -> None:
+        hint_mq = getattr(self._engine_core.model_executor, "cloud_recv_hint_mq", None)
+        if hint_mq is not None:
+            hint_mq.enqueue((b"prefill_only_drop", (request_id,), {}, None))
 
 
-def lwd_cloud_main(args, engine_core) -> bool:
-    """云进程入口(serve.py run_headless 守卫分支调用);装配三段见下(§2.6)。
-
-    守卫先按 headless 原生路径构建 EngineCore,再以本入口完成 Lwd 装配;
-    与 core.py __init__ 尾守卫(lwd_try_assemble 分流)幂等共存。
+def lwd_cloud_install_empty_batch_contract(engine_core) -> None:
+    """空批契约垫片:fork runner 对 0-token 批回 None,原生步体
+    future.result() 即崩(core.py:576)。0-token 派发在执行器接缝处
+    短路为预完成 EMPTY_MODEL_RUNNER_OUTPUT(上游契约值;原步体增强 1
+    的下沉形态,附带省一次 worker 往返)—— runner 侧契约修复落地后
+    可整体拆除,非 PO 形态不安装。
     """
-    _lwd_cloud_init_process(args)
-    return lwd_cloud_try_assemble(engine_core)
+    executor = engine_core.model_executor
+    original_execute = executor.execute_model
+
+    def execute_model(scheduler_output, *args, **kwargs):
+        if scheduler_output.total_num_scheduled_tokens > 0:
+            return original_execute(scheduler_output, *args, **kwargs)
+        future: Future = Future()
+        future.set_result(EMPTY_MODEL_RUNNER_OUTPUT)
+        return future
+
+    executor.execute_model = execute_model
 
 
 def lwd_cloud_try_assemble(engine_core) -> bool:
     """云侧装配点(幂等):非 PO / 边角色立即返回 False,零副作用。
 
-    PO 云角色:建 PRE_OUT 订阅通道 -> 换装相位调度器 -> 建 LwdCloudCore
-    并赋给 engine_core.step_wrapper(§9.8 委托点)。
+    装配三段:空批契约垫片安装 → PRE_OUT 订阅通道与桥线程 → 请求
+    工厂/出口绑定调度器(§10.12)。step_wrapper 不再使用,core.py
+    的关停经原生 scheduler.shutdown 钩子转发停桥。
     """
-    if engine_core.step_wrapper is not None:
-        return True
+    # 先角色判定再触达调度器:非 PO 引擎是原生调度器,无 Lwd 接口
     if not is_lwd_prefill_only(engine_core.vllm_config):
         return False
     config = LwdConfig.from_env_and_config(engine_core.vllm_config)
     if config.is_edge_node:
         return False
+    scheduler = engine_core.scheduler
+    if scheduler.lwd_cloud_control_plane_bound():
+        return True
     if engine_core.batch_queue is None:
-        # 无 batch queue 时 step_fn 绑定同步 step(core.py:221),step_wrapper
-        # 守卫(core.py:509)永不触发,云侧 drain 静默失效 —— 装配期 fail-fast
-        # (源装配断言同款:requires the batch queue, max_concurrent_batches > 1)
+        # 云侧按异步流水线部署验证(源装配断言同款:requires the batch
+        # queue, max_concurrent_batches > 1),缺位即部署错误显式失败
         raise RuntimeError(
             "[Lwd] cloud prefill_only requires the batch queue "
             "(async_scheduling / max_concurrent_batches > 1)"
         )
-    subscriber = _lwd_cloud_connect_planes(config)
-    # 请求构建唯一交互点绑定给调度器(§10.11):门/暂存/准入均在调度器,
-    # 工厂只负责 Request 构建(违禁 import 容忍点,§7.2)。
-    engine_core.scheduler.lwd_cloud_bind_request_factory(
-        _lwd_cloud_build_request(engine_core)
-    )
-    engine_core.step_wrapper = _lwd_cloud_build_core(engine_core, subscriber, config)
-    return True
-
-
-def lwd_cloud_shutdown(cloud_core) -> None:
-    """关停云侧订阅通道(core.py shutdown 守卫经 lwd_shutdown 路由)。
-
-    包内生命周期辅助:cores 不暴露额外公共接口(§9.8),通道生命周期
-    由装配层掌管。
-    """
-    cloud_core._lwd_subscriber.shutdown()
-
-
-def _lwd_cloud_init_process(args) -> None:
-    """进程级初始化(角色标记/信号/日志)。"""
-    del args  # 信号注册由原生 headless 入径负责,此处只做角色标记
+    # 角色标记(原 lwd_cloud_main 进程初始化段随删除折叠至此)
     set_process_title("vllm::EngineCore::LwdCloud")
-    logger.info("[Lwd] cloud process assembling (prefill_only subscriber)")
+    lwd_cloud_install_empty_batch_contract(engine_core)
+    subscriber = _lwd_cloud_connect_planes(config)
+    bridge = LwdCloudBridge(subscriber, scheduler, engine_core)
+    scheduler.lwd_cloud_bind_request_factory(_lwd_cloud_build_request(engine_core))
+    scheduler.lwd_cloud_bind_bridge(
+        admit_sink=_lwd_cloud_admit_sink(engine_core),
+        abort_sink=_lwd_cloud_abort_sink(engine_core),
+        stop=bridge.stop,
+    )
+    bridge.start()
+    logger.info("[Lwd] cloud assembled: native step + bridge pump (no step_wrapper)")
+    return True
 
 
 def _lwd_cloud_connect_planes(config: LwdConfig) -> LwdControlSubscriber:
@@ -146,29 +202,12 @@ def _lwd_cloud_connect_planes(config: LwdConfig) -> LwdControlSubscriber:
     return LwdControlSubscriber(config.lwd_pre_out_endpoint(), bind=True)
 
 
-def _lwd_cloud_build_core(
-    engine_core, subscriber: LwdControlSubscriber, config: LwdConfig
-) -> LwdCloudCore:
-    """装配云侧执行类。
-
-    调度接线:scheduler 已在构造期注入(serve 守卫按 (scheduler_name,
-    admission_name) 二维写 scheduler_config.scheduler_cls,相位排批 +
-    相位准入 + 首预告门同体,§10.10/§10.11;request factory 由
-    try_assemble 绑定);本函数只装 step 委托。
-    """
-    port = LwdCloudEnginePortAdapter(engine_core)
-    return LwdCloudCore(
-        subscriber=subscriber,
-        engine_port=port,
-        settings=config.lwd_step_settings(),
-    )
-
-
 def _lwd_cloud_build_request(engine_core) -> Callable[[LwdRequestNotify], Request]:
     """唯一请求构建点:Request 构建/block_hasher 全收于此(§7.3-C1)。
 
     数据面挂载(prompt_embeds 视图)由数据面落位侧在此对接(§9.12);
-    产物经调度器 add_request 进首预告门后的暂存/准入(§10.10/§10.11)。
+    产物经提升出口进 input_queue,循环线程原生 ADD 分发到调度器暂存
+    (§10.10/§10.12)。
     """
     block_hasher = engine_core.request_block_hasher
 
@@ -183,3 +222,23 @@ def _lwd_cloud_build_request(engine_core) -> Callable[[LwdRequestNotify], Reques
         )
 
     return _build
+
+
+def _lwd_cloud_admit_sink(engine_core) -> Callable[[Request], None]:
+    """提升出口:过门请求 marshal 到循环线程(input_queue 原生 ADD 分发)。"""
+    input_queue = engine_core.input_queue
+
+    def _admit(request: Request) -> None:
+        input_queue.put_nowait((EngineCoreRequestType.ADD, (request, 0)))
+
+    return _admit
+
+
+def _lwd_cloud_abort_sink(engine_core) -> Callable[[str], None]:
+    """abort 出口:终结 marshal 到循环线程(原生 ABORT 分发 → finish_requests)。"""
+    input_queue = engine_core.input_queue
+
+    def _abort(request_id: str) -> None:
+        input_queue.put_nowait((EngineCoreRequestType.ABORT, [request_id]))
+
+    return _abort

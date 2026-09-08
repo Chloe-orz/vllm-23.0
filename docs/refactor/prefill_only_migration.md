@@ -908,3 +908,55 @@ docs/refactor/lwd_control_communication_composition.md):
 - **未决承接**:步体/驱动/has_work 守卫 #6/runner 空批契约修复仍属
   step 面,按 prefill_only_core_reuse 方案另批落地;文件删除(用户
   诉求终态)待步体面收敛后随 step_wrapper 机制一并评估。
+
+### 10.12 云侧脱离 step_wrapper:空批垫片 + 桥线程,lwd_cloud_core 删除
+(2026-09-08,用户裁定;承接 prefill_only_core_reuse 方案的云侧部分)
+
+> 用户裁定:适配尽量收在调度器;经推演权衡,泵线程与垫片落装配层
+> (调度器实例摸不到 executor/订阅通道,装配层是接线本职),调度器
+> 只增注入接口与关停转发。core.py 与 vllm-ascend **零改动**。
+
+- **执行流推演结论**(换调度器 + 原生循环的直接模拟):启动换装/调度
+  步/输出簿记/空闲唤醒六环节天然通过;两个真断点 = ①云部署无前端,
+  input_queue 无人喂(引擎聋)②fork runner 0-token 批回 None 撞
+  core.py:576;两处小接线 = 提升/abort 的 marshal 与关停路由。
+- **空批契约垫片**(`lwd_cloud_assemble.lwd_cloud_install_empty_batch_
+  contract`):装配期包装 model_executor.execute_model,0-token 派发
+  短路为预完成 EMPTY_MODEL_RUNNER_OUTPUT(上游契约值;原步体增强 1
+  的下沉形态,附带省一次 worker 往返)。原 83 行步体拷贝
+  (`lwd_native_step_bq_prefill_only`)与 [PO-RPC] 预检/相位日志随之
+  删除(§2.2"日志/预检可选诊断可弃"落地);runner 侧修复落地后垫片
+  可整体拆除。非 PO 不安装,PD/原生零影响。
+- **PRE_OUT 桥线程**(`lwd_cloud_assemble.LwdCloudBridge`,daemon):
+  循环 drain → 翻译三类消息;数据面接缝(seqno 登记/hint/drop)与
+  首预告线上语义(offset==0 判首)留桥侧,门接口转发调度器。
+  生命周期:try_assemble 启动;停桥句柄经 bind 注入调度器。
+- **两线程分工(零锁纪律)**:桥线程独占门状态与数据面接缝;调度
+  状态(_staged/waiting/running)只经 input_queue 的 ADD/ABORT 原生
+  元组分发在循环线程变更。has_work 守卫 #6 挂账就此消解 —— 桥投
+  input_queue 直接唤醒阻塞 get(WAKEUP 同款机制),不依赖轮询。
+- **调度器新增**:`lwd_cloud_bind_bridge(admit_sink, abort_sink, stop)`
+  三注入(缺省直进/自终结,兼容直连形态与单测);`shutdown()` 覆写
+  转发停桥 —— 原生 shutdown 无条件调 scheduler.shutdown,core.py
+  关停路径零改动;`lwd_cloud_control_plane_bound()` 为装配幂等判据。
+  `lwd_cloud_on_abort_notify` 收缩为纯门清理(终结经 ABORT 分发)。
+- **删除**:`lwd_cloud_core.py` 整文件(LwdCloudCore +
+  lwd_native_step_bq_prefill_only + run_busy_loop/_has_work/
+  _process_engine_step/lwd_stats);装配层云侧端口/视图适配器与
+  lwd_cloud_main 入口形态(零引用,§10.12 记录在案);
+  lwd_step_core 的 LwdCloudSchedulerView 协议与 LwdEnginePort 云方法
+  (边侧只用 lwd_scheduler/lwd_execute_model)。
+- **接线变化**:`lwd_cloud_try_assemble` 幂等判据改
+  control_plane_bound(不再看 step_wrapper),角色判定先于调度器触达
+  (原生调度器无 Lwd 接口);`lwd_shutdown` 收缩为仅边角色(云关停
+  走调度器钩子);预算例外迁移:lwd_cloud_assemble 增 v1.outputs
+  (垫片契约值)与 v1.engine(ADD/ABORT 请求元组类型),lwd_cloud_core
+  条目随文件删除;getattr 容忍文件集删 lwd_cloud_core.py。
+- **云侧文件终态**:lwd_cloud_phase_scheduler.py(纯调度 + 门 +
+  注入接口)+ lwd_cloud_assemble.py(装配 + 垫片 + 桥)两个文件;
+  check_functions 全目录首次全绿(超限步体随删除清零)。
+- **验证**:ruff check/format、lwd_check_budget、py_compile、
+  check_functions 全绿;stub 冒烟扩展桥注入用例(提升走 sink 不直改
+  暂存/abort 走 sink/shutdown 转发停桥且幂等);推演核对的运行时项
+  (input_queue 唤醒、finally 关停链、原生 ADD 校验轻量)以行号记录
+  于推演记录,真机双进程冒烟仍随 §10.6 backlog。

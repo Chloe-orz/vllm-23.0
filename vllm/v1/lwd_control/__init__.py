@@ -6,16 +6,17 @@
 (嵌入前向、tag 直传、接收落位、消费释放)不在本目录,由其落位侧经
 既有接缝对接:
   - 边侧:LwdEdgeScheduler.lwd_edge_update_progress(执行量来源)
-  - 云侧:LwdCloudCore._record_chunk_notify(接收登记)/
+  - 云侧:LwdCloudBridge._on_range_notify(接收登记)/
     lwd_cloud_assemble._lwd_cloud_build_request(请求侧挂载点)
 
 通信模型(§9):单向 边 -> 云,仅控制面 PRE_OUT
   (notify/add_request/abort,ZMQ PUSH/PULL);无结果面、无水位、无快路径。
 
-扩展模型(§9.8):对 EngineCore 的唯一扩展点是 step 接口。
-  LwdStepCore <- LwdEdgeCore / LwdCloudCore;装配期把专用 core 赋给
-  EngineCore.step_wrapper(默认 None),core.py step 守卫委托。
-  上游接线共 5 处 additive 守卫(§10.1):core.py 4 处
+扩展模型(§9.8/§10.12):边侧对 EngineCore 的扩展点是 step 接口
+  (LwdStepCore <- LwdEdgeCore,装配期赋 EngineCore.step_wrapper,
+  core.py step 守卫委托);云侧零 step 依赖 —— 调度逻辑经构造期
+  scheduler_cls 注入,泵为装配层桥线程,关停经原生 scheduler.shutdown
+  钩子转发停桥。上游接线 additive 守卫(§10.1):core.py 4 处
   (step_wrapper 字段 / __init__ 尾装配点 / step 顶部守卫 / shutdown 守卫,
   经本模块 lwd_try_assemble / lwd_shutdown 分流)+ serve.py 入口守卫
   (lwd_serve_guard)。
@@ -37,9 +38,9 @@
              lwd_edge_scheduler;lwd_edge_assemble(装配 + LwdConfig +
              模式判定唯一实现 + 边侧适配器)为 L3(违禁 import 容忍点)
   control_cloud_scheduler/(云侧):lwd_cloud_phase_scheduler(相位排批 +
-             相位准入 + 首预告门/控制面功能接口,§10.10/§10.11);
-             lwd_cloud_core(PRE_OUT 泵 + 步体/驱动 + 数据面接缝);
-             lwd_cloud_assemble(装配 + 云侧/视图适配器)为 L3
+             相位准入 + 首预告门/控制面功能接口,§10.10-§10.12);
+             lwd_cloud_assemble(装配 + 空批契约垫片 + PRE_OUT 桥线程
+             + 请求构建)为 L3;lwd_cloud_core 已删(§10.12)
 
 import 白名单与交互预算(唯一事实源为设计文档 §7/§8.4/§9/§10,
 变更先改台账再改代码;检查脚本 tools/lwd_check_budget.py):
@@ -52,8 +53,9 @@ import 白名单与交互预算(唯一事实源为设计文档 §7/§8.4/§9/§1
   - 例外(台账登记):两个调度器文件可 import vllm.v1.request 的
     RequestStatus——AsyncScheduler 继承面的既有传递依赖,不新增依赖边;
     云装配文件 import Request/SamplingParams(请求构建唯一交互点)
-  - vllm.v1.engine 仅 lwd_notify(TYPE_CHECKING
-    re-export:EngineCoreOutputs)
+  - vllm.v1.engine 仅 lwd_notify(TYPE_CHECKING re-export:
+    EngineCoreOutputs)与 lwd_cloud_assemble(运行时:ADD/ABORT 请求
+    元组类型,§10.12)
   - vllm.v1.core.sched.*(output/async_scheduler/request_queue)仅两个
     调度器文件;kv_cache_utils 仅两个装配文件(L3)
   - 继承例外共 2 个:lwd_cloud_phase_scheduler 与 lwd_edge_scheduler
@@ -78,18 +80,16 @@ def lwd_try_assemble(engine_core) -> bool:
 
 
 def lwd_shutdown(engine_core) -> None:
-    """core.py shutdown 守卫的路由点:按装配形态关停通道(边 publisher/云 subscriber)。"""
-    from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_assemble import (
-        LwdCloudCore,
-        lwd_cloud_shutdown,
-    )
+    """core.py shutdown 守卫的路由点:边角色通道关停。
+
+    云侧不经此处:step_wrapper 恒为 None(§10.12),关停经原生
+    scheduler.shutdown 钩子转发停桥(相位调度器 shutdown 覆写)。
+    """
     from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import (
         lwd_edge_shutdown,
     )
 
     lwd_edge_shutdown(engine_core)
-    if isinstance(engine_core.step_wrapper, LwdCloudCore):
-        lwd_cloud_shutdown(engine_core.step_wrapper)
 
 
 def lwd_serve_guard(vllm_config) -> None:
