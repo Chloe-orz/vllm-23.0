@@ -1201,7 +1201,22 @@ class WorkerProc:
             if isinstance(method, str):
                 func = getattr(self.worker, method)
             elif isinstance(method, bytes):
-                func = partial(cloudpickle.loads(method), self.worker)
+                try:
+                    func = partial(cloudpickle.loads(method), self.worker)
+                except Exception:
+                    # Diagnostic: a truncated control-RPC payload means the
+                    # shm/sideband message was corrupted or misassembled —
+                    # capture what we actually got before raising.
+                    logger.error(
+                        "[EC-RPC-CORRUPT] local_rank=%d corrupt control RPC: "
+                        "method_len=%d head=%s args_len=%s",
+                        self.local_rank,
+                        len(method),
+                        bytes(method[:48]).hex(),
+                        [len(a) if isinstance(a, (bytes, bytearray)) else None
+                         for a in args],
+                    )
+                    raise
             else:
                 raise TypeError(f"Unsupported RPC method type: {type(method)!r}")
             output = func(*args, **kwargs)
