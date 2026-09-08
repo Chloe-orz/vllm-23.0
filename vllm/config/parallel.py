@@ -106,6 +106,42 @@ class EPLBConfig:
 
 
 @config
+class LwdParallelConfig:
+    """LWD (layerwise disaggregated) parallel-topology config aggregation.
+
+    Aggregates the vLLM-side parallel knobs of an LWD deployment into a
+    single object: the master switch (mirrored from
+    ``additional_config["lwd_config"].enabled``), the edge/cloud process
+    role mirror and the edge/cloud NPU counts (from the LWD CLI flags).
+    ``ParallelConfig`` exposes exactly one field of this type, so no LWD
+    variable is ever scattered across ``ParallelConfig``.
+    """
+
+    enable_lwd: bool = False
+    """LWD master switch (mirror of ``LwdConfig.enabled``)."""
+    is_edge_node: bool = False
+    """Whether this process is the edge side of the LWD deployment
+    (mirror of ``LwdConfig.role == "edge"``)."""
+    edge_npu_count: int = Field(default=0, ge=0)
+    """Total number of edge NPUs across all DP instances (LWD mode)."""
+    cloud_npu_count: int = Field(default=0, ge=0)
+    """Total number of cloud NPUs across all DP instances (LWD mode)."""
+
+    def edge_npu_count_per_dp(self, data_parallel_size: int) -> int:
+        """Per-DP-instance edge NPU count."""
+        return self.edge_npu_count // data_parallel_size
+
+    def cloud_npu_count_per_dp(self, data_parallel_size: int) -> int:
+        """Per-DP-instance cloud NPU count."""
+        return self.cloud_npu_count // data_parallel_size
+
+    def is_shared_model_edge(self, data_parallel_size: int) -> bool:
+        """True when the LWD edge is a single shared rank across all DP
+        instances (one NPU shared by the virtual DP workers)."""
+        return (self.enable_lwd and self.edge_npu_count_per_dp(data_parallel_size) == 1 and data_parallel_size > 1)
+
+
+@config
 class ParallelConfig:
     """Configuration for the distributed execution."""
 
@@ -196,6 +232,12 @@ class ParallelConfig:
 
     enable_elastic_ep: bool = False
     """Enable elastic expert parallelism with stateless NCCL groups for DP/EP."""
+
+    lwd_config: "LwdParallelConfig" = Field(default_factory=LwdParallelConfig)
+    """LWD (layerwise disaggregated) parallel-topology config. Aggregates
+    the master switch, edge/cloud role mirror and NPU counts into one
+    object (see :class:`LwdParallelConfig`); filled in
+    ``VllmConfig.__post_init__``."""
 
     enable_dbo: bool = False
     """Enable dual batch overlap for the model executor."""

@@ -435,6 +435,11 @@ class GPUModelRunner(
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
 
+        # LWD (layerwise disaggregated): edge/cloud role flags for the LWD execution branches.
+        self.lwd_config = getattr(vllm_config, "lwd_config", None)
+        self.enable_lwd = bool(self.lwd_config is not None and self.lwd_config.enabled)
+        self.is_lwd_edge = bool(self.enable_lwd and self.lwd_config.is_edge)
+
         model_config = self.model_config
         cache_config = self.cache_config
         scheduler_config = self.scheduler_config
