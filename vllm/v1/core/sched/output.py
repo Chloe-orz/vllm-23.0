@@ -178,6 +178,29 @@ class CachedRequestData:
 
 
 @dataclass
+class LwdEdgeEmbedChunk:
+    """prefill_only LWD: one chunk of a request's prompt embedding.
+
+    A request's prompt may be split into ``num_chunks`` parts
+    (transport-level chunking for big prompts / TTFT pipelining).  Each
+    chunk is a separate UP message with its own channel seqno; chunks of
+    one request carry contiguous ``token_ids`` slices in ``chunk_idx``
+    order and are reassembled in that order on the cloud side.
+    Non-chunked requests are the degenerate case
+    ``num_chunks == 1, chunk_idx == 0``.
+    """
+    request_id: str
+    seqno: int
+    token_ids: list[int]
+    chunk_idx: int = 0
+    num_chunks: int = 1
+
+    @property
+    def num_tokens(self) -> int:
+        return len(self.token_ids)
+
+
+@dataclass
 class SchedulerOutput:
     # list of the requests that are scheduled for the first time.
     # We cache the request's data in each worker process, so that we don't
@@ -239,6 +262,13 @@ class SchedulerOutput:
     # The worker zeros the corresponding GPU memory before the blocks are used,
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
+
+    # prefill_only LWD data plane: whole-prompt embed requests handed
+    # to the edge worker.  Presence (non-None) IS the batch discriminator —
+    # a SchedulerOutput carrying lwd_edge_embed_chunks is an LWD_EDGE_EMBED batch and
+    # carries no regular scheduling content.  Appended with default so wire
+    # compatibility is preserved for all non-prefill_only modes.
+    lwd_edge_embed_chunks: list["LwdEdgeEmbedChunk"] | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
