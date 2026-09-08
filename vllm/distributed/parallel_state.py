@@ -2084,20 +2084,17 @@ def initialize_model_parallel(
                 group_name="dp",
             )
 
-            # EP: all edge workers one group, all cloud workers another
-            # (same semantics as the legacy edge-cloud layout).
+            # EP: one group per instance (each edge and each cloud gets its
+            # own EP group), consistent with the TP group layout.  All
+            # ranks must call new_group in the same order.
             assert _EP is None, (
                 "expert parallel group is already initialized")
-            ep_edge_ranks = [
-                r for i in registry.edge_ids
-                for r in registry.edge(i).ranks
-            ]
-            ep_cloud_ranks = [
-                r for i in registry.cloud_ids
-                for r in registry.cloud(i).ranks
-            ]
+            ep_groups = ([e.ranks for e in
+                          (registry.edge(i) for i in registry.edge_ids)] +
+                         [c.ranks for c in
+                          (registry.cloud(i) for i in registry.cloud_ids)])
             _EP = init_model_parallel_group(
-                [ep_edge_ranks, ep_cloud_ranks],
+                ep_groups,
                 get_world_group().local_rank,
                 backend,
                 group_name="ep",
