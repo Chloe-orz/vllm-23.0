@@ -12,53 +12,39 @@ from collections.abc import Callable
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.utils.system_utils import set_process_title
-from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
-from vllm.v1.lwd_control.control_communication.lwd_message import (
-    LwdRequestNotify,
-)
+from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_core import LwdCloudCore
 from vllm.v1.lwd_control.control_communication.lwd_control_subscriber import (
     LwdControlSubscriber,
 )
-from vllm.v1.lwd_control.control_scheduler.lwd_cloud_admission import (
-    lwd_cloud_admission_policy,
+from vllm.v1.lwd_control.control_communication.lwd_notify import (
+    LwdRequestNotify,
 )
-from vllm.v1.lwd_control.control_scheduler.lwd_cloud_core import LwdCloudCore
-from vllm.v1.lwd_control.control_scheduler.lwd_cloud_phase_scheduler import (
-    lwd_cloud_scheduler_cls,
-)
-from vllm.v1.lwd_control.control_scheduler.lwd_edge_assemble import (
+from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import (
     LwdConfig,
     is_lwd_prefill_only,
 )
-from vllm.v1.lwd_control.control_scheduler.lwd_step_core import LwdCloudSchedulerView
+from vllm.v1.lwd_control.control_edge_scheduler.lwd_step_core import (
+    LwdCloudSchedulerView,
+)
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
 
 
 class LwdCloudEnginePortAdapter:
-    """云侧端口适配器(§10.3 落位装配文件):step 委托 + abort + 视图。
+    """云侧端口适配器(§10.3 落位装配文件):engine_core 触达 + abort + 视图。
 
-    lwd_step_with_batch_queue 的 wrapper 翻转依赖 step 循环单线程:
-    翻空 -> 调原生体 -> 复位,core.py 守卫因此不会递归回 wrapper(§9.8)。
+    增强步体(lwd_cloud_core.lwd_native_step_bq_prefill_only)直接以
+    engine_core 为入参,不回调原生步体、无 wrapper 翻转(§10.8)。
     台账登记的 engine_core 属性容忍点(§7.3-C5)。
     """
 
     def __init__(self, engine_core) -> None:
         self._engine_core = engine_core
-        self._wrapper = None
 
-    def lwd_bind_wrapper(self, wrapper) -> None:
-        """装配期绑定 step_wrapper 对象,供原生 step 返回后复位委托。"""
-        self._wrapper = wrapper
-
-    def lwd_step_with_batch_queue(self):
-        engine_core = self._engine_core
-        engine_core.step_wrapper = None
-        try:
-            return engine_core.step_with_batch_queue()
-        finally:
-            engine_core.step_wrapper = self._wrapper
+    def lwd_engine_core(self):
+        """增强步体的 EngineCore 触达(LwdCloudCore._process_engine_step 用)。"""
+        return self._engine_core
 
     def lwd_abort_requests(self, request_ids: list[str]) -> None:
         self._engine_core.abort_requests(request_ids)
@@ -117,7 +103,20 @@ def lwd_cloud_try_assemble(engine_core) -> bool:
     config = LwdConfig.from_env_and_config(engine_core.vllm_config)
     if config.is_edge_node:
         return False
+    if engine_core.batch_queue is None:
+        # 无 batch queue 时 step_fn 绑定同步 step(core.py:221),step_wrapper
+        # 守卫(core.py:509)永不触发,云侧 drain 静默失效 —— 装配期 fail-fast
+        # (源装配断言同款:requires the batch queue, max_concurrent_batches > 1)
+        raise RuntimeError(
+            "[Lwd] cloud prefill_only requires the batch queue "
+            "(async_scheduling / max_concurrent_batches > 1)"
+        )
     subscriber = _lwd_cloud_connect_planes(config)
+    # 请求构建唯一交互点绑定给调度器(§10.11):门/暂存/准入均在调度器,
+    # 工厂只负责 Request 构建(违禁 import 容忍点,§7.2)。
+    engine_core.scheduler.lwd_cloud_bind_request_factory(
+        _lwd_cloud_build_request(engine_core)
+    )
     engine_core.step_wrapper = _lwd_cloud_build_core(engine_core, subscriber, config)
     return True
 
@@ -152,50 +151,29 @@ def _lwd_cloud_build_core(
 ) -> LwdCloudCore:
     """装配云侧执行类。
 
-    调度接线:scheduler_cls 经 lwd_cloud_scheduler_cls() 按配置选取
-    (PrefillFirst/DecodeFirst),注入真实 EngineCore 的构造——此后
-    engine_port.lwd_scheduler() 拿到的即相位调度器实例;准入策略经
-    lwd_cloud_admission_policy() 注入,请求构建收进唯一准入交互点。
+    调度接线:scheduler 已在构造期注入(serve 守卫按 (scheduler_name,
+    admission_name) 二维写 scheduler_config.scheduler_cls,相位排批 +
+    相位准入 + 首预告门同体,§10.10/§10.11;request factory 由
+    try_assemble 绑定);本函数只装 step 委托。
     """
-    _lwd_cloud_install_scheduler(engine_core, config)
     port = LwdCloudEnginePortAdapter(engine_core)
-    core = LwdCloudCore(
+    return LwdCloudCore(
         subscriber=subscriber,
-        admission_policy=lwd_cloud_admission_policy(config.admission_name),
         engine_port=port,
-        admit_request=_lwd_cloud_build_admit_request(engine_core),
         settings=config.lwd_step_settings(),
     )
-    port.lwd_bind_wrapper(core)
-    return core
 
 
-def _lwd_cloud_install_scheduler(engine_core, config: LwdConfig) -> None:
-    """以相位调度器整实例替换原生调度器(同边侧装配约束,见 lwd_edge_assemble)。"""
-    vllm_config = engine_core.vllm_config
-    native_scheduler = engine_core.scheduler
-    block_size, hash_block_size = resolve_kv_cache_block_sizes(
-        native_scheduler.kv_cache_config, vllm_config
-    )
-    engine_core.scheduler = lwd_cloud_scheduler_cls(config.scheduler_name)(
-        vllm_config=vllm_config,
-        kv_cache_config=native_scheduler.kv_cache_config,
-        structured_output_manager=engine_core.structured_output_manager,
-        log_stats=engine_core.log_stats,
-        block_size=block_size,
-        hash_block_size=hash_block_size,
-    )
+def _lwd_cloud_build_request(engine_core) -> Callable[[LwdRequestNotify], Request]:
+    """唯一请求构建点:Request 构建/block_hasher 全收于此(§7.3-C1)。
 
-
-def _lwd_cloud_build_admit_request(engine_core) -> Callable[[LwdRequestNotify], None]:
-    """唯一准入交互点:Request 构建/block_hasher 全收于此(§7.3-C1)。
-
-    数据面挂载(prompt_embeds 视图)由数据面落位侧在此对接(§9.12)。
+    数据面挂载(prompt_embeds 视图)由数据面落位侧在此对接(§9.12);
+    产物经调度器 add_request 进首预告门后的暂存/准入(§10.10/§10.11)。
     """
     block_hasher = engine_core.request_block_hasher
 
-    def _admit(wire: LwdRequestNotify) -> None:
-        request = Request(
+    def _build(wire: LwdRequestNotify) -> Request:
+        return Request(
             request_id=wire.request_id,
             # 占位 token:云侧调度只看长度,真值由边侧 embeds 经数据面提供(§9.5)
             prompt_token_ids=[0] * wire.num_prompt_tokens,
@@ -203,6 +181,5 @@ def _lwd_cloud_build_admit_request(engine_core) -> Callable[[LwdRequestNotify], 
             pooling_params=None,
             block_hasher=block_hasher,
         )
-        engine_core.scheduler.add_request(request)
 
-    return _admit
+    return _build

@@ -83,8 +83,8 @@ class LwdEnginePort(Protocol):
         """边侧原生执行提交(同步返回 ModelRunnerOutput,输出内容不消费)。"""
         ...
 
-    def lwd_step_with_batch_queue(self):
-        """云侧委托原生 step(core.py 守卫在位时经 wrapper 翻转防递归)。"""
+    def lwd_engine_core(self):
+        """云侧增强步体的 EngineCore 触达(lwd_cloud_core 步外接口用)。"""
         ...
 
     def lwd_abort_requests(self, request_ids: list[str]) -> None:

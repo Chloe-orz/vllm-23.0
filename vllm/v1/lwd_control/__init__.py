@@ -6,8 +6,8 @@
 (嵌入前向、tag 直传、接收落位、消费释放)不在本目录,由其落位侧经
 既有接缝对接:
   - 边侧:LwdEdgeScheduler.lwd_edge_update_progress(执行量来源)
-  - 云侧:LwdCloudCore._lwd_handle_range_notify(接收登记)/
-    lwd_cloud_assemble._lwd_cloud_build_admit_request(请求侧挂载点)
+  - 云侧:LwdCloudCore._record_chunk_notify(接收登记)/
+    lwd_cloud_assemble._lwd_cloud_build_request(请求侧挂载点)
 
 通信模型(§9):单向 边 -> 云,仅控制面 PRE_OUT
   (notify/add_request/abort,ZMQ PUSH/PULL);无结果面、无水位、无快路径。
@@ -28,15 +28,18 @@
 目录布局(§10.3 支撑折入既有文件,框架不增文件):
   control_communication/(传输层,side-agnostic,只认方向不认边/云;
              侧别与 bind/connect 是装配期 wiring):
-             lwd_message(线上消息 + 编解码,纯协议,§10.7)/
-             lwd_control_communicator(公共基类)
+             lwd_notify(通知定义 + 编解码,纯协议,§10.7)/
+             lwd_control_communicator(纯收发句柄,无线程)
              + lwd_control_publisher(OUTBOUND)/ lwd_control_subscriber(INBOUND)
-  control_scheduler/:     lwd_step_core(step 抽象 + 端口/视图协议 +
-             LwdStepSettings/LwdLog) <- lwd_edge_core / lwd_cloud_core;
-             lwd_edge_scheduler / lwd_cloud_phase_scheduler /
-             lwd_cloud_admission;lwd_edge_assemble(装配 + LwdConfig +
-             模式判定唯一实现 + 边侧适配器)/ lwd_cloud_assemble(装配 +
-             云侧/视图适配器)为 L3(违禁 import 容忍点)
+  control_scheduler/(分组入口,仅包说明)
+  control_edge_scheduler/(边侧):lwd_step_core(step 抽象 + 端口/视图
+             协议 + LwdStepSettings/LwdLog) <- lwd_edge_core;
+             lwd_edge_scheduler;lwd_edge_assemble(装配 + LwdConfig +
+             模式判定唯一实现 + 边侧适配器)为 L3(违禁 import 容忍点)
+  control_cloud_scheduler/(云侧):lwd_cloud_phase_scheduler(相位排批 +
+             相位准入 + 首预告门/控制面功能接口,§10.10/§10.11);
+             lwd_cloud_core(PRE_OUT 泵 + 步体/驱动 + 数据面接缝);
+             lwd_cloud_assemble(装配 + 云侧/视图适配器)为 L3
 
 import 白名单与交互预算(唯一事实源为设计文档 §7/§8.4/§9/§10,
 变更先改台账再改代码;检查脚本 tools/lwd_check_budget.py):
@@ -49,7 +52,7 @@ import 白名单与交互预算(唯一事实源为设计文档 §7/§8.4/§9/§1
   - 例外(台账登记):两个调度器文件可 import vllm.v1.request 的
     RequestStatus——AsyncScheduler 继承面的既有传递依赖,不新增依赖边;
     云装配文件 import Request/SamplingParams(请求构建唯一交互点)
-  - vllm.v1.engine 仅 lwd_message(TYPE_CHECKING
+  - vllm.v1.engine 仅 lwd_notify(TYPE_CHECKING
     re-export:EngineCoreOutputs)
   - vllm.v1.core.sched.*(output/async_scheduler/request_queue)仅两个
     调度器文件;kv_cache_utils 仅两个装配文件(L3)
@@ -64,10 +67,10 @@ from __future__ import annotations
 
 def lwd_try_assemble(engine_core) -> bool:
     """core.py __init__ 尾装配守卫的分流点(§10.1):边角色/云角色各装各的。"""
-    from vllm.v1.lwd_control.control_scheduler.lwd_cloud_assemble import (
+    from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_assemble import (
         lwd_cloud_try_assemble,
     )
-    from vllm.v1.lwd_control.control_scheduler.lwd_edge_assemble import (
+    from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import (
         lwd_edge_try_assemble,
     )
 
@@ -76,11 +79,11 @@ def lwd_try_assemble(engine_core) -> bool:
 
 def lwd_shutdown(engine_core) -> None:
     """core.py shutdown 守卫的路由点:按装配形态关停通道(边 publisher/云 subscriber)。"""
-    from vllm.v1.lwd_control.control_scheduler.lwd_cloud_assemble import (
+    from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_assemble import (
         LwdCloudCore,
         lwd_cloud_shutdown,
     )
-    from vllm.v1.lwd_control.control_scheduler.lwd_edge_assemble import (
+    from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import (
         lwd_edge_shutdown,
     )
 
@@ -90,18 +93,36 @@ def lwd_shutdown(engine_core) -> None:
 
 
 def lwd_serve_guard(vllm_config) -> None:
-    """serve.py run_headless 入口守卫(§10.1):PO 模式角色标记。
+    """serve.py run_headless 入口守卫(§10.1):云角色构造期注入相位调度器。
 
-    控制面装配发生在 EngineCore 进程内(__init__ 尾守卫),云角色由
-    headless 原生路径拉起;运行时底座(parallel_state 角色/executor
-    拓扑)延后(§10.1),本守卫是后续云入口分叉的唯一挂点。
+    位置在 vllm_config 建成之后、任何引擎构造之前 —— 写
+    scheduler_config.scheduler_cls(经源工厂按 (config.scheduler_name,
+    config.admission_name) 二维选类,§10.10;类对象跨进程按模块引用
+    序列化,EngineCore.__init__ core.py:139 get_scheduler_cls 构造期
+    解析),引擎即以相位调度器出生,无需事后整实例替换(§10.8)。
+    边角色不注入:边调度器需 publisher 构造注入,仍走 __init__ 尾
+    lwd_edge_try_assemble。
     """
     from vllm.logger import init_logger
-    from vllm.v1.lwd_control.control_scheduler.lwd_edge_assemble import (
+    from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import (
+        LwdConfig,
         is_lwd_prefill_only,
     )
 
-    if is_lwd_prefill_only(vllm_config):
-        init_logger(__name__).info(
-            "[Lwd] prefill_only mode enabled: engines self-assemble on startup"
-        )
+    if not is_lwd_prefill_only(vllm_config):
+        return
+    config = LwdConfig.from_env_and_config(vllm_config)
+    if config.is_edge_node:
+        return
+    from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_phase_scheduler import (
+        get_pure_phase_scheduler_cls,
+    )
+
+    vllm_config.scheduler_config.scheduler_cls = get_pure_phase_scheduler_cls(
+        config.scheduler_name, config.admission_name
+    )
+    init_logger(__name__).info(
+        "[Lwd] prefill_only cloud: scheduler (%s, %s) injected (construction-time)",
+        config.scheduler_name,
+        config.admission_name,
+    )

@@ -11,9 +11,10 @@ import argparse
 import re
 from pathlib import Path
 
-# 台账例外:文件名 -> 允许的额外 import 片段(正则);布局依 §10.3 折入
+# 台账例外:文件名 -> 允许的额外 import 片段(正则);布局依 §10.3/§10.7
 _LWD_FILE_EXCEPTIONS = {
-    "lwd_control_communicator.py": (r"from vllm\.v1\.engine import",),
+    "lwd_notify.py": (r"from vllm\.v1\.engine import",),
+    "lwd_cloud_core.py": (r"from vllm\.v1\.outputs import",),
     "lwd_edge_scheduler.py": (r"from vllm\.v1\.request import",),
     "lwd_cloud_phase_scheduler.py": (r"from vllm\.v1\.request import",),
     "lwd_edge_assemble.py": (r"from vllm\.v1\.core\.kv_cache_utils import",),
@@ -75,14 +76,22 @@ def check_import_whitelist(lwd_root: Path) -> list[str]:
     return violations
 
 
+_LWD_GETATTR_TOLERANT_FILES = {
+    "lwd_edge_assemble.py",
+    "lwd_cloud_assemble.py",
+    # 源类全方法照搬(§10.8):hint_mq 探测等防御式访问暂存,改造收敛时清零
+    "lwd_cloud_core.py",
+}
+
+
 def check_getattr_budget(lwd_root: Path) -> list[str]:
-    """内核 getattr = 0;装配层(assemble/launch)<=10 且逐处注释。"""
+    """内核 getattr = 0;装配层/照搬移植文件 <=10 且逐处注释。"""
     violations: list[str] = []
     for path in _lwd_iter_files(lwd_root):
         count = len(_LWD_GETATTR_PATTERN.findall(path.read_text(encoding="utf-8")))
         if count == 0:
             continue
-        if path.name.endswith("_assemble.py"):
+        if path.name in _LWD_GETATTR_TOLERANT_FILES:
             if count > _LWD_GETATTR_BUDGET:
                 violations.append(
                     f"{path.name}: getattr {count} > budget {_LWD_GETATTR_BUDGET}"

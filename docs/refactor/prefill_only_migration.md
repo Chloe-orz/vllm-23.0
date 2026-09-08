@@ -588,7 +588,7 @@ class LwdCloudSchedulerView(Protocol):   # 只读快照,3 方法
 | edge_cloud/prefill_only_channel.py(467 行) | control_communication/lwd_control_publisher + lwd_control_subscriber(方向原语,side-agnostic) | 只留 PRE_OUT 单向;POST_OUT/结果面/水位/fast-handler 删除(§9.1);publish 队满返 False(§2.4);线上消息定义收进通信层 |
 | edge_cloud/edge_prefill_dispatcher.py(576 行) | control_scheduler/lwd_edge_scheduler | chunk 状态机/round-robin/两道背压门取消(§9.7/§9.9);分块复用原生 schedule();notify/abort/seqno 并入调度器(§9.12) |
 | edge_cloud/prefill_only_engine_core.py(280 行) | control_scheduler/lwd_edge_core + lwd_edge_assemble | step 四拍改编排;6 个 monkey-patch → core.py in-tree 守卫 + 装配单点开关 |
-| edge_cloud/active_engine_core.py(1074 行) | control_scheduler/lwd_cloud_core + lwd_cloud_admission + lwd_cloud_assemble | ~200 行 step 拷贝经 §9.8 step_wrapper 消解;准入策略独立;进程入口/调度器视图/唯一准入交互点收进装配文件 |
+| edge_cloud/active_engine_core.py(1074 行) | control_scheduler/lwd_cloud_core + lwd_cloud_assemble | ~200 行 step 拷贝经 §9.8 step_wrapper 消解;准入策略族后经 §10.10 收编进相位调度器(原 lwd_cloud_admission.py 删除);进程入口/调度器视图/唯一准入交互点收进装配文件 |
 | edge_cloud/pure_phase_scheduler.py(166 行) | control_scheduler/lwd_cloud_phase_scheduler | 容器交换 + 空步翻转机制保真;prefill_first/decode_first + 工厂 |
 | patch_engine_core.py PO hunk | lwd_edge_assemble(+core.py 守卫) | 挂钩逻辑内聚装配文件 |
 | patch_serve_headless.py PO hunk | lwd_cloud_assemble(+serve.py 守卫) | 同上 |
@@ -644,7 +644,7 @@ lwd_cloud_channel 按侧别命名的文件随之移除。
 | S0 落位准备 | ✅ | 悬空 import 全部修复(30 处包内 import 解析验证);支撑归属按 10.3 定稿;lwd_check_budget 可运行 |
 | S1 通信层 | ✅ | 公共基类 LwdControlCommunicator(线程持 socket/幂等关停/join 2s)+ 线上消息与编解码折入其中;边 publish 队满返 False(默认 1000);云 drain 非阻塞,坏帧同时捕获 DecodeError/ValidationError(msgspec 平行异常类) |
 | S2 边侧控制面 | ✅ | 纯 prefill = 原生 schedule() 全复用(边侧无输出 token,完结当步由 lwd_edge_update_progress 本地终结,decode 分支不可达);notify offset 取调度后回退量;未派发重试按 update_from_output 的拒绝回退同款语义回滚 num_computed;add 预告短退避重试超限告警放行(zombie 兜底) |
-| S3 云侧控制面 | ✅ | 相位调度 = 队列手术复用(decode-ready 暂存/等待队列整体暂存),空步检查先行、单次 super().schedule()(不变量 5);准入策略族 + 工厂;首预告门在 `_lwd_apply_scheduling_policy` 落地(不变量 3);release 三路径唯一实现(不变量 4);zombie 观测 |
+| S3 云侧控制面 | ✅(准入后经 §10.10 收编进调度器) | 相位调度 = 队列手术复用(decode-ready 暂存/等待队列整体暂存),空步检查先行、单次 super().schedule()(不变量 5);准入策略族 + 工厂;首预告门在 `_lwd_apply_scheduling_policy` 落地(不变量 3);release 三路径唯一实现(不变量 4);zombie 观测 |
 | S4 接线 | ✅ | core.py 4 守卫 + serve.py 入口守卫,纯增量 22 行(0 删除);装配分流 lwd_try_assemble/lwd_shutdown/lwd_serve_guard 住 lwd_control/__init__;云装配与 __init__ 尾守卫幂等共存 |
 | S5 验收 | ✅(静态) | ruff check/format 全绿;check_functions 全绿(≤50 行/4 层);lwd_check_budget 全绿;py_compile 全过;线上编解码冒烟通过(往返/tag 联合/默认值/坏帧);vllm-ascend diff = 0 |
 
@@ -665,6 +665,10 @@ lwd_cloud_channel 按侧别命名的文件随之移除。
 
 - `typing.Union` 而非 `X | Y` 定义线上联合(msgspec 解码器全版本路径,noqa UP007);
 - 调度器两文件 import RequestStatus(AsyncScheduler 继承面既有传递依赖);
+  §10.10 后 lwd_cloud_phase_scheduler 增 TYPE_CHECKING Request 注解
+  (staging 池签名);§10.11 后 RequestStatus 升为运行时 import(abort
+  终结状态值)+ TYPE_CHECKING LwdRequestNotify(门池注解,运行时零
+  触达);
 - 调度器装配为 __init__ 尾整实例替换(重建一次前缀缓存管理器);
   kv_connector 在位时降级原生(重建丢握手态);入口期 scheduler_cls
   注入可免重建 —— backlog,随上游接线/数据面落位处理;
@@ -690,3 +694,217 @@ lwd_cloud_channel 按侧别命名的文件随之移除。
 - §2.7 映射表与 §9.9 的 LwdEmbedNotify 等为历史快照,以本节为准;
   LwdRequestNotify 的字段取舍(3 字段瘦身)为唯一无前文出处的实现决策,
   max_tokens=16 为占位,采样参数 additive 待数据面补齐。
+
+### 10.8 云侧调度初版对齐(2026-09-08)
+
+- 目录二次分组:control_scheduler 拆为 control_edge_scheduler /
+  control_cloud_scheduler 两包(原 control_scheduler/ 仅留包说明);
+  重组后 18 处包内 import 修复,预算脚本 vllm.v1.engine 例外键
+  随 §10.7 拆分改指 lwd_message.py。
+- **空步翻转恢复**(源 _force_other_phase 对齐,gap-1):相位调度器
+  schedule() 选相后若出 0-token 空步且另一相有活,置一次性翻转标志,
+  下一步换相;空步照返不重复调 schedule()(不变量 5)。
+- **SeparatePhases 源语义恢复**(gap-2):准入条件由"decode 活跃即挡"
+  改回源定义 —— 调度器完全排空(unfinished == 0)才整批放行;放行
+  截断到 max_num_seqs(经 lwd_cloud_admission_policy 工厂注入,值取
+  scheduler_config;<=0 不截断),溢出留待下一轮排空相。宽松版不保留。
+- **batch_queue fail-fast**(gap-3 前置):lwd_cloud_try_assemble 在云角色
+  装配前断言 engine_core.batch_queue 非空 —— 无 batch queue 时 step_fn
+  绑定同步 step,step_wrapper 守卫(core.py:509)永不触发,drain 静默
+  失效;部署错误在装配期显式崩溃(源装配断言同款)。
+- 0-token 空批预完成 future(源增强 1)仍未落:原生 step(core.py:491)
+  对空批照常派发 worker,fork 血统 runner 回 None 即 core.py:576
+  "unexpected error";触发组合 immediate + KV 压力。处置选项(in-tree
+  守卫 / 限制 immediate 用途 / 真机复现后定)待拍板,见 §10.5-6 之外
+  新增挂账。
+- **门序修正**(等价性审计发现):初版先策略截断再过首预告门,队首
+  未预告请求占满截断名额即卡死准入;改为源同序 —— 先过滤 eligible
+  (pending ∩ 已预告)再交策略,截断只数已预告。
+- **has_work 接线洞(挂账,待拍板)**:原生驱动 has_work(core.py:1228)
+  = engines_running ∨ scheduler.has_requests() ∨ batch_queue,不含 Lwd
+  pending;首请求只经 PRE_OUT 到达时循环停在 input_queue 阻塞等,
+  step_wrapper 永不执行 → 云端聋。源以其自有 busy loop(_has_work 含
+  pending)规避;§9.8"busy loop/has_work 回归原生"在该到达模型下不
+  成立。推荐修法:in-tree 守卫 #6 —— has_work 追加 step_wrapper 非空时
+  的 lwd_has_work()(LwdStepCore 增接口,LwdCloudCore 实现为
+  pending 非空 ∨ 订阅通道有积压),§10.1 守卫计数 5 → 6。
+- **源步接口移植稿(裁剪定稿)**(2026-09-08):源 _native_step_bq_prefill_only
+  → lwd_native_step_bq_prefill_only,**并入 lwd_cloud_core.py 文件尾**
+  (框架不增文件;engine_core 显式入参免 MethodType)。
+  步内保留:空批预完成 future(增强 1,§10.8 挂账项的本体落位)+
+  [PO-RPC] 预检;增强 2(seqnos)/ 增强 3(retain)经确认不需要已剪除
+  —— 两者均为数据面载体,落位时经 SchedulerOutput 扩展另行对接;
+  POST_OUT/水位按 §9.1 裁剪。步外结论:源 _process_engine_step 相对
+  原生(core.py:1267)仅余僵尸日志诊断,水位/POST_OUT/step_index 均可
+  裁 —— **步外直接用原生**(当前接线即如此,Lwd 记账全在 step_wrapper
+  内);lwd_cloud_process_engine_step 已删。scheduler 模块差异已盘点:
+  源 4 文件 426 行(output.py PO 字段族 293/request.py np 缓存 37/
+  scheduler.py 热路径 107/async_scheduler PD guard 21),控制面均不依赖;
+  相位调度器依赖的 is_prefill_chunk 与 skipped_waiting 基线已有,目标仓
+  齐备。函数超 50 行为移植暂态;预算例外 v1.outputs(lwd_cloud_core.py)。
+- **LwdCloudCore 结构镜像源 ActiveEdgeCloudEngineCore**(2026-09-08 定稿):
+  `step_with_batch_queue` = 入口单拍(drain → 准入 → `_process_engine_step`),
+  `_process_engine_step` = 源步外接口替换稿(增强步体 + finished 清理;
+  POST_OUT/水位 §9.1 裁剪,post_step/GIL 让出由外层原生步外承担不重复,
+  返回元组而非源的 bool 以嵌套 step_fn 委托链),增强步体 =
+  `lwd_native_step_bq_prefill_only`。绑定随之定稿:adapter 增
+  `lwd_engine_core()` 访问器,步体不再回调原生步体 → wrapper 翻转/
+  `lwd_bind_wrapper`/端口 `lwd_step_with_batch_queue` 整体移除(协议
+  LwdEnginePort 同步修订);has_work 守卫 #6 挂账仍独立存在。
+- **LwdCloudCore 全方法照搬**(2026-09-08 二次迭代,取代上一条 curated
+  结构):源 ActiveEdgeCloudEngineCore 全部 14 方法
+  (__init__/_try_fast_forward/_record_chunk_notify/_drain_control_plane/
+  _handle_add_request/_handle_abort/_forward_chunk_hint/_forward_drop/
+  _apply_scheduling_policy/_admit/_publish_consumed_watermarks/_has_work/
+  _process_engine_step/run_busy_loop)照搬进 LwdCloudCore,方法名保持源
+  名;另有守卫入口 step_with_batch_queue(drain→准入→步外)与 lwd_stats。
+  12 条照搬差异清单住文件 docstring(消息名映射/chunk_idx→offset==0 门/
+  step_fn 绑定不搬防双步进/步体直调/results 可空注入/水位传输点日志化/
+  fast path 不接/_admit 委托闭包/post_step 与 sleep 不搬防双份/state 两
+  字段版/run_busy_loop 不启用/超 50 行暂态)。旧 curated 方法
+  (_lwd_*族/_notified/_embed_registry)删除;§10.5-4"三路径唯一实现"
+  暂被源双处清理形态取代,由后续收敛。预算:getattr 容忍文件集增
+  lwd_cloud_core.py(源防御式访问暂存,收敛时清零);v1.outputs 例外
+  不变。has_work 守卫 #6 挂账不变。
+- **相位调度器同步照搬**(2026-09-08):lwd_cloud_phase_scheduler.py 整
+  文件替换为源 pure_phase_scheduler.py 照搬版(类名映射
+  PurePhaseSchedulerBase/PrefillFirst*/DecodeFirst* → LwdCloudPhaseScheduler/
+  LwdCloudPrefillFirstScheduler/LwdCloudDecodeFirstScheduler;工厂保留源名
+  get_pure_phase_scheduler_cls,装配层同步改引)。curated 的
+  is_prefill_chunk 工作纯手术版删除 —— 相位语义基线定为源的"按人口分伙"
+  (prefill 步只看 WAITING,decode 步只看 RUNNING,已开动请求的 prefill
+  尾巴在 decode 步续算);native_mix 语义归装配层裁决(不装 = 原生混合,
+  当前装配恒装,配置传 native_mix 会告警回退 prefill_first)。
+- **scheduler 构造期注入定稿**(2026-09-08):云侧相位调度器改由
+  serve 守卫注入 —— `lwd_serve_guard` 在 vllm_config 建成后、引擎构造前
+  写 `scheduler_config.scheduler_cls = <LwdCloudPhaseScheduler 全限定名>`
+  (字符串形式,跨进程序列化安全;上游一等配置,EngineCore.__init__:139
+  get_scheduler_cls 构造期解析)→ 引擎出生即相位调度器。整实例替换
+  (`_lwd_cloud_install_scheduler`)删除:前缀缓存管理器重建与
+  kv_connector 降级两条款随之消失;装配层少一次调度器重建。边角色不
+  注入(LwdEdgeScheduler 需 publisher 构造注入,仍走 __init__ 尾
+  instance swap)。scheduler_name 选类能力保留:守卫经源工厂
+  get_pure_phase_scheduler_cls(config.scheduler_name) 取类对象注入
+  (类按模块引用序列化),prefill_first/decode_first 照常可选。
+
+### 10.9 通信层组合化 + 词根统一 notify(2026-09-08)
+
+组合化重构(问题量化 P1-P5 与行为不变量见
+docs/refactor/lwd_control_communication_composition.md):
+
+- `LwdControlCommunicator` 由模板方法基类(线程持 socket/幂等关停)
+  瘦身为纯收发句柄 send/recv/close/terminate(无线程,单线程亲和);
+  publisher/subscriber 脱离继承,自有线程 + 成员组合。公开 API 不变,
+  消费面零改动。§10.6 S1 行的"公共基类"描述由本节取代。
+- **P5 关停缺陷修正(冒烟实测发现的存量缺陷)**:跨线程 close(0)
+  不唤醒阻塞 recv(macOS/pyzmq 实测),旧"close 即线程唯一退出路径"
+  从未生效——关停 join 必超时、泄漏阻塞线程、context 永不 term。
+  修正:term 是跨线程打断阻塞收发的可靠手段(ETERM);subscriber
+  close→term→join(2s),publisher 哨兵入队→join(2s)→卡死 term 兜底。
+
+词根统一(§10.7 Notify 词根的收尾,"wire"与"message"退场):
+
+- LwdWireMessage → **LwdNotify**(三 Notify 类型的 Union;"wire"本无
+  对应物——线上表示只是 bytes,该类型是解码后的类型联合);
+- lwd_encode_wire/lwd_decode_wire → lwd_encode_notify/lwd_decode_notify,
+  _WIRE_DECODER → _NOTIFY_DECODER;
+- lwd_message.py → **lwd_notify.py**(git mv,历史保留);§10.3 落位结果
+  与 §10.8 预算例外键中的 lwd_message.py 改指 lwd_notify.py(脚本已同步);
+- 冒烟(ipc 端到端):203 条三类型消息 FIFO 保序、drain 取空、双侧关停
+  毫秒级且幂等、无线程泄漏;改名后 ruff/check_functions/lwd_check_budget
+  复跑全绿。
+
+### 10.10 云侧准入收编 scheduler_cls(2026-09-08)
+
+> 依据:prefill_only_core_reuse_scheduler_only_plan §2.3/§4(core 全复用、
+> 调度逻辑唯一归宿 = scheduler_cls);本次只落调度面,step/驱动/传输不动。
+
+- **动机**:EngineCore 侧(源 ActiveEdgeCloudEngineCore → LwdCloudCore)
+  持有准入决策(`_apply_scheduling_policy` + SeparatePhases/Immediate
+  策略族),与"core 零自有调度逻辑"的收敛方向冲突;批次纪律是纯调度
+  知识,归宿是 scheduler_cls。
+- **收编形态**(`lwd_cloud_phase_scheduler.py`):
+  - `LwdCloudPhaseScheduler` 基类增 staging 池 `_staged`(rid -> Request,
+    FIFO;源 pending 池的调度器侧后半段,不计入 unfinished —— 否则释放
+    条件永假);
+  - `add_request` override:separate_phases(默认)进池;immediate 直通
+    super(原生等价);
+  - `_lwd_release_staged()` 释放闸挂 `schedule()` 顶部、先于选相:未满
+    unfinished == 0 不放行;放行截断 max_num_seqs(<=0 不截断),溢出
+    留待下一轮排空相;放行走原生 add_request 全路径(簿记/connector/
+    统计事件不缺);语义逐条对齐源 SeparatePhasesPolicy(gap-2 口径);
+  - `has_requests()` override 含暂存池(排空窗口到达时 schedule 可被
+    驱动,防 staged-only 死等);`finish_requests()` override 对池内
+    请求就地摘除(abort 到达暂存态的清理路径;未入原生簿记,无 KV/
+    队列需释放),按返回契约上抛 (rid, client_index);
+  - 两纪律折叠为类属性 `LWD_CLOUD_IMMEDIATE_ADMISSION`(部署决策 =
+    类身份,经 scheduler_cls 注入,跨进程按模块引用序列化安全,不引
+    partial/动态类);注册表折叠源 BATCH_POLICY_REGISTRY 与准入策略族
+    两张表为 (phase, admission) 二维表,四个具体类
+    (LwdCloud{PrefillFirst,DecodeFirst}{,Immediate}Scheduler),工厂
+    `get_pure_phase_scheduler_cls(name, admission_name)` warn-and-fallback
+    口径不变。
+- **首预告门不进调度器**:chunk-0 就绪判定依赖 PRE_OUT notify(传输层
+  知识),留在 LwdCloudCore 控制面;`_apply_scheduling_policy` 收缩为
+  `_admit_pending`(门内即交调度器,纪律自持);调度器只见"已可跑的
+  请求"。(**已被 §10.11 取代**:门状态与通知处理接口后经用户裁定收编
+  进调度器。)
+- **删除**:`lwd_cloud_admission.py` 整文件(策略族 + 工厂 + admission
+  state);LwdCloudCore 构造的 admission_policy 注入线;装配层
+  `lwd_cloud_admission_policy` 接线(max_num_seqs 由调度器自取
+  scheduler_config,装配不再传值)。
+- **接线**:serve 守卫 `lwd_serve_guard` 改传 (config.scheduler_name,
+  config.admission_name) 二维选类;`edge_cloud_config.admission` 配置键
+  与默认 separate_phases 语义不变。
+- **顺手收敛**:lwd_cloud_core 照搬暂态的 ruff 违例(UP037 引号注解 ×5、
+  F821 幽灵名 CloudResultPublisher → `object | None`,§9.1 裁发布器仅
+  判空)与一处 format 差异;85 行步体函数维持 §10.8 豁免不动。
+- **验证**:ruff check/format、lwd_check_budget、py_compile、
+  check_functions(新改函数)全绿;stub 父类行为冒烟覆盖二维工厂解析/
+  暂存/截断与不截断/排空窗口/未排空不放行/abort 摘除/immediate 直通/
+  未知名回退;运行时单测随 §10.6 backlog 待可运行环境补。
+- **未决承接**:源步体缺失/双步进暂态、has_work 守卫 #6 挂账、空批
+  预检等 step/驱动面项不属本节,按 prefill_only_core_reuse 方案另批
+  落地;数据面挂载点(`_lwd_cloud_build_admit_request`)不变。
+
+### 10.11 控制面功能接口二次收编进调度器(2026-09-08,用户裁定)
+
+> 用户裁定:lwd_cloud_core.py 中与 EngineCore 模块强耦合的逻辑留原文件,
+> 功能类接口全部整合进 lwd_cloud_phase_scheduler.py。**偏离方案 §2.3
+> "chunk-0 门控不进 scheduler、留桥线程 A"的备注,记录在案**;调度器
+> 不触达传输对象与 EngineCore 的底线保持。
+
+- **移入调度器**(`lwd_cloud_phase_scheduler.py`):
+  - 首预告门状态:`_lwd_gate_pending`(rid -> LwdRequestNotify,未过门
+    线上元数据)+ `_lwd_gate_ready`(已收首预告 rid);LwdRequestNotify
+    仅 TYPE_CHECKING 注解,运行时不触达传输对象;
+  - 三类通知处理接口:`lwd_cloud_on_request_notify`(门池暂收 + 乱序
+    防御)/ `lwd_cloud_on_range_notify`(过门即建请求进暂存)/
+    `lwd_cloud_on_abort_notify`(门池就地清理;暂存与已准入走
+    finish_requests,RequestStatus 运行时 import 走调度器台账例外);
+  - 请求工厂绑定:`lwd_cloud_bind_request_factory`(装配层唯一建请求点
+    经此注入;工厂未绑时过门告警留门,不丢请求);
+  - 消费水位推导 `lwd_cloud_publish_consumed_watermarks` 与统计
+    `lwd_cloud_stats`(门池/门标记/暂存规模);
+  - 准入时序由轮询改事件驱动:过门即进暂存池,源每拍轮询 +
+    5s 节流诊断日志随之删除(PRE_OUT 单连接 FIFO,预告后到由乱序
+    防御兜底)。
+- **LwdCloudCore 收敛为 EngineCore 强耦合残部**:PRE_OUT 泵
+  (`_drain_control_plane`:线上语义 offset==0 判首留泵侧,门信号转发
+  调度器接口)、数据面接缝(`_record_chunk_notify` seqno 登记 + hint/
+  drop 转发,§10.1 接缝名同步台账)、步体(`lwd_native_step_bq_prefill_
+  only`)与驱动(`run_busy_loop`/`_has_work`/`_process_engine_step`,
+  has_work 不再含门池 —— 过门即进暂存,has_requests 已覆盖);删除
+  `_try_fast_forward`(死代码,方案 §4 删除项)/`_handle_add_request`/
+  `_admit_pending`/`_admit`/`_publish_consumed_watermarks`/`lwd_stats`。
+- **装配**:`_lwd_cloud_build_admit_request` → `_lwd_cloud_build_request`
+  (只构建 Request,不再代调 add_request),经
+  `lwd_cloud_bind_request_factory` 绑给调度器;LwdCloudCore 构造删
+  admit_request 注入线;§10.1 数据面挂载点条目同步改名。
+- **验证**:ruff check/format、lwd_check_budget、py_compile、
+  check_functions 全绿;stub 冒烟扩展:门池暂收(未过门不进暂存)/
+  过门经工厂进暂存/乱序防御(预告先行)/abort 门池态与暂存态分路径/
+  工厂未绑防御/水位空簿记;运行时单测仍随 §10.6 backlog。
+- **未决承接**:步体/驱动/has_work 守卫 #6/runner 空批契约修复仍属
+  step 面,按 prefill_only_core_reuse 方案另批落地;文件删除(用户
+  诉求终态)待步体面收敛后随 step_wrapper 机制一并评估。

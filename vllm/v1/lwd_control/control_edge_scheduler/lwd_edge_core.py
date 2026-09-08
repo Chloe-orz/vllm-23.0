@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from vllm.v1.lwd_control.control_scheduler.lwd_step_core import (
+from vllm.v1.lwd_control.control_edge_scheduler.lwd_step_core import (
     LwdLog,
     LwdStepCore,
     LwdStepSettings,
@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from vllm.v1.lwd_control.control_communication.lwd_control_communicator import (
         EngineCoreOutputs,
     )
-    from vllm.v1.lwd_control.control_scheduler.lwd_step_core import LwdEnginePort
+    from vllm.v1.lwd_control.control_edge_scheduler.lwd_step_core import LwdEnginePort
 
 
 class LwdEdgeCore(LwdStepCore):

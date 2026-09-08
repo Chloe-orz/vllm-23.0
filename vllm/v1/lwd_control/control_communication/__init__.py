@@ -1,8 +1,9 @@
-"""控制面通信层(传输层,side-agnostic):线上消息 + 生命周期基类 + 方向原语。
+"""控制面通信层(传输层,side-agnostic):通知协议 + 纯收发句柄 + 方向原语。
 
-构成:lwd_message(线上消息与编解码,纯协议,零 zmq/线程)、
-lwd_control_communicator(生命周期基类)、lwd_control_publisher
-(OUTBOUND)、lwd_control_subscriber(INBOUND)。传输层只认方向,
+构成:lwd_notify(通知定义与编解码,纯协议,零 zmq/线程)、
+lwd_control_communicator(ZMQ socket 收发句柄,无线程)、
+lwd_control_publisher(OUTBOUND,自有线程+有界队列)、
+lwd_control_subscriber(INBOUND,自有线程+桥接队列)。传输层只认方向,
 不认边/云;侧别与 bind/connect 是装配期 wiring(control_scheduler 侧
 assemble 文件决定),新增平面/角色互换不触碰本包。
 

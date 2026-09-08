@@ -1,4 +1,4 @@
-"""Lwd 线上消息:仅依赖 msgspec,不携带 tensor(§2.7/§9,控制面专用,§9.12)。
+"""Lwd 控制面通知(notify):仅依赖 msgspec,不携带 tensor(§2.7/§9,控制面专用,§9.12)。
 
 数据面不在本目录范围:notify 只承载调度决策预告,张量传输与落位
 由数据面经既有接缝对接。上游输出类型经本模块 re-export,
@@ -50,16 +50,16 @@ class LwdAbortNotify(msgspec.Struct, gc=False, tag=True):
 
 
 # typing.Union 而非 PEP 604 `|`:msgspec 解码器的全版本支持路径
-LwdWireMessage = Union[LwdRangeNotify, LwdRequestNotify, LwdAbortNotify]  # noqa: UP007
+LwdNotify = Union[LwdRangeNotify, LwdRequestNotify, LwdAbortNotify]  # noqa: UP007
 
-_WIRE_DECODER = msgspec.msgpack.Decoder(LwdWireMessage)
+_NOTIFY_DECODER = msgspec.msgpack.Decoder(LwdNotify)
 
 
-def lwd_encode_wire(message: LwdWireMessage) -> bytes:
-    """线上编码(发布端唯一入口)。"""
+def lwd_encode_notify(message: LwdNotify) -> bytes:
+    """通知编码为传输字节(发布端唯一入口)。"""
     return msgspec.msgpack.encode(message)
 
 
-def lwd_decode_wire(data: bytes) -> LwdWireMessage:
-    """线上解码(订阅端唯一入口);坏帧抛异常,由订阅线程捕获丢弃。"""
-    return _WIRE_DECODER.decode(data)
+def lwd_decode_notify(data: bytes) -> LwdNotify:
+    """传输字节解码为通知(订阅端唯一入口);坏包抛异常,由接收线程捕获丢弃。"""
+    return _NOTIFY_DECODER.decode(data)

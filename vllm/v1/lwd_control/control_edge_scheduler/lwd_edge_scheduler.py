@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.lwd_control.control_communication.lwd_message import (
+from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LwdAbortNotify,
     LwdRangeNotify,
     LwdRequestNotify,

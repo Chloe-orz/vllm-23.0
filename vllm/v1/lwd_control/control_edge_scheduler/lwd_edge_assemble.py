@@ -20,9 +20,11 @@ from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
     LWD_PUBLISH_QUEUE_MAX,
     LwdControlPublisher,
 )
-from vllm.v1.lwd_control.control_scheduler.lwd_edge_core import LwdEdgeCore
-from vllm.v1.lwd_control.control_scheduler.lwd_edge_scheduler import LwdEdgeScheduler
-from vllm.v1.lwd_control.control_scheduler.lwd_step_core import LwdStepSettings
+from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_core import LwdEdgeCore
+from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler import (
+    LwdEdgeScheduler,
+)
+from vllm.v1.lwd_control.control_edge_scheduler.lwd_step_core import LwdStepSettings
 
 logger = init_logger(__name__)
 
