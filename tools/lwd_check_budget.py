@@ -17,12 +17,13 @@ _LWD_FILE_EXCEPTIONS = {
     "lwd_edge_scheduler.py": (r"from vllm\.v1\.request import",),
     "lwd_cloud_phase_scheduler.py": (r"from vllm\.v1\.request import",),
     "lwd_edge_assemble.py": (r"from vllm\.v1\.core\.kv_cache_utils import",),
-    "lwd_cloud_assemble.py": (
+    "lwd_cloud_engine.py": (
         r"from vllm\.v1\.core\.kv_cache_utils import",
         r"from vllm\.v1\.request import",
         r"from vllm\.v1\.outputs import",
         r"from vllm\.sampling_params import",
         r"from vllm\.v1\.engine import",
+        r"from vllm\.v1\.engine\.core import",
     ),
 }
 
@@ -79,7 +80,7 @@ def check_import_whitelist(lwd_root: Path) -> list[str]:
 
 _LWD_GETATTR_TOLERANT_FILES = {
     "lwd_edge_assemble.py",
-    "lwd_cloud_assemble.py",
+    "lwd_cloud_engine.py",
 }
 
 

@@ -1177,7 +1177,12 @@ class EngineCoreProc(EngineCore):
                 parallel_config.data_parallel_size = 1
                 parallel_config.data_parallel_size_local = 1
                 parallel_config.data_parallel_rank = 0
-                engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+                # Lwd prefill-only cloud engine selection: no-op unless the
+                # mode is enabled (vanilla EngineCoreProc elsewhere).
+                from vllm.v1.lwd_control import lwd_resolve_engine_cls
+
+                engine_cls = lwd_resolve_engine_cls(vllm_config) or EngineCoreProc
+                engine_core = engine_cls(*args, engine_index=dp_rank, **kwargs)
 
             assert engine_core is not None
 

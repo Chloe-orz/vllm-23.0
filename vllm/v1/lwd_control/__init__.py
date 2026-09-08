@@ -6,20 +6,25 @@
 (嵌入前向、tag 直传、接收落位、消费释放)不在本目录,由其落位侧经
 既有接缝对接:
   - 边侧:LwdEdgeScheduler.lwd_edge_update_progress(执行量来源)
-  - 云侧:LwdCloudBridge._on_range_notify(接收登记)/
-    lwd_cloud_assemble._lwd_cloud_build_request(请求侧挂载点)
+  - 云侧:LwdCloudEngineCore 的 PRE_OUT 接收泵(首预告门 + 接收登记)/
+    _lwd_build_request(请求侧挂载点)
 
 通信模型(§9):单向 边 -> 云,仅控制面 PRE_OUT
   (notify/add_request/abort,ZMQ PUSH/PULL);无结果面、无水位、无快路径。
 
-扩展模型(§9.8/§10.12):边侧对 EngineCore 的扩展点是 step 接口
+扩展模型(§9.8/§10.12/§10.14):边侧对 EngineCore 的扩展点是 step 接口
   (LwdStepCore <- LwdEdgeCore,装配期赋 EngineCore.step_wrapper,
-  core.py step 守卫委托);云侧零 step 依赖 —— 调度逻辑经构造期
-  scheduler_cls 注入,泵为装配层桥线程,关停经原生 scheduler.shutdown
-  钩子转发停桥。上游接线 additive 守卫(§10.1):core.py 4 处
-  (step_wrapper 字段 / __init__ 尾装配点 / step 顶部守卫 / shutdown 守卫,
-  经本模块 lwd_try_assemble / lwd_shutdown 分流)+ serve.py 入口守卫
-  (lwd_serve_guard)。
+  core.py step 守卫委托);云侧零 step 依赖 —— 引擎经 core.py
+  run_engine_core 类选择点(lwd_resolve_engine_cls)出生即云形态;
+  云侧主线程收发:PRE_OUT 在 run_busy_loop 循环线程经
+  _process_input_queue 覆写直收(空闲阻塞等 PRE_OUT,超时轮询保关停
+  响应),首预告门住引擎子类,门/暂存/调度簿记全单线程化,引擎转
+  Request 直接 scheduler.add_request(调度器只保留准入/排批纪律,
+  免接口绑定),关停经子类 shutdown 覆写关通道。上游接线 additive
+  守卫(§10.1):core.py 5 处(step_wrapper 字段 / __init__ 尾装配点 /
+  step 顶部守卫 / shutdown 守卫,经本模块 lwd_try_assemble /
+  lwd_shutdown 分流;run_engine_core 类选择点,经 lwd_resolve_engine_cls
+  分流)+ serve.py 入口守卫(lwd_serve_guard)。
 
 分块模型(§9.9):不自造分割,复用原生 Scheduler.schedule() 的 chunked
   prefill 决策;边侧纯 prefill = 原生调度 + 完结即本地终结
@@ -38,9 +43,10 @@
              lwd_edge_scheduler;lwd_edge_assemble(装配 + LwdConfig +
              模式判定唯一实现 + 边侧适配器)为 L3(违禁 import 容忍点)
   control_cloud_scheduler/(云侧):lwd_cloud_phase_scheduler(相位排批 +
-             相位准入 + 首预告门/控制面功能接口,§10.10-§10.12);
-             lwd_cloud_assemble(装配 + 空批契约垫片 + PRE_OUT 桥线程
-             + 请求构建)为 L3;lwd_cloud_core 已删(§10.12)
+             相位准入:暂存池/释放闸,§10.10);
+             lwd_cloud_engine(类选择点注入的云 EngineCore 子类:ZMQ
+             收发 + 首预告门 + 请求构建)为 L3;
+             lwd_cloud_assemble/lwd_cloud_core 已删(§10.12/§10.14)
 
 import 白名单与交互预算(唯一事实源为设计文档 §7/§8.4/§9/§10,
 变更先改台账再改代码;检查脚本 tools/lwd_check_budget.py):
@@ -52,31 +58,58 @@ import 白名单与交互预算(唯一事实源为设计文档 §7/§8.4/§9/§1
     env 入口,§7.3-C3;内核收 LwdStepSettings plain 值)
   - 例外(台账登记):两个调度器文件可 import vllm.v1.request 的
     RequestStatus——AsyncScheduler 继承面的既有传递依赖,不新增依赖边;
-    云装配文件 import Request/SamplingParams(请求构建唯一交互点)
+    云引擎文件 import Request/SamplingParams(请求构建唯一交互点)
   - vllm.v1.engine 仅 lwd_notify(TYPE_CHECKING re-export:
-    EngineCoreOutputs)与 lwd_cloud_assemble(运行时:ADD/ABORT 请求
-    元组类型,§10.12)
+    EngineCoreOutputs)与 lwd_cloud_engine(运行时:EngineCoreProc
+    继承 + ADD/ABORT 请求元组类型,§10.14)
   - vllm.v1.core.sched.*(output/async_scheduler/request_queue)仅两个
     调度器文件;kv_cache_utils 仅两个装配文件(L3)
-  - 继承例外共 2 个:lwd_cloud_phase_scheduler 与 lwd_edge_scheduler
-    均继承 AsyncScheduler(§7.5/§9.10);内核不继承 EngineCore,
-    触达一律经两侧装配文件中的端口适配器(台账登记的 engine_core
-    属性容忍点,§7.3-C5)
+  - 继承例外共 3 个:lwd_cloud_phase_scheduler 与 lwd_edge_scheduler
+    均继承 AsyncScheduler(§7.5/§9.10);lwd_cloud_engine 继承
+    EngineCoreProc(§10.14,类选择点注入,装配/触达收进引擎子类自身)
 """
 
 from __future__ import annotations
 
 
 def lwd_try_assemble(engine_core) -> bool:
-    """core.py __init__ 尾装配守卫的分流点(§10.1):边角色/云角色各装各的。"""
-    from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_assemble import (
-        lwd_cloud_try_assemble,
-    )
+    """core.py __init__ 尾装配守卫的分流点(§10.1):仅边角色。
+
+    云侧不经此处(§10.14):run_engine_core 类选择点(lwd_resolve_engine_cls)
+    使云引擎出生即 LwdCloudEngineCore,装配收进子类 __init__。
+    """
     from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import (
         lwd_edge_try_assemble,
     )
 
-    return lwd_edge_try_assemble(engine_core) or lwd_cloud_try_assemble(engine_core)
+    return lwd_edge_try_assemble(engine_core)
+
+
+def lwd_resolve_engine_cls(vllm_config):
+    """core.py run_engine_core 类选择点的分流点(§10.14):云 PO 引擎返回
+    LwdCloudEngineCore(出生即云形态,装配收进子类 __init__),其余返回
+    None(调用方用原生 EngineCoreProc)。边角色不换类,仍走 __init__ 尾
+    lwd_edge_try_assemble。
+    """
+    from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import (
+        LwdConfig,
+        is_lwd_prefill_only,
+    )
+
+    if not is_lwd_prefill_only(vllm_config):
+        return None
+    config = LwdConfig.from_env_and_config(vllm_config)
+    if config.is_edge_node:
+        return None
+    from vllm.logger import init_logger
+    from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_engine import (
+        LwdCloudEngineCore,
+    )
+
+    init_logger(__name__).info(
+        "[Lwd] prefill_only cloud: engine class selected (LwdCloudEngineCore)"
+    )
+    return LwdCloudEngineCore
 
 
 def lwd_shutdown(engine_core) -> None:
@@ -100,8 +133,9 @@ def lwd_serve_guard(vllm_config) -> None:
     config.admission_name) 二维选类,§10.10;类对象跨进程按模块引用
     序列化,EngineCore.__init__ core.py:139 get_scheduler_cls 构造期
     解析),引擎即以相位调度器出生,无需事后整实例替换(§10.8)。
-    边角色不注入:边调度器需 publisher 构造注入,仍走 __init__ 尾
-    lwd_edge_try_assemble。
+    云引擎类由 run_engine_core 的 lwd_resolve_engine_cls 子进程内
+    解析(§10.14),不在此处。边角色不注入:边调度器需 publisher
+    构造注入,仍走 __init__ 尾 lwd_edge_try_assemble。
     """
     from vllm.logger import init_logger
     from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import (

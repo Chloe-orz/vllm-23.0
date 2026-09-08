@@ -995,3 +995,65 @@ docs/refactor/lwd_control_communication_composition.md):
   消息类型不受影响);原方案 §6 清单的哈希逻辑分支(链长校验/续算
   本地/缺失回退)由工厂闭包逐条对齐;真机项 = 边云同源 prefix cache
   命中观察,随 §10.6 backlog。
+
+### 10.14 云侧引擎子类化:lwd_cloud_engine 替代 lwd_cloud_assemble(2026-09-08,用户裁定)
+
+**决策**:云侧从"构造期 scheduler_cls 注入 + 装配层接线"升级为"引擎子类"——
+`LwdCloudEngineCore(EngineCoreProc)` 经 core.py `run_engine_core` 类选择点出生即
+云形态,`lwd_cloud_assemble.py` 整文件删除。引擎子类收敛为五接口、
+`__init__` 两行介入(用户裁定的两段式):`__init__` = super + 两调用
+(空批垫片、ZMQ 装配),`_process_input_queue` 收发接入(三类 PRE_OUT
+消息是协议:request 进门池 / range offset==0 开门 / abort 终结),
+`_lwd_pump_pre_out` 收取分派,`_lwd_build_request` 请求构建。
+动机:装配/引擎态归位、端口适配器消失(出口直接 `self.input_queue` 原生
+marshal)、线程生命周期原生(subscriber 建于 `__init__`,停桥仍经原生
+`scheduler.shutdown` 钩子转发)。数据面接缝(hint/drop 转发)未随迁 ——
+worker `cloud_recv_hint_mq` 本就未接线,接缝随 §9.12 数据面落位时再接。
+
+**上游接线变化**:core.py 新增第 5 处 additive 守卫 —— `run_engine_core`
+类选择点(经本模块 `lwd_resolve_engine_cls` 分流,非 PO/边角色返回 None 用
+原生 `EngineCoreProc`;MoE+DP 走 `DPEngineCoreProc` 分支不换类)。原 4 处
+守卫保留(服务边侧)。注意:spawn 按模块引用 pickle 目标函数,父进程
+monkeypatch 不可达子进程,类选择必须在子进程内做。
+
+**通信层**:subscriber 回归无线程纯句柄 —— `recv_available(timeout)` 阻塞
+至多有消息或超时返回整批;云侧收发移入 run_busy_loop 循环线程
+(`_process_input_queue` 覆写:空闲阻塞等 PRE_OUT 替代原生
+`input_queue.get()`,headless 云无客户端请求,前者才是真实工作源;
+超时轮询保 signal 关停响应)。门/暂存/调度簿记随之全单线程化,调度器
+缺省直进即正确 —— 桥线程、接收回调、sinks marshal、跨线程纪律约束
+整体消失;步执行在途期间 PRE_OUT 缓冲于 zmq socket,下一轮循环消化
+(与桥线程设计的实际处理时机一致)。客户端 UTILITY/EXECUTOR_FAILED
+经 input_queue,空闲期最坏感知延迟 = 空闲轮询超时(0.1s)。
+
+**随之完成的清理**:
+- seqno 注册表旁路(`_po_chunk_seqnos`)删除 —— §10.12 tag 匹配裁决的
+  彻底执行,其"未初始化即 AttributeError 致首预告门永不开"的缺陷随之
+  消除;线上 `LwdRangeNotify.seqno` 与 hint 转发保留(§9.3/§9.12 数据面
+  接缝,worker tag=seqno 匹配用)。
+- 消费水位推导(`lwd_cloud_publish_consumed_watermarks`/`_lwd_consumed_sent`)
+  删除 —— 全仓无调用方的死代码,§9.1"无结果面无水位"裁决的彻底执行。
+
+**装配顺序不变量**:工厂/出口绑定先于订阅通道创建(subscriber 构造即
+启动接收线程,顺序即序,消除"消息先到、工厂未绑"窗口 —— 原 assemble
+"绑定后才 bridge.start()"的零窗口语义保真)。
+
+**台账**:checker 文件例外表 `lwd_cloud_assemble` → `lwd_cloud_engine`
+(新增 `engine.core` 例外:EngineCoreProc 继承);getattr 容忍文件同步换名;
+继承例外 2→3。线程纪律不变:接收线程独占调度器门状态
+(`lwd_cloud_on_*_notify`),调度状态变更一律经 input_queue marshal,
+接收线程不触达 `_staged`/`requests`。
+
+**修订(同日,用户裁定,以本段为准)**:
+1. 空批契约垫片移除 —— 相位调度器刻意空步的崩溃防护挂 runner 侧
+   契约修复(复现表现 = core.py:576 RuntimeError),垫片代码整体删除;
+2. 首预告门/PRE_OUT 处理自调度器迁云引擎子类 `_lwd_pump_pre_out`
+   —— §10.11 的桥线程前提(跨线程触达调度器需接口收编)随主线程化
+   消失,调度器 `bind_*`/`on_*_notify`/`_lwd_promote`/门状态整体删除,
+   只保留 §10.10 准入(暂存池/释放闸)与相位排批;引擎转 Request 后
+   直接 `scheduler.add_request`;
+3. `_lwd_setup_zmq` 收敛为仅建订阅通道(+ 门状态),关停经子类
+   shutdown 覆写关通道;
+4. 通信层 subscriber 回归无线程纯句柄(`recv_available(timeout)`),
+   收发由调用方(循环线程)驱动;步执行在途期间 PRE_OUT 缓冲于
+   zmq socket,下一轮循环消化。

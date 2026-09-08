@@ -1,14 +1,12 @@
 """传输层方向原语:INBOUND 订阅端(side-agnostic)。
 
 边/云身份与 bind/connect 是装配期 wiring(control_scheduler 侧
-assemble 文件决定);本类自有线程接收解码入桥接队列,不关心消息
-来自谁。
+assemble 文件决定);本类无线程,收发由调用方线程驱动 —— recv_available
+阻塞至多有消息或超时,返回整批已解码通知,调用方按消息 tag 分派。
+坏包/垃圾数据丢弃(两者是 msgspec 的平行异常类),其余异常上抛调用方。
 """
 
 from __future__ import annotations
-
-import threading
-from collections import deque
 
 import msgspec
 import zmq
@@ -26,48 +24,32 @@ logger = init_logger(__name__)
 
 
 class LwdControlSubscriber:
-    """控制面订阅端;元数据阻塞等待绝不丢,消息统一由主循环 drain 处理。"""
+    """控制面订阅端;元数据阻塞等待绝不丢,由调用方决定阻塞位置。"""
 
     def __init__(self, endpoint: str, *, bind: bool) -> None:
         self._closed = False
-        self._messages: deque[LwdNotify] = deque()
-        self._lock = threading.Lock()
-        self._communicator = LwdControlCommunicator(endpoint, zmq.PULL, bind=bind)
-        self._thread = threading.Thread(
-            target=self._receive_thread, name="lwd-subscriber", daemon=True
-        )
-        # 线程最后启动:全部自有状态就绪后才开始接收
-        self._thread.start()
+        self._socket = LwdControlCommunicator(endpoint, zmq.PULL, bind=bind)
 
-    def drain(self) -> list[LwdNotify]:
-        """非阻塞取走积压消息(保持到达序),由调用方按消息 tag 分派。"""
-        with self._lock:
-            taken = list(self._messages)
-            self._messages.clear()
-        return taken
+    def recv_available(self, timeout: float) -> list[LwdNotify]:
+        """阻塞至多有消息或超时(s,0 = 非阻塞),返回整批通知(到达序)。"""
+        if timeout > 0 and not self._socket.poll(int(timeout * 1000)):
+            return []
+        messages: list[LwdNotify] = []
+        while True:
+            try:
+                data = self._socket.recv(block=False)
+            except zmq.Again:
+                break
+            try:
+                messages.append(lwd_decode_notify(data))
+            except (msgspec.DecodeError, msgspec.ValidationError):
+                logger.warning("[Lwd] drop malformed PRE_OUT notify")
+        return messages
 
     def shutdown(self) -> None:
-        """关停(幂等):close 释放 fd -> term 打断阻塞 recv -> join(2s) 收尸。"""
+        """关停(幂等):close 释放 fd,terminate 回收 ctx。"""
         if self._closed:
             return
         self._closed = True
-        self._communicator.close()
-        # close(0) 不保证唤醒跨线程阻塞 recv(实测 macOS 不唤醒):
-        # term 使 recv 以 ETERM 返回,是唯一可靠的打断手段
-        self._communicator.terminate()
-        self._thread.join(timeout=2.0)
-
-    def _receive_thread(self) -> None:
-        while True:
-            try:
-                data = self._communicator.recv()
-                message = lwd_decode_notify(data)
-            except zmq.ZMQError:
-                # close 后再 recv / term 打断(ETERM)均走此退出
-                break
-            except (msgspec.DecodeError, msgspec.ValidationError):
-                # 坏包/垃圾数据丢弃(两者是 msgspec 的平行异常类)
-                logger.warning("[Lwd] drop malformed PRE_OUT notify")
-                continue
-            with self._lock:
-                self._messages.append(message)
+        self._socket.close()
+        self._socket.terminate()

@@ -1,15 +1,12 @@
-"""源 pure_phase_scheduler.py 全文件照搬(§10.8)+ 相位准入收编(§10.10)
-+ 控制面功能接口二次收编(§10.11)。
+"""源 pure_phase_scheduler.py 全文件照搬(§10.8)+ 相位准入收编(§10.10)。
 
 = 纯相位批次策略:prefill 与 decode 不混批,相位优先级是部署决策
 (prefill_first / decode_first)。相位准入(separate_phases / immediate)
 自源 ActiveEdgeCloudEngineCore._apply_scheduling_policy + 准入策略族收编:
 add_request 进暂存池,schedule() 顶部过释放闸(调度器完全排空才整批
-放行)。首预告门(chunk-0 就绪)与 PRE_OUT 三类通知的调度侧处理经
-lwd_cloud_on_*_notify 接口收编(§10.11 用户裁定,偏离方案 §2.3"门留
-桥线程"备注):LwdCloudCore 泵做线上语义(offset==0 判首)后转发,
-过门请求经装配层 request factory 建请求进暂存池 —— 调度器不触达
-传输对象与 EngineCore。
+放行)。§10.14 主线程化后,首预告门与 PRE_OUT 处理属线上语义,住云引擎
+子类(lwd_cloud_engine);本调度器只保留调度纪律 —— 暂存池/释放闸与
+纯相位排批,不含任何控制面接口。
 
 照搬差异清单:
   1. 类名映射:PurePhaseSchedulerBase / PrefillFirstPurePhaseScheduler /
@@ -26,12 +23,9 @@ lwd_cloud_on_*_notify 接口收编(§10.11 用户裁定,偏离方案 §2.3"门�
      排空相;immediate 即 staging 直通(原生等价),两纪律折叠为类属性
      LWD_CLOUD_IMMEDIATE_ADMISSION(部署决策 = 类身份,经 scheduler_cls
      注入,跨进程按模块引用序列化安全);
-  5. 控制面功能接口自 LwdCloudCore 移入(§10.11):首预告门状态、
-     请求/预告/abort 三处理接口、消费水位推导、统计;
-  6. 桥线程侧注入(§10.12):提升出口/abort 出口经 lwd_cloud_bind_bridge
-     绑定(缺省直进,调度状态变更 marshal 到循环线程,泵线程只碰门);
-     shutdown() 覆写转发停桥(原生 scheduler.shutdown 钩子,core.py 零
-     改动);LwdCloudCore 整文件删除,泵与数据面接缝迁装配层桥线程。
+  5. §10.11 控制面功能接口收编已被 §10.14 取代:首预告门/请求工厂/
+     出口绑定迁云引擎子类(主线程收发,免 marshal),本文件零控制面
+     接口、零控制面状态。
 """
 
 from __future__ import annotations
@@ -46,11 +40,8 @@ from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.request import RequestStatus
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Iterable
 
-    from vllm.v1.lwd_control.control_communication.lwd_notify import (
-        LwdRequestNotify,
-    )
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -72,19 +63,6 @@ class LwdCloudPhaseScheduler(AsyncScheduler):
         # 请求在此等排空窗口,未进原生簿记(self.requests 不可见,源
         # pending 池同义),故不计入 unfinished —— 否则释放条件永假。
         self._staged: OrderedDict[str, Request] = OrderedDict()
-        # 首预告门状态(§10.11 自 LwdCloudCore 移入):_lwd_gate_pending
-        # 收未过门的线上请求元数据,_lwd_gate_ready 记已收首预告的 rid。
-        self._lwd_gate_pending: OrderedDict[str, LwdRequestNotify] = OrderedDict()
-        self._lwd_gate_ready: set[str] = set()
-        # 请求工厂(装配层绑定):线上元数据 -> Request(L3 唯一建请求点)
-        self._lwd_request_factory: Callable | None = None
-        # 桥线程侧注入(§10.12,缺省 = 单线程直进/自终结,供直连形态与单测):
-        # 提升出口与 abort 出口把调度状态变更 marshal 到循环线程,桥线程只碰门。
-        self._lwd_admit_sink: Callable | None = None
-        self._lwd_abort_sink: Callable | None = None
-        self._lwd_bridge_stop: Callable | None = None
-        # 消费水位簿记(§9.1 裁:传输点未接,推导保留待回接)
-        self._lwd_consumed_sent: dict[str, int] = {}
 
     # ------------------------------------------------------------------ #
     # Phase primitives                                                    #
@@ -131,7 +109,7 @@ class LwdCloudPhaseScheduler(AsyncScheduler):
         raise NotImplementedError
 
     # ------------------------------------------------------------------ #
-    # Phase admission(收编自源准入策略族)                                #
+    # 相位准入(收编自源准入策略族)                                      #
     # ------------------------------------------------------------------ #
     def _lwd_release_staged(self) -> None:
         """separate_phases 释放闸:调度器完全排空才整批放行。
@@ -178,104 +156,6 @@ class LwdCloudPhaseScheduler(AsyncScheduler):
         staged_ids = [rid for rid in self._staged if rid in staged_hits]
         finished = [(rid, self._staged.pop(rid).client_index) for rid in staged_ids]
         return finished + super().finish_requests(native_ids, finished_status)
-
-    # ------------------------------------------------------------------ #
-    # 控制面功能接口(§10.11 自 LwdCloudCore 移入;泵侧做线上语义)        #
-    # ------------------------------------------------------------------ #
-    def lwd_cloud_bind_request_factory(
-        self, factory: Callable[[LwdRequestNotify], Request]
-    ) -> None:
-        """绑定请求工厂(装配层唯一建请求点,Request/SamplingParams 留 L3)。"""
-        self._lwd_request_factory = factory
-        logger.info("[Lwd] cloud request factory bound")
-
-    def lwd_cloud_on_request_notify(self, wire: LwdRequestNotify) -> None:
-        """请求预告:未过门先住门池;首预告已先行(乱序防御)则即过门。"""
-        rid = wire.request_id
-        if rid in self._lwd_gate_pending or rid in self._staged:
-            logger.warning("[Lwd] duplicate request metadata %s ignored", rid)
-            return
-        self._lwd_gate_pending[rid] = wire
-        if rid in self._lwd_gate_ready:
-            self._lwd_promote(rid)
-
-    def lwd_cloud_on_range_notify(self, request_id: str) -> None:
-        """首预告就绪(offset==0 由泵侧判定):过门即建请求进暂存/准入。"""
-        self._lwd_gate_ready.add(request_id)
-        if request_id in self._lwd_gate_pending:
-            self._lwd_promote(request_id)
-
-    def lwd_cloud_on_abort_notify(self, request_id: str) -> None:
-        """abort 预告:门池/门标记就地清理(桥线程独占);暂存与已准入的
-        终结经 abort 出口 marshal 到循环线程走 finish_requests(原生分发)。"""
-        if self._lwd_gate_pending.pop(request_id, None) is not None:
-            logger.info("[Lwd] cloud aborted pending request %s", request_id)
-        self._lwd_gate_ready.discard(request_id)
-        if self._lwd_abort_sink is not None:
-            self._lwd_abort_sink(request_id)
-        else:
-            self.finish_requests([request_id], RequestStatus.FINISHED_ABORTED)
-
-    def lwd_cloud_bind_bridge(
-        self, admit_sink: Callable, abort_sink: Callable, stop: Callable
-    ) -> None:
-        """绑定桥线程侧注入:提升出口/abort 出口/停桥句柄(§10.12)。"""
-        self._lwd_admit_sink = admit_sink
-        self._lwd_abort_sink = abort_sink
-        self._lwd_bridge_stop = stop
-        logger.info("[Lwd] cloud bridge bound to scheduler")
-
-    def lwd_cloud_control_plane_bound(self) -> bool:
-        """幂等判据:控制面是否已绑定到本调度器(装配期防重复装配)。"""
-        return self._lwd_request_factory is not None
-
-    def shutdown(self) -> None:
-        """关停转发:云形态下桥线程经原生 scheduler.shutdown 钩子收到停机。"""
-        if self._lwd_bridge_stop is not None:
-            self._lwd_bridge_stop()
-            self._lwd_bridge_stop = None
-        super().shutdown()
-
-    def _lwd_promote(self, request_id: str) -> None:
-        """过门:工厂建请求经提升出口交暂存/准入(缺省直进 add_request)。"""
-        if self._lwd_request_factory is None:
-            logger.warning("[Lwd] request factory unbound, %s stays gated", request_id)
-            return
-        wire = self._lwd_gate_pending.pop(request_id)
-        if self._lwd_admit_sink is not None:
-            self._lwd_admit_sink(self._lwd_request_factory(wire))
-        else:
-            self.add_request(self._lwd_request_factory(wire))
-        logger.info("[Lwd] cloud gated request %s admitted", request_id)
-
-    def lwd_cloud_stats(self) -> dict[str, int]:
-        """只读观测:首预告门与暂存池规模。"""
-        return {
-            "lwd_gate_pending": len(self._lwd_gate_pending),
-            "lwd_gate_ready": len(self._lwd_gate_ready),
-            "lwd_staged": len(self._staged),
-        }
-
-    def lwd_cloud_publish_consumed_watermarks(self) -> None:
-        """消费水位推导(§9.1 裁:传输点未接,upto 推导保留待回接)。"""
-        chunk_size = self.scheduler_config.max_num_batched_tokens
-        sent = self._lwd_consumed_sent
-        for rid, request in self.requests.items():
-            n_prompt = request.num_prompt_tokens
-            if request.num_computed_tokens >= n_prompt:
-                upto = (n_prompt + chunk_size - 1) // chunk_size - 1
-            else:
-                upto = request.num_computed_tokens // chunk_size - 1
-            if upto < 0:
-                continue
-            last = sent.get(rid, -1)
-            if upto > last:
-                sent[rid] = upto
-                logger.debug(
-                    "[Lwd] watermark rid=%s upto=%s (transport cut, §9.1)",
-                    rid,
-                    upto,
-                )
 
     # ------------------------------------------------------------------ #
     # Entry point                                                         #
