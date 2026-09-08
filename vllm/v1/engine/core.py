@@ -352,6 +352,15 @@ class EngineCore:
         `request_wave`: indicate which wave of requests this is expected to
         belong to in DP case
         """
+        # Lwd prefill-only: single handoff to the edge scheduler — boundary
+        # validation before the request enters the scheduler, the request
+        # notify to the cloud right after (sole control-plane exit, §9.12).
+        # Native entry checks (pooling task, kv_transfer) are subsumed:
+        # both modes are rejected by the edge boundary.
+        if self.step_wrapper is not None:
+            self.scheduler.lwd_edge_add_request(request)  # type: ignore[attr-defined]
+            return
+
         # Validate the request_id type.
         if not isinstance(request.request_id, str):
             raise TypeError(
@@ -385,6 +394,12 @@ class EngineCore:
 
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""
+
+        # Lwd prefill-only: forward the abort to the cloud before native
+        # cleanup (sole control-plane exit, §9.12); in-flight isends cannot
+        # be withdrawn, the cloud discards the extras on finish (§14.7).
+        if self.step_wrapper is not None:
+            self.scheduler.lwd_edge_abort(request_ids)  # type: ignore[attr-defined]
 
         # TODO: The scheduler doesn't really need to know the
         # specific finish reason, TBD whether we propagate that
@@ -454,6 +469,10 @@ class EngineCore:
         Returns tuple of outputs and a flag indicating whether the model
         was executed.
         """
+        # Lwd prefill-only: same delegation as step_with_batch_queue — this
+        # path is selected when batch_queue is None (step_fn wiring).
+        if self.step_wrapper is not None:
+            return self.step_wrapper.step_with_batch_queue()
 
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
