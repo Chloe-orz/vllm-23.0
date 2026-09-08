@@ -2,11 +2,12 @@
 lwd_cloud_assemble 装配层)。
 
 接入点只有一个:覆写原生 socket IO 线程入口 process_input_sockets ——
-父类原版照跑(super 引用,前端消息零复制零改动),本线程跑边侧
-PRE_OUT 循环。两类消息都汇入 input_queue(多生产者-单消费者):
-父类线程产前端消息,本线程产 (ADD, (Request, 0)) / (ABORT, [rid]) ——
+父线程照跑父类原版(前端消息零复制零改动),PRE_OUT 循环独立成
+lwd-pre-out 专属线程,通道与门状态在该线程内先建后用(无线程竞态)。
+两类消息都汇入 input_queue(多生产者-单消费者):
+父类线程产前端消息,PRE_OUT 线程产 (ADD, (Request, 0)) / (ABORT, [rid]) ——
 主循环 _handle_client_request 原生分发,零改动。
-空闲唤醒由原生机制自然解决:IO 线程阻塞在 zmq 上,消息转成 ADD 塞进
+空闲唤醒由原生机制自然解决:PRE_OUT 线程阻塞在 zmq 上,消息转成 ADD 塞进
 input_queue,主循环的 input_queue.get() 随即被唤醒 —— 无轮询、无
 空闲切换、core.py 零改动。
 
@@ -47,10 +48,6 @@ logger = init_logger(__name__)
 class LwdCloudEngineCore(EngineCoreProc):
     """云 PO 引擎:覆写 socket IO 线程入口,其余全走原生。"""
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self._lwd_setup_zmq()
-
     def _lwd_setup_zmq(self) -> None:
         """介入 ZMQ:边侧订阅通道(bind)+ 首预告门状态。"""
         self._lwd_subscriber = LwdControlSubscriber(
@@ -71,14 +68,25 @@ class LwdCloudEngineCore(EngineCoreProc):
         identity: bytes,
         ready_event: threading.Event,
     ) -> None:
-        """原生 IO 线程入口的云侧版:父类原版照跑(super 引用),本线程
-        跑边侧 PRE_OUT 循环 —— 两个生产者共用 input_queue。"""
+        """原生 IO 线程入口的云侧版:父线程照跑父类原版,PRE_OUT 循环
+        独立成线程 —— 两个生产者共用 input_queue。"""
         threading.Thread(
-            target=super().process_input_sockets,
-            args=(input_addresses, coord_input_address, identity, ready_event),
-            daemon=True,
-            name="frontend-input-sockets",
+            target=self._lwd_pre_out_loop, daemon=True, name="lwd-pre-out"
         ).start()
+        super().process_input_sockets(
+            input_addresses, coord_input_address, identity, ready_event
+        )
+
+    def _lwd_pre_out_loop(self) -> None:
+        """边侧 PRE_OUT 接收循环:subscriber 与门状态在本线程内先建后用,
+        无构造期竞态,socket 建用同线程(zmq 单线程亲和);建站失败经
+        EXECUTOR_FAILED 通道升级为引擎致命错误,不静默降级。"""
+        try:
+            self._lwd_setup_zmq()
+        except Exception:
+            logger.exception("[Lwd] cloud PRE_OUT setup failed")
+            self.input_queue.put_nowait((EngineCoreRequestType.EXECUTOR_FAILED, b""))
+            return
         while (msg := self._lwd_subscriber.recv()) is not None:
             self._lwd_dispatch(msg)
 
