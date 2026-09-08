@@ -2025,10 +2025,12 @@ def initialize_model_parallel(
                 group_name="tp",
             )
 
-            # PP groups: per (edge, cloud) pair = [edge_npu0, cloud_npu0];
-            # every other rank gets a singleton group.  All ranks must call
-            # new_group in the same order, so emit pair groups in sorted
-            # order first, then singletons for the remaining ranks.
+            # PP groups: per (edge, cloud) pair.  Multi-edge: edge e pairs
+            # with cloud rank (e % cloud_npu_count), spreading the P2P
+            # communicators across cloud cards instead of pinning every pair
+            # on cloud rank0 (per-card communicator limit / head-of-line
+            # blocking suspect in the multi-edge hang).  Pairs are disjoint,
+            # so each rank's default PP group is its own pair (no overlap).
             assert _PP is None, (
                 "pipeline model parallel group is already initialized")
             pair_rank_sets: list[list[int]] = []
@@ -2036,7 +2038,8 @@ def initialize_model_parallel(
             for e_id in registry.edge_ids:
                 for c_id in registry.cloud_ids:
                     e0 = registry.edge(e_id).ranks[0]
-                    c0 = registry.cloud(c_id).ranks[0]
+                    _cloud_ranks = registry.cloud(c_id).ranks
+                    c0 = _cloud_ranks[e_id % len(_cloud_ranks)]
                     pair_rank_sets.append([e0, c0])
                     paired.add(e0)
                     paired.add(c0)
