@@ -42,7 +42,6 @@ class LwdConfig:
     pre_out_host: str = "127.0.0.1"
     pre_out_port: int = LWD_PRE_OUT_PORT_DEFAULT
     scheduler_name: str = "prefill_first"
-    admission_name: str = "separate_phases"
     publish_queue_max: int = LWD_PUBLISH_QUEUE_MAX
     zombie_log_interval_s: float = 30.0
     debug: bool = False
@@ -66,7 +65,6 @@ class LwdConfig:
             pre_out_host=str(section.get("pre_out_host", "127.0.0.1")),
             pre_out_port=int(section.get("pre_out_port", LWD_PRE_OUT_PORT_DEFAULT)),
             scheduler_name=str(section.get("scheduler", "prefill_first")),
-            admission_name=str(section.get("admission", "separate_phases")),
             publish_queue_max=int(
                 section.get("publish_queue_max", LWD_PUBLISH_QUEUE_MAX)
             ),
@@ -102,7 +100,6 @@ def _lwd_apply_env_overrides(config: LwdConfig) -> LwdConfig:
         pre_out_host=host if host else config.pre_out_host,
         pre_out_port=port if port is not None else config.pre_out_port,
         scheduler_name=config.scheduler_name,
-        admission_name=config.admission_name,
         publish_queue_max=config.publish_queue_max,
         zombie_log_interval_s=config.zombie_log_interval_s,
         debug=config.debug or (debug is not None and debug.lower() == "1"),

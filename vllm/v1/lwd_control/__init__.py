@@ -16,15 +16,16 @@
   (LwdStepCore <- LwdEdgeCore,装配期赋 EngineCore.step_wrapper,
   core.py step 守卫委托);云侧零 step 依赖 —— 引擎经 core.py
   run_engine_core 类选择点(lwd_resolve_engine_cls)出生即云形态;
-  云侧主线程收发:PRE_OUT 在 run_busy_loop 循环线程经
-  _process_input_queue 覆写直收(空闲阻塞等 PRE_OUT,超时轮询保关停
-  响应),首预告门住引擎子类,门/暂存/调度簿记全单线程化,引擎转
-  Request 直接 scheduler.add_request(调度器只保留准入/排批纪律,
-  免接口绑定),关停经子类 shutdown 覆写关通道。上游接线 additive
-  守卫(§10.1):core.py 5 处(step_wrapper 字段 / __init__ 尾装配点 /
-  step 顶部守卫 / shutdown 守卫,经本模块 lwd_try_assemble /
-  lwd_shutdown 分流;run_engine_core 类选择点,经 lwd_resolve_engine_cls
-  分流)+ serve.py 入口守卫(lwd_serve_guard)。
+  云侧收发接入点 = 覆写原生 socket IO 线程入口 process_input_sockets
+  (super 引用父类原版照跑,core.py 零改动):本线程跑边侧 PRE_OUT
+  循环,过门请求转 Request 投 input_queue 走原生 ADD/ABORT 分发
+  (_handle_client_request 零改动);首预告门住引擎子类、归该 IO 线程
+  独占,调度器只经 input_queue 被主循环碰,空闲唤醒由原生机制自然
+  解决(IO 线程 put ADD 唤醒主循环的 input_queue.get()),无轮询。
+  上游接线 additive 守卫(§10.1):core.py 3 处(step_wrapper 字段 /
+  __init__ 尾装配点 / step 顶部守卫 / shutdown 守卫,经本模块
+  lwd_try_assemble / lwd_shutdown 分流;run_engine_core 类选择点,
+  经 lwd_resolve_engine_cls 分流)+ serve.py 入口守卫(lwd_serve_guard)。
 
 分块模型(§9.9):不自造分割,复用原生 Scheduler.schedule() 的 chunked
   prefill 决策;边侧纯 prefill = 原生调度 + 完结即本地终结
@@ -42,8 +43,8 @@
              协议 + LwdStepSettings/LwdLog) <- lwd_edge_core;
              lwd_edge_scheduler;lwd_edge_assemble(装配 + LwdConfig +
              模式判定唯一实现 + 边侧适配器)为 L3(违禁 import 容忍点)
-  control_cloud_scheduler/(云侧):lwd_cloud_phase_scheduler(相位排批 +
-             相位准入:暂存池/释放闸,§10.10);
+  control_cloud_scheduler/(云侧):lwd_cloud_phase_scheduler(纯相位
+             排批;准入固定 immediate 直进,§10.10/§10.14);
              lwd_cloud_engine(类选择点注入的云 EngineCore 子类:ZMQ
              收发 + 首预告门 + 请求构建)为 L3;
              lwd_cloud_assemble/lwd_cloud_core 已删(§10.12/§10.14)
@@ -129,8 +130,8 @@ def lwd_serve_guard(vllm_config) -> None:
     """serve.py run_headless 入口守卫(§10.1):云角色构造期注入相位调度器。
 
     位置在 vllm_config 建成之后、任何引擎构造之前 —— 写
-    scheduler_config.scheduler_cls(经源工厂按 (config.scheduler_name,
-    config.admission_name) 二维选类,§10.10;类对象跨进程按模块引用
+    scheduler_config.scheduler_cls(经源工厂按 config.scheduler_name
+    一维选类,准入固定 immediate,§10.14;类对象跨进程按模块引用
     序列化,EngineCore.__init__ core.py:139 get_scheduler_cls 构造期
     解析),引擎即以相位调度器出生,无需事后整实例替换(§10.8)。
     云引擎类由 run_engine_core 的 lwd_resolve_engine_cls 子进程内
@@ -153,10 +154,9 @@ def lwd_serve_guard(vllm_config) -> None:
     )
 
     vllm_config.scheduler_config.scheduler_cls = get_pure_phase_scheduler_cls(
-        config.scheduler_name, config.admission_name
+        config.scheduler_name
     )
     init_logger(__name__).info(
-        "[Lwd] prefill_only cloud: scheduler (%s, %s) injected (construction-time)",
+        "[Lwd] prefill_only cloud: scheduler %s injected (construction-time)",
         config.scheduler_name,
-        config.admission_name,
     )

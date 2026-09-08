@@ -1047,13 +1047,24 @@ monkeypatch 不可达子进程,类选择必须在子进程内做。
 **修订(同日,用户裁定,以本段为准)**:
 1. 空批契约垫片移除 —— 相位调度器刻意空步的崩溃防护挂 runner 侧
    契约修复(复现表现 = core.py:576 RuntimeError),垫片代码整体删除;
-2. 首预告门/PRE_OUT 处理自调度器迁云引擎子类 `_lwd_pump_pre_out`
-   —— §10.11 的桥线程前提(跨线程触达调度器需接口收编)随主线程化
-   消失,调度器 `bind_*`/`on_*_notify`/`_lwd_promote`/门状态整体删除,
-   只保留 §10.10 准入(暂存池/释放闸)与相位排批;引擎转 Request 后
-   直接 `scheduler.add_request`;
-3. `_lwd_setup_zmq` 收敛为仅建订阅通道(+ 门状态),关停经子类
-   shutdown 覆写关通道;
-4. 通信层 subscriber 回归无线程纯句柄(`recv_available(timeout)`),
-   收发由调用方(循环线程)驱动;步执行在途期间 PRE_OUT 缓冲于
-   zmq socket,下一轮循环消化。
+2. 首预告门/PRE_OUT 处理自调度器迁云引擎子类 —— §10.11 的桥线程
+   前提(跨线程触达调度器需接口收编)消失,调度器
+   `bind_*`/`on_*_notify`/`_lwd_promote`/门状态整体删除,
+   只保留 §10.10 准入(暂存池/释放闸)与相位排批;
+3. `_lwd_setup_zmq` 收敛为仅建订阅通道(+ 门状态);
+4. 通信层 subscriber 回归无线程纯句柄(阻塞 `recv()` 一条解码一条);
+5. **接收驱动点定稿(最终形态)**:core.py 零改动(`_process_input_queue`
+   与 `process_input_sockets` 均保持原生)—— 引擎子类覆写原生
+   socket IO 线程入口 `process_input_sockets`,super 引用父类原版
+   照跑(前端消息零复制),本线程跑边侧 PRE_OUT 循环,过门请求转
+   Request 投 input_queue 走原生 `(ADD, (request, 0))` /
+   `(ABORT, [rid])` 分发(`_handle_client_request` 零改动)。空闲唤醒
+   由原生机制自然解决(IO 线程 put ADD 唤醒主循环的
+   `input_queue.get()`),无轮询、无空闲切换。门归该 IO 线程独占,
+   调度器只经 input_queue 被主循环碰。
+6. **准入收敛 immediate(用户裁定,最终形态)**:separate_phases
+   准入族(暂存池/释放闸/`add_request`/`has_requests`/`finish_requests`
+   覆写/`LWD_CLOUD_IMMEDIATE_ADMISSION` 开关/Immediate 对照子类)
+   整体删除 —— 引擎过门即投 input_queue,原生 `add_request` 随到随
+   调度;调度器只剩纯相位排批(prefill_first/decode_first),注册表
+   二维收敛一维(相位名),`LwdConfig.admission_name` 配置项删除。

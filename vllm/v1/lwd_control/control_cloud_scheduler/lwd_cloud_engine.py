@@ -1,11 +1,18 @@
 """云侧 L3 引擎子类:类选择点注入的云 EngineCore(§10.14,替代已删的
 lwd_cloud_assemble 装配层)。
 
-__init__ 一处云侧介入:ZMQ 收发。接收在 _process_input_queue(循环
-线程):空闲阻塞等 PRE_OUT,收到经首预告门/请求转换直接进调度器,
-门/暂存/调度簿记全单线程化。PRE_OUT 三类消息是协议:request 预告
-进门池;range(offset==0)开门(边侧真派发了首块才开算);abort 终结。
-数据面接缝(hint 转发,§9.12)随数据面落位时再接。
+接入点只有一个:覆写原生 socket IO 线程入口 process_input_sockets ——
+父类原版照跑(super 引用,前端消息零复制零改动),本线程跑边侧
+PRE_OUT 循环。两类消息都汇入 input_queue(多生产者-单消费者):
+父类线程产前端消息,本线程产 (ADD, (Request, 0)) / (ABORT, [rid]) ——
+主循环 _handle_client_request 原生分发,零改动。
+空闲唤醒由原生机制自然解决:IO 线程阻塞在 zmq 上,消息转成 ADD 塞进
+input_queue,主循环的 input_queue.get() 随即被唤醒 —— 无轮询、无
+空闲切换、core.py 零改动。
+
+PRE_OUT 三类消息是协议:request 预告进门池;range(offset==0)开门
+(边侧真派发了首块才开算);abort 终结。数据面接缝(hint 转发,§9.12)
+随数据面落位时再接。
 
 本类仅在 mode=prefill_only 且云角色时经类选择点构造;部署需
 max_concurrent_batches > 1(异步流水线,同步步路径兼容但慢)。
@@ -16,9 +23,12 @@ runner 侧契约修复)。
 
 from __future__ import annotations
 
+import threading
+
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.lwd_control.control_communication.lwd_control_subscriber import (
     LwdControlSubscriber,
@@ -29,84 +39,79 @@ from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LwdRequestNotify,
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import LwdConfig
-from vllm.v1.request import Request, RequestStatus
+from vllm.v1.request import Request
 
 logger = init_logger(__name__)
 
-# 空闲等 PRE_OUT 的单轮超时(s):上界 = 关停信号/客户端 UTILITY 消息的
-# 最坏感知延迟,下界无关紧要(poll 就绪即醒)
-_LWD_IDLE_RECV_TIMEOUT_S = 0.1
-
 
 class LwdCloudEngineCore(EngineCoreProc):
-    """云 PO 引擎:ZMQ 收发一处介入,其余全走原生。"""
+    """云 PO 引擎:覆写 socket IO 线程入口,其余全走原生。"""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._lwd_setup_zmq()
 
-    def shutdown(self) -> None:
-        self._lwd_subscriber.shutdown()
-        super().shutdown()
-
     def _lwd_setup_zmq(self) -> None:
-        """介入 ZMQ:订阅通道(bind)+ 首预告门状态。"""
+        """介入 ZMQ:边侧订阅通道(bind)+ 首预告门状态。"""
         self._lwd_subscriber = LwdControlSubscriber(
             LwdConfig.from_env_and_config(self.vllm_config).lwd_pre_out_endpoint(),
             bind=True,
         )
         # 首预告门:request 进门池,range(offset==0)开门;乱序防御 =
-        # 双侧检查(先 range 后 request 到达同样放行)
+        # 双侧检查(先 range 后 request 到达同样放行)。门归 socket IO
+        # 线程独占;调度器只经 input_queue 被主循环碰。
         self._lwd_gate_pending: dict[str, LwdRequestNotify] = {}
         self._lwd_gate_ready: set[str] = set()
-        logger.info("[Lwd] cloud engine assembled: main-loop PRE_OUT pump")
+        logger.info("[Lwd] cloud engine assembled: edge socket feeds input_queue")
 
-    def _process_input_queue(self) -> None:
-        """结构对齐原生 _process_input_queue,唯一差异是空闲阻塞点:
-        原生阻塞在 input_queue.get() 等客户端请求,headless 云没有
-        客户端,改为阻塞等边侧 PRE_OUT(0.1s 轮询,响应 signal 关停);
-        input_queue 有消息时同样处理(UTILITY/EXECUTOR_FAILED 等照常走)。
-        退出循环后 has_work=True 或已请求关停,此时调 super() 只会做
-        input_queue 非阻塞排空,不会再阻塞。"""
-        self._lwd_pump_pre_out(timeout=0)
-        while self.is_running() and not self.has_work():
-            self._notify_idle_state_callbacks()
-            if not self.input_queue.empty():
-                req = self.input_queue.get_nowait()
-                self._handle_client_request(*req)
-            else:
-                with self.aborts_queue.mutex:
-                    self.aborts_queue.queue.clear()
-                self._lwd_pump_pre_out(timeout=_LWD_IDLE_RECV_TIMEOUT_S)
-        super()._process_input_queue()
+    def process_input_sockets(
+        self,
+        input_addresses: list[str],
+        coord_input_address: str | None,
+        identity: bytes,
+        ready_event: threading.Event,
+    ) -> None:
+        """原生 IO 线程入口的云侧版:父类原版照跑(super 引用),本线程
+        跑边侧 PRE_OUT 循环 —— 两个生产者共用 input_queue。"""
+        threading.Thread(
+            target=super().process_input_sockets,
+            args=(input_addresses, coord_input_address, identity, ready_event),
+            daemon=True,
+            name="frontend-input-sockets",
+        ).start()
+        while (msg := self._lwd_subscriber.recv()) is not None:
+            self._lwd_dispatch(msg)
 
-    def _lwd_pump_pre_out(self, timeout: float) -> None:
-        """收 PRE_OUT 并分派(循环线程;阻塞至多有消息或超时)。"""
-        for msg in self._lwd_subscriber.recv_available(timeout):
-            if isinstance(msg, LwdRangeNotify):
-                if msg.offset == 0:
-                    # 首预告门:offset==0 = 边侧派发首块,开门放行
-                    self._lwd_gate_ready.add(msg.request_id)
-                    self._lwd_promote(msg.request_id)
-            elif isinstance(msg, LwdAbortNotify):
-                self._lwd_gate_pending.pop(msg.request_id, None)
-                self._lwd_gate_ready.discard(msg.request_id)
-                self.scheduler.finish_requests(
-                    [msg.request_id], RequestStatus.FINISHED_ABORTED
-                )
-            else:
-                rid = msg.request_id
-                if rid in self._lwd_gate_pending:
-                    logger.warning("[Lwd] duplicate request metadata %s ignored", rid)
-                    return
-                self._lwd_gate_pending[rid] = msg
-                self._lwd_promote(rid)
+    def _lwd_dispatch(self, msg) -> None:
+        """PRE_OUT 三类分派(本 IO 线程):门/转换/终结。"""
+        if isinstance(msg, LwdRangeNotify):
+            if msg.offset == 0:
+                # 首预告门:offset==0 = 边侧派发首块,开门放行
+                self._lwd_gate_ready.add(msg.request_id)
+                self._lwd_promote(msg.request_id)
+        elif isinstance(msg, LwdAbortNotify):
+            self._lwd_gate_pending.pop(msg.request_id, None)
+            self._lwd_gate_ready.discard(msg.request_id)
+            # 双队列与原生 ABORT 同款:eager 处理 + 保持 input_queue 次序
+            self.aborts_queue.put_nowait([msg.request_id])
+            self.input_queue.put_nowait(
+                (EngineCoreRequestType.ABORT, [msg.request_id])
+            )
+        else:
+            rid = msg.request_id
+            if rid in self._lwd_gate_pending:
+                logger.warning("[Lwd] duplicate request metadata %s ignored", rid)
+                return
+            self._lwd_gate_pending[rid] = msg
+            self._lwd_promote(rid)
 
     def _lwd_promote(self, request_id: str) -> None:
-        """过门:门池取 wire,转 Request 直接进调度器(暂存池/原生路径)。"""
+        """过门:门池取 wire,转 Request 投 input_queue 走原生 ADD 分发。"""
         wire = self._lwd_gate_pending.pop(request_id, None)
         if wire is not None:
-            self.scheduler.add_request(self._lwd_build_request(wire))
+            request = self._lwd_build_request(wire)
+            self.input_queue.put_nowait((EngineCoreRequestType.ADD, (request, 0)))
+            logger.info("[Lwd] cloud request %s admitted via gate", request_id)
 
     def _lwd_build_request(self, wire: LwdRequestNotify) -> Request:
         """请求构建(唯一建请求点,Request/SamplingParams 留 L3)。"""
