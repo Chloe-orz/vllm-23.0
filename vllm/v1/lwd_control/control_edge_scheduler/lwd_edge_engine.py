@@ -230,15 +230,17 @@ class LwdEdgeEngineCore(EngineCoreProc):
         return None, bool(executed)
 
     def _lwd_edge_consume_c2e(self) -> tuple[list, set]:
-        """drain 云载荷队列(LwdC2eNotify,云->边唯一载荷)-> 按 req_ids
-        组 UNEMBED 批提交 worker(lm_head,数据面按 batch_type 分流)->
-        deliver 到 awaiting -> 组前端输出。
+        """drain 云载荷队列(LwdC2eNotify,云->边唯一载荷)-> 组 UNEMBED 批
+        (c2e 全量随批下发)提交 worker(lm_head,数据面按 batch_type 分流)
+        -> deliver 到 awaiting -> 组前端输出。
 
-        worker 返回按批型约定为 dict[request_id -> token_ids](假定
-        接口);c2e 元数据本体(hidden 尺寸/预挂 recv)归数据面消费,本层
-        只取 req_ids 驱动结果路径;完结判定暂按 True 处理,c2e 补完结
-        标志后改为透传。迟到载荷 deliver 返回 False,丢弃告警(幂等);
-        UNEMBED 批与 prefill 排程串行,无顺序耦合。
+        应答契约(定型):worker 经原生 future 返回 ModelRunnerResult 形态,
+        token ids 取 lwd_token_ids(request_id -> list[int];缺失/为 None/
+        空 = 该请求 unembed 失败)。错误路径:失败请求以 FinishReason.ERROR
+        终结前端等待(原生 ERROR 通道转 5xx),不静默降级为空 STOP 输出。
+        完结判定暂按 True 处理,c2e 补完结标志后改为透传。迟到载荷
+        deliver 返回 False,丢弃告警(幂等);UNEMBED 批与 prefill 排程
+        串行,无顺序耦合。
         """
         notifies: list[LwdC2eNotify] = []
         while True:
@@ -251,19 +253,19 @@ class LwdEdgeEngineCore(EngineCoreProc):
         req_ids = [rid for notify in notifies for rid in notify.req_ids]
         if not req_ids:
             return [], set()
-        unembed_batch = lwd_build_unembed_batch(req_ids)
+        unembed_batch = lwd_build_unembed_batch(notifies)
         result = self.model_executor.execute_model(unembed_batch).result()
-        token_map = result if isinstance(result, dict) else {}
-        if not isinstance(result, dict):
+        token_map = getattr(result, "lwd_token_ids", None)
+        if token_map is None:
             logger.warning(
-                "[Lwd] unembed batch returned %r (expected token map), "
-                "delivering empty tokens",
+                "[Lwd] unembed batch answer missing lwd_token_ids (%r), "
+                "finishing requests with ERROR",
                 type(result),
             )
         outputs: list = []
         finished_reqs: set = set()
         for request_id in req_ids:
-            token_ids = list(token_map.get(request_id, []))
+            token_ids = list(token_map.get(request_id, [])) if token_map else []
             if not self.scheduler.lwd_edge_deliver_tokens(
                 request_id, token_ids, finished=True
             ):
@@ -272,11 +274,14 @@ class LwdEdgeEngineCore(EngineCoreProc):
                     request_id,
                 )
                 continue
+            finish_reason = (
+                FinishReason.STOP if token_ids else FinishReason.ERROR
+            )
             outputs.append(
                 EngineCoreOutput(
                     request_id,
                     token_ids,
-                    finish_reason=FinishReason.STOP,
+                    finish_reason=finish_reason,
                 )
             )
             finished_reqs.add(request_id)

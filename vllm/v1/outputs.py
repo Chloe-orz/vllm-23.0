@@ -271,6 +271,13 @@ class ModelRunnerOutput:
     # to the edge via the control plane; None on non-LWD deployments).
     lwd_c2e_meta: LwdC2eMeta | None = None
 
+    # prefill_only LWD edge unembed answer (edge data plane fills it on
+    # batch_type="unembed" batches: request_id -> sampled token ids from
+    # the local lm_head over cloud-provided hidden rows; None on non-LWD
+    # deployments and on failed unembed batches — the engine turns a
+    # missing value on an unembed batch into a per-request ERROR finish).
+    lwd_token_ids: dict[str, list[int]] | None = None
+
     # [num_reqs, max_num_logprobs + 1]
     # [num_reqs, max_num_logprobs + 1]
     # [num_reqs]

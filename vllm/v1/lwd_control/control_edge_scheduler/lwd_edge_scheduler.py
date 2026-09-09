@@ -371,16 +371,21 @@ class LwdEdgeScheduler(AsyncScheduler):
         return current
 
 
-def lwd_build_unembed_batch(request_ids: list[str]) -> SchedulerOutput:
-    """组 UNEMBED 批(云结果派发,引擎步内调用;数据面按 batch_type 分流)。
+def lwd_build_unembed_batch(notifies: list) -> SchedulerOutput:
+    """组 UNEMBED 批(云载荷派发,引擎步内调用;数据面按 batch_type 分流)。
 
-    云结果不经过原生 schedule,无原生 SO 可打标 —— 以 make_empty 为骨架、
-    批载荷(请求集合)由 num_scheduled_tokens 表达(值 1 = 单 token 位,
-    数据面按 unembed 语义解释,不视为 token 预算)。sched 模块 import
-    归属本文件(台账:调度器文件)。
+    云结果不经过原生 schedule,无原生 SO 可打标 —— 以 make_empty 为骨架:
+    - 批载荷(请求集合)由 num_scheduled_tokens 表达(值 1 = 单 token 位,
+      数据面按 unembed 语义解释,不视为 token 预算);
+    - 触发本批的 LwdC2eNotify 全量挂 lwd_c2e_notifies 动态属性(无 slots
+      存活至 worker):数据面据 hidden_num_elements 等待/对齐 DOWN 张量
+      (元数据先于张量到达的预挂契约),req_ids 即隐藏行序。
+    sched 模块 import 归属本文件(台账:调度器文件)。
     """
     scheduler_output = SchedulerOutput.make_empty()
     scheduler_output.batch_type = LWD_BATCH_TYPE_UNEMBED
-    scheduler_output.num_scheduled_tokens = {rid: 1 for rid in request_ids}
-    scheduler_output.total_num_scheduled_tokens = len(request_ids)
+    req_ids = [rid for notify in notifies for rid in notify.req_ids]
+    scheduler_output.num_scheduled_tokens = {rid: 1 for rid in req_ids}
+    scheduler_output.total_num_scheduled_tokens = len(req_ids)
+    scheduler_output.lwd_c2e_notifies = list(notifies)
     return scheduler_output
