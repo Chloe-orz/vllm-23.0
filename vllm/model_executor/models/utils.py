@@ -629,6 +629,48 @@ class PPMissingLayer(torch.nn.Identity):
         return args[0] if args else next(iter(kwargs.values()))
 
 
+def make_lwd_layers(
+    num_hidden_layers: int,
+    layer_fn: LayerFn,
+    prefix: str,
+    lwd_config: "LwdConfig",
+) -> tuple[int, int, torch.nn.ModuleList]:
+    """Make layers for the locally-owned LWD (layerwise disaggregated)
+    layer ranges.
+
+    Only the layers the current process owns (possibly non-contiguous:
+    edge head+tail or cloud middle) are built; every other position gets
+    a ``PPMissingLayer`` placeholder, so weights land directly on the
+    owning device.
+
+    Args:
+        num_hidden_layers: Total number of hidden layers in the model.
+        layer_fn: Function to create a layer given its index.
+        prefix: Prefix for layer names.
+        lwd_config: The LWD behavior config providing the layer
+            assignment (``LwdConfig.local_layer_indices``).
+
+    Returns:
+        Tuple of (start_layer, end_layer, modules).
+    """
+    from vllm.model_executor.offloader import get_offloader
+
+    local_indices = sorted(lwd_config.local_layer_indices(num_hidden_layers))
+    real_layers = iter(zip(local_indices, get_offloader().wrap_modules(
+        layer_fn(prefix=f"{prefix}.{idx}") for idx in local_indices)))
+    next_idx, next_layer = next(real_layers, (None, None))
+    modules = []
+    for idx in range(num_hidden_layers):
+        if idx == next_idx:
+            modules.append(next_layer)
+            next_idx, next_layer = next(real_layers, (None, None))
+        else:
+            modules.append(PPMissingLayer())
+    start_layer = local_indices[0] if local_indices else 0
+    end_layer = local_indices[-1] + 1 if local_indices else 0
+    return start_layer, end_layer, torch.nn.ModuleList(modules)
+
+
 def make_layers(
     num_hidden_layers: int,
     layer_fn: LayerFn,
@@ -645,9 +687,15 @@ def make_layers(
     Returns:
         Tuple of (start_layer, end_layer, modules).
     """
+    from vllm.config import get_current_vllm_config_or_none
     from vllm.distributed.parallel_state import get_pp_group
     from vllm.distributed.utils import get_pp_indices
     from vllm.model_executor.offloader import get_offloader
+
+    vllm_config = get_current_vllm_config_or_none()
+    lwd_config = (getattr(vllm_config, "lwd_config", None) if vllm_config is not None else None)
+    if lwd_config is not None and lwd_config.enabled:
+        return make_lwd_layers(num_hidden_layers, layer_fn, prefix, lwd_config)
 
     start_layer, end_layer = get_pp_indices(
         num_hidden_layers, get_pp_group().rank_in_group, get_pp_group().world_size
