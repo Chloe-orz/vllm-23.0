@@ -68,11 +68,21 @@ class LwdHelloNotify(msgspec.Struct, gc=False, tag=True):
     pre_out_port: int
 
 
+class LwdResultNotify(msgspec.Struct, gc=False, tag=True):
+    """云->边结果通告(POST_OUT,占位首版:仅 request_id,载荷字段后续补充)。
+
+    边侧接收线程按类型分发入结果队列,由引擎步消费;unembedding
+    载荷/完结标志等字段在此 additive 扩展,解码器随 union 自动覆盖。
+    """
+
+    request_id: str
+
+
 # typing.Union 而非 PEP 604 `|`:msgspec 解码器的全版本支持路径
 LwdNotify = Union[LwdRangeNotify, LwdRequestNotify, LwdAbortNotify]  # noqa: UP007
-# 云->边方向(POST_OUT 保留面):现在只有 HELLO,将来的结果回传/
-# 重同步消息在此 union 上 additive 扩展
-LwdCloudNotify = Union[LwdHelloNotify]  # noqa: UP007
+# 云->边方向(POST_OUT 保留面):HELLO + 结果回传(占位),重同步消息
+# 等后续在此 union 上 additive 扩展
+LwdCloudNotify = Union[LwdHelloNotify, LwdResultNotify]  # noqa: UP007
 
 _NOTIFY_DECODER = msgspec.msgpack.Decoder(LwdNotify)
 _CLOUD_NOTIFY_DECODER = msgspec.msgpack.Decoder(LwdCloudNotify)
