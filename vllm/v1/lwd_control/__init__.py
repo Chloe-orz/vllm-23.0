@@ -9,8 +9,12 @@
   - 云侧:LwdCloudEngineCore 的 PRE_OUT 接收泵(首预告门 + 接收登记)/
     _lwd_build_request(请求侧挂载点)
 
-通信模型(§9):单向 边 -> 云,仅控制面 PRE_OUT
-  (notify/add_request/abort,ZMQ PUSH/PULL);无结果面、无水位、无快路径。
+通信模型(§9,双面拓扑):数据传输仅 边 -> 云 的 PRE_OUT
+  (notify/add_request/abort,ZMQ PUSH:云 bind,边经 HELLO 发现后 connect);
+  云 -> 边 的 POST_OUT(ZMQ PUSH:边 bind wildcard,云经 master_addr
+  connect)为保留面,当前仅承载周期 HELLO 发现通告(云端点唯一
+  事实源,决策 B),结果回传等云->边扩展在此 additive 追加;
+  无结果面、无水位、无快路径。
 
 扩展模型(§9.8/§10.12/§10.14):边侧对 EngineCore 的扩展点是 step 接口
   (LwdStepCore <- LwdEdgeCore,装配期赋 EngineCore.step_wrapper,
@@ -117,7 +121,8 @@ def lwd_shutdown(engine_core) -> None:
     """core.py shutdown 守卫的路由点:边角色通道关停。
 
     云侧不经此处:step_wrapper 恒为 None(§10.12),关停经原生
-    scheduler.shutdown 钩子转发停桥(相位调度器 shutdown 覆写)。
+    scheduler.shutdown 钩子转发停桥(相位调度器 shutdown 覆写)+
+    LwdCloudEngineCore.shutdown 覆写收面(PRE_OUT/POST_OUT)。
     """
     from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import (
         lwd_edge_shutdown,
@@ -137,6 +142,9 @@ def lwd_serve_guard(vllm_config) -> None:
     云引擎类由 run_engine_core 的 lwd_resolve_engine_cls 子进程内
     解析(§10.14),不在此处。边角色不注入:边调度器需 publisher
     构造注入,仍走 __init__ 尾 lwd_edge_try_assemble。
+
+    同处执行云角色部署校验(_lwd_cloud_deploy_guard):master_addr
+    非空、pre_out_host 非 0.0.0.0(HELLO 通告值必须可路由,§9.1)。
     """
     from vllm.logger import init_logger
     from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_phase_scheduler import (
@@ -152,7 +160,38 @@ def lwd_serve_guard(vllm_config) -> None:
     config = LwdConfig.from_env_and_config(vllm_config)
     if config.is_edge_node:
         return
+    _lwd_cloud_deploy_guard(vllm_config, config)
     vllm_config.scheduler_config.scheduler_cls = LwdCloudPhaseScheduler
     init_logger(__name__).info(
         "[Lwd] prefill_only cloud: phase scheduler injected (construction-time)"
     )
+
+
+def _lwd_cloud_deploy_guard(vllm_config, config) -> None:
+    """云角色部署校验(fail-fast,serve 入口即拦,不等到运行期):
+
+    - master_addr 非空:POST_OUT 经它连边,缺了通告面整条不成立;
+    - pre_out_host 非 0.0.0.0:该值随 HELLO 通告给边作连接目标,
+      通配 bind 地址不可路由(决策 B 的配套约束)。
+    """
+    from vllm.logger import init_logger
+
+    master_addr = vllm_config.parallel_config.master_addr
+    if not master_addr:
+        raise ValueError(
+            "[Lwd] prefill_only cloud requires --master-addr (POST_OUT connect)"
+        )
+    if config.pre_out_host == "0.0.0.0":
+        raise ValueError(
+            "[Lwd] prefill_only cloud pre_out_host=0.0.0.0 is not announceable; "
+            "set a routable IP (VLLM_ASCEND_LWD_PRE_OUT_HOST)"
+        )
+    if config.pre_out_host == "127.0.0.1" and master_addr not in (
+        "127.0.0.1",
+        "localhost",
+    ):
+        init_logger(__name__).warning(
+            "[Lwd] cloud announces pre_out_host=127.0.0.1 but master_addr=%s "
+            "is remote; edge will fail to reach PRE_OUT unless same host",
+            master_addr,
+        )
