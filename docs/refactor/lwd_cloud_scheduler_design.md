@@ -45,8 +45,8 @@
 | 结构 | 字段 | 云侧用途 |
 |------|------|----------|
 | `LwdRequestNotify` | `request_id` / `num_prompt_tokens` / `max_tokens`(默认 16) / `block_hashes: list[bytes]` | 请求元数据预告。`num_prompt_tokens` 决定占位 token 长度;`max_tokens` 供云侧判定终结;`block_hashes` 是边侧本地 prompt 的全量满块链,云侧借它按**真实内容**命中前缀缓存(云侧 prompt 是占位零值,本地哈希算不出真链) |
-| `LwdRangeNotify` | `request_id` / `offset` / `num_tokens` / `seqno` | 调度范围预告。`offset` = 该 chunk 起始位置(边侧调度前进度);`offset==0` 是首预告门的**开门条件**;`seqno` 单调递增,数据面落位后用于登记接收 |
-| `LwdAbortNotify` | `request_id` | 终结预告:清门 + 双队列 abort |
+| `LwdRangeNotify` | `request_id` / `offset` / `num_tokens` / `seqno` | 调度范围预告。`offset` = 该 chunk 起始位置(边侧调度前进度);当前无云侧消费点(数据面登记接缝,§9.12);`seqno` 单调递增,数据面落位后用于登记配对 |
+| `LwdAbortNotify` | `request_id` | 终结预告:清门池 + 双队列 abort |
 
 三类消息共用 ZMQ PULL 单通道(PRE_OUT),msgspec 编解码,`Union` tag 区分。
 
@@ -55,11 +55,13 @@
 | 字段 | 类型 | 用途 |
 |------|------|------|
 | `_lwd_subscriber` | `LwdControlSubscriber` | PRE_OUT 接收句柄(zmq PULL, bind=True);在 PRE_OUT 线程内创建与使用(zmq 单线程亲和) |
-| `_lwd_gate_pending` | `dict[str, LwdRequestNotify]` | **门池**:已收到元数据、尚未开门的请求。key 为 request_id;重复元数据告警丢弃 |
-| `_lwd_gate_ready` | `set[str]` | **已开门集合**:收到 `offset==0` range 即登记。支撑乱序防御——range 先到、request 后到同样放行 |
+| `_lwd_gate_pending` | `dict[str, LwdRequestNotify]` | **门池**:收到元数据的线上消息。key 为 request_id,重复元数据告警丢弃;元数据到达即构建放行,正常时序下瞬时存亡 |
 
-三个字段均在 `_lwd_setup_zmq()` 中初始化,而该函数在 PRE_OUT 线程内、进入
+两个字段均在 `_lwd_setup_zmq()` 中初始化,而该函数在 PRE_OUT 线程内、进入
 接收循环之前调用(先建后用,无构造期竞态)。
+
+> 注:原 `_lwd_gate_ready`(offset==0 开门集合)已裁撤——它只写不读,放行
+> 实际只由门池 pop 决定;数据到齐前的开算 gate 归数据面(§9.12)。
 
 ### 3.3 调度器内部状态(`LwdCloudPhaseScheduler`)
 
@@ -104,20 +106,19 @@
 #### 4.1.3 `_lwd_setup_zmq()` — 私有
 
 创建 `LwdControlSubscriber(endpoint, bind=True)`(endpoint 来自
-`LwdConfig.from_env_and_config`),初始化门池/开门集合。仅由 4.1.2 调用一次。
+`LwdConfig.from_env_and_config`),初始化门池。仅由 4.1.2 调用一次。
 
 #### 4.1.4 `_lwd_dispatch(msg)` — 私有,PRE_OUT 三类分派
 
 | 消息 | 行为 |
 |------|------|
-| `LwdRangeNotify(offset==0)` | `_lwd_gate_ready.add(rid)` + `_lwd_promote(rid)`(开门) |
-| `LwdRangeNotify(offset>0)` | 当前无动作(数据面登记接缝,§9.12) |
-| `LwdRequestNotify` | rid 已在门池 → 告警丢弃;否则入池 + `_lwd_promote(rid)`(先 range 后 request 同样放行) |
-| `LwdAbortNotify` | 清门池/开门集合 + `aborts_queue.put` + `input_queue.put((ABORT,[rid]))`(与原生 abort 双队列同款:eager 处理 + 保持 input_queue 次序,调度器 abort 幂等) |
+| `LwdRangeNotify` | 当前无动作(数据面登记接缝,§9.12;原 `offset==0` 首预告门已裁撤) |
+| `LwdRequestNotify` | rid 已在门池 → 告警丢弃;否则入池 + `_lwd_promote(rid)` 即构建放行 |
+| `LwdAbortNotify` | 清门池 + `aborts_queue.put` + `input_queue.put((ABORT,[rid]))`(与原生 abort 双队列同款:eager 处理 + 保持 input_queue 次序,调度器 abort 幂等) |
 
 #### 4.1.5 `_lwd_promote(request_id)` — 私有,过门
 
-门池 pop wire;为 None(range 先到)则 no-op;否则 `_lwd_build_request` 后
+门池 pop wire;为 None 则 no-op;否则 `_lwd_build_request` 后
 `input_queue.put((ADD, (request, 0)))`,主循环走原生 `_handle_client_request`
 分发。日志 `[Lwd] cloud request %s admitted via gate`。
 
@@ -173,7 +174,6 @@ classDiagram
         <<L3 云 PO 引擎>>
         -_lwd_subscriber : LwdControlSubscriber
         -_lwd_gate_pending : dict
-        -_lwd_gate_ready : set
         +process_input_sockets()
         -_lwd_pre_out_loop()
         -_lwd_setup_zmq()
@@ -255,7 +255,7 @@ flowchart TD
     L --> M["主线程阻塞等 ready_event"]
     L2["input 线程进入覆写 process_input_sockets"] --> N["spawn lwd-pre-out daemon 线程"]
     N --> O["父线程跑 super() 原生前端 socket 循环"]
-    N --> P["lwd-pre-out: _lwd_setup_zmq<br>subscriber bind + 门池/开门集合"]
+    N --> P["lwd-pre-out: _lwd_setup_zmq<br>subscriber bind + 门池"]
     P --> Q["recv 循环等待边侧 PRE_OUT"]
     O --> R["ready_event.set → 主线程继续 → run_busy_loop"]
 ```
@@ -276,9 +276,8 @@ flowchart TD
     C2 -- "ZMQ PULL PRE_OUT" --> D1["lwd-pre-out 线程"]
     D1 --> D2{"_lwd_dispatch 分派"}
     D2 -- "RequestNotify" --> D3["门池 gate_pending"]
-    D2 -- "RangeNotify offset==0" --> D4["开门 gate_ready"]
+    D2 -- "RangeNotify(无消费点,§9.12)" --> D4["忽略"]
     D3 --> D5["_lwd_promote 过门"]
-    D4 --> D5
     D5 --> D6["_lwd_build_request<br>占位零 token + block_hasher 闭包"]
     D2 -- "AbortNotify" --> D7["aborts_queue + input_queue(ABORT)"]
 
@@ -338,7 +337,7 @@ flowchart TD
 | MainThread | `run_busy_loop` | 步进、调度器触达、`_handle_client_request` 分发 | `input_queue`(消费)、`output_queue`(产)、调度器 |
 | input 线程(原生) | `EngineCoreProc.__init__` | 前端 socket 循环:握手应答、ADD/ABORT/UTILITY | `input_queue`、`aborts_queue` |
 | output 线程(原生) | `EngineCoreProc.__init__` | `output_queue` → ZMQ PUSH 到前端/协调器 | `output_queue` |
-| `lwd-pre-out` | 覆写 `process_input_sockets` spawn | PRE_OUT 接收、首预告门、请求构建、abort 转发 | `_lwd_subscriber`、门池/开门集合(独占)、`input_queue`、`aborts_queue` |
+| `lwd-pre-out` | 覆写 `process_input_sockets` spawn | PRE_OUT 接收、门池、请求构建、abort 转发 | `_lwd_subscriber`、门池(独占)、`input_queue`、`aborts_queue` |
 
 同步机制:全部经 `queue.Queue`(线程安全)汇流,门状态单线程独占,无锁。
 
@@ -358,7 +357,7 @@ flowchart TD
 | # | 缺口 | 影响 | 计划归属 |
 |---|------|------|----------|
 | G1 | 边侧 `lwd_edge_notify_request` / `lwd_edge_abort` 出口无调用方 | 云侧当前实际收不到任何请求/abort,门池恒空 | 数据面落位(§9.12)接线 |
-| G2 | 首预告门 `offset==0` 判据与边侧前缀缓存命中冲突 | 接线后,边侧命中前缀的请求首个 range offset>0,永不开门,请求静默丢失(v1 默认开前缀缓存) | 接线前置修复:判据改为"该请求首张 range"(first_chunk 标志或最小 seqno),前缀空洞由 block_hashes 在云侧补 |
+| G2 | 开算 gate 未建(原 `offset==0` 首预告门已裁撤,元数据到达即放行) | 数据面落位后,数据到齐前云可能被调度提前开算;且判据不能沿用 `offset==0`——边侧前缀缓存命中时首张 range offset>0(v1 默认开前缀缓存),沿用会永不开门 | 数据面落位时建 gate:判据用"该请求首张 range"(first_chunk 标志或最小 seqno),前缀空洞由 block_hashes 在云侧补 |
 | G3 | zombie 兜底未实现 | `zombie_log_interval_s` 为死配置;门池卡死无检测 | 数据面落位 |
 | G4 | `_lwd_subscriber` 无关停路径 | 引擎关停不收 PRE_OUT 通道,靠进程退出兜底 | 云侧关停收敛 |
 | G5 | `offset>0` 的 range 无任何登记/日志 | 数据面接缝就位前,非首 chunk 预告被静默忽略 | 数据面落位 |

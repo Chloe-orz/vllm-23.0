@@ -14,9 +14,9 @@ lwd-pre-out 专属线程,通道与门状态在该线程内先建后用(无线程
 input_queue,主循环的 input_queue.get() 随即被唤醒 —— 无轮询、无
 空闲切换、core.py 零改动。
 
-PRE_OUT 三类消息是协议:request 预告进门池;range(offset==0)开门
-(边侧真派发了首块才开算);abort 终结。数据面接缝(hint 转发,§9.12)
-随数据面落位时再接。
+PRE_OUT 三类消息:request 预告进门池,元数据到达即构建放行(数据到齐
+前是否开算由数据面 gate 负责,§9.12);range 预告当前无消费点;abort
+终结。数据面接缝(hint 转发,§9.12)随数据面落位时再接。
 
 本类仅在 mode=prefill_only 且云角色时经类选择点构造;部署需
 max_concurrent_batches > 1(异步流水线,同步步路径兼容但慢)。
@@ -82,11 +82,10 @@ class LwdCloudEngineCore(EngineCoreProc):
         )
         # 首拍即通告(边可能已 bind 等待);此后周期重发覆盖边重启场景
         self._lwd_announce()
-        # 首预告门:request 进门池,range(offset==0)开门;乱序防御 =
-        # 双侧检查(先 range 后 request 到达同样放行)。门归 socket IO
-        # 线程独占;调度器只经 input_queue 被主循环碰。
+        # 门池:request 元数据查重与暂存,元数据到达即构建放行——数据
+        # 到齐前是否开算由数据面 gate 负责(§9.12),引擎层不设卡。
+        # 门状态归 socket IO 线程独占;调度器只经 input_queue 被主循环碰。
         self._lwd_gate_pending: dict[str, LwdRequestNotify] = {}
-        self._lwd_gate_ready: set[str] = set()
         logger.info(
             "[Lwd] cloud engine assembled: PRE_OUT bind %s, POST_OUT announce -> "
             "%s:%s via master %s",
@@ -149,25 +148,24 @@ class LwdCloudEngineCore(EngineCoreProc):
         super().shutdown()
 
     def _lwd_dispatch(self, msg) -> None:
-        """PRE_OUT 三类分派(本 IO 线程):门/转换/终结。"""
+        """PRE_OUT 三类分派(本 IO 线程):元数据转 Request / abort 终结。"""
         if isinstance(msg, LwdRangeNotify):
-            if msg.offset == 0:
-                # 首预告门:offset==0 = 边侧派发首块,开门放行
-                self._lwd_gate_ready.add(msg.request_id)
-                self._lwd_promote(msg.request_id)
-        elif isinstance(msg, LwdAbortNotify):
+            # 范围预告当前无消费点(§9.12):元数据到达即已构建放行,seqno/
+            # offset 登记与开算 gate 随数据面落位再接
+            return
+        if isinstance(msg, LwdAbortNotify):
             self._lwd_gate_pending.pop(msg.request_id, None)
-            self._lwd_gate_ready.discard(msg.request_id)
             # 双队列与原生 ABORT 同款:eager 处理 + 保持 input_queue 次序
             self.aborts_queue.put_nowait([msg.request_id])
             self.input_queue.put_nowait((EngineCoreRequestType.ABORT, [msg.request_id]))
-        else:
-            rid = msg.request_id
-            if rid in self._lwd_gate_pending:
-                logger.warning("[Lwd] duplicate request metadata %s ignored", rid)
-                return
-            self._lwd_gate_pending[rid] = msg
-            self._lwd_promote(rid)
+            return
+        # LwdRequestNotify:查重后入门池,元数据到达即构建放行
+        rid = msg.request_id
+        if rid in self._lwd_gate_pending:
+            logger.warning("[Lwd] duplicate request metadata %s ignored", rid)
+            return
+        self._lwd_gate_pending[rid] = msg
+        self._lwd_promote(rid)
 
     def _lwd_promote(self, request_id: str) -> None:
         """过门:门池取 wire,转 Request 投 input_queue 走原生 ADD 分发。"""
