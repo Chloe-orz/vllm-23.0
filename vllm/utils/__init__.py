@@ -8,19 +8,6 @@ import torch
 MASK_64_BITS = (1 << 64) - 1
 
 
-def is_prefill_only_lwd(vllm_config) -> bool:
-    """Whether the prefill_only LWD data plane is enabled.
-
-    Reads ``additional_config["lwd_config"]`` (a plain dict, no vllm
-    config-schema change).  Init-order independent: only inspects the config
-    object, never imports vllm_ascend (no import cycle).
-    """
-    additional_config = getattr(vllm_config, "additional_config", None) or {}
-    lwd_config = additional_config.get("lwd_config") or {}
-    return bool(lwd_config.get("enabled", False)) and \
-        lwd_config.get("mode", None) == "prefill_only"
-
-
 def random_uuid() -> str:
     return f"{uuid.uuid4().int & MASK_64_BITS:016x}"  # 16 hex chars
 
