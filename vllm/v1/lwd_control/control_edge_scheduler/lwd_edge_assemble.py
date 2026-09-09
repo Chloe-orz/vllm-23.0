@@ -44,7 +44,9 @@ logger = init_logger(__name__)
 LWD_PRE_OUT_PORT_DEFAULT = 5558
 LWD_POST_OUT_PORT_DEFAULT = LWD_PRE_OUT_PORT_DEFAULT + 1
 
-_LWD_CONFIG_SECTION = "edge_cloud_config"
+_LWD_CONFIG_SECTION = "lwd_config"
+# 传输层字段(pre_out_host 等)的历史段名;仅作兼容回退,新增部署用 lwd_config
+_LWD_LEGACY_SECTION = "edge_cloud_config"
 _LWD_ENV_PREFIX = "VLLM_ASCEND_LWD_"
 
 
@@ -79,10 +81,17 @@ class LwdConfig:
 
     @classmethod
     def from_env_and_config(cls, vllm_config) -> LwdConfig:
-        """解析 edge_cloud_config 段;env(VLLM_ASCEND_LWD_*)只覆盖地址与开关。"""
+        """解析 lwd_config 段(兼容回退旧 edge_cloud_config 段);角色取自
+        生效配置类 vllm_config.lwd_config(vllm/config/lwd.py)。
+
+        env(VLLM_ASCEND_LWD_*)只覆盖地址与开关。
+        """
         section = _lwd_read_section(vllm_config)
+        effective = getattr(vllm_config, "lwd_config", None)
         config = cls(
-            is_edge_node=str(section.get("role", "edge")) == "edge",
+            is_edge_node=effective.is_edge
+            if effective is not None
+            else str(section.get("role", "edge")) == "edge",
             pre_out_host=str(section.get("pre_out_host", "127.0.0.1")),
             pre_out_port=int(section.get("pre_out_port", LWD_PRE_OUT_PORT_DEFAULT)),
             post_out_port=int(section.get("post_out_port", LWD_POST_OUT_PORT_DEFAULT)),
@@ -99,19 +108,30 @@ class LwdConfig:
 
 
 def is_lwd_prefill_only(vllm_config) -> bool:
-    """模式判定唯一实现(全仓 1 处,§2.3/W9);edge/cloud 角色由 LwdConfig 区分。
+    """模式判定唯一实现(全仓 1 处,§2.3/W9);基于生效配置类
+    vllm_config.lwd_config(vllm/config/lwd.py,additional_config
+    ["lwd_config"] 在 VllmConfig.__post_init__ 解析):enabled 且
+    mode == "prefill_only" 才生效;配置类缺位时回退旧
+    edge_cloud_config 段。edge/cloud 角色由 LwdConfig 区分。
 
     主仓既有文件不 import 本函数:上游守卫经装配函数内部分流。
     """
+    effective = getattr(vllm_config, "lwd_config", None)
+    if effective is not None:
+        return effective.enabled and effective.mode == "prefill_only"
     section = _lwd_read_section(vllm_config)
     return section.get("mode") == "prefill_only"
 
 
 def _lwd_read_section(vllm_config) -> dict:
-    """取 additional_config 下的 edge_cloud_config 段;缺省/非 dict 均按空段处理。"""
+    """取 additional_config 下传输层字段所在段:lwd_config 优先,
+    旧 edge_cloud_config 段回退;缺省/非 dict 均按空段处理。"""
     additional = vllm_config.additional_config or {}
     section = additional.get(_LWD_CONFIG_SECTION)
-    return section if isinstance(section, dict) else {}
+    if isinstance(section, dict):
+        return section
+    legacy = additional.get(_LWD_LEGACY_SECTION)
+    return legacy if isinstance(legacy, dict) else {}
 
 
 def _lwd_apply_env_overrides(config: LwdConfig) -> LwdConfig:
