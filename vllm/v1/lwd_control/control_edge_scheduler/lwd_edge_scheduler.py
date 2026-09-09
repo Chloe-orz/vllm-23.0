@@ -148,6 +148,15 @@ class LwdEdgeScheduler(AsyncScheduler):
     def lwd_edge_notify(self, scheduler_output: SchedulerOutput) -> bool:
         """对新调度的 prefill 发 LwdRangeNotify(seqno 先行)。
 
+        seqno 无空洞契约(单通道 UP 链的配对根基,channel 层按连续号序
+        post,一个空洞即挂死整条链):
+        - peek-then-advance:publish 成功才进位计数器,队满回退时号
+          未消耗,重试复用同一号——从构造上消灭"分配了却不上 wire"的号;
+        - 单 notify 前提:依赖单请求组批不变量(§9.9,prefill 批最多一个
+          请求,本方法每步至多发一条);若放开多请求,部分成功的 notify
+          已上 wire 而整步回退不发张量,任何计数器方案都救不了,必须
+          同步改为按已成功子集执行(台账登记的不变量)。
+
         publish 队满返回 False,调用方本步视为未派发、下一步重试
         (原生 SO 由调度器自然复现,无需回滚;重复预告在云侧按
         (request_id, offset) 幂等登记)。
@@ -156,19 +165,30 @@ class LwdEdgeScheduler(AsyncScheduler):
         if publisher is None:
             logger.error("[Lwd] edge scheduler assembled without publisher")
             return False
-        for request_id, num_tokens in scheduler_output.num_scheduled_tokens.items():
+        scheduled = scheduler_output.num_scheduled_tokens
+        assert len(scheduled) <= 1, (
+            "[Lwd] single-request batch invariant violated: seqno hole risk"
+        )
+        for request_id, num_tokens in scheduled.items():
             request = self.requests.get(request_id)
             if request is None:
                 continue
             # _update_after_schedule 已乐观推进 num_computed,起点需回退本步量
-            notify = LwdRangeNotify(
-                request_id=request_id,
-                offset=request.num_computed_tokens - num_tokens,
-                num_tokens=num_tokens,
-                seqno=self._lwd_edge_next_seqno(),
-            )
-            if not publisher.publish(notify):
+            seqno = self._lwd_seqno
+            if not publisher.publish(
+                LwdRangeNotify(
+                    request_id=request_id,
+                    offset=request.num_computed_tokens - num_tokens,
+                    num_tokens=num_tokens,
+                    seqno=seqno,
+                )
+            ):
                 return False
+            self._lwd_seqno = seqno + 1
+            # 数据面配对键随批透传给边 worker(SO 动态属性,无 slots 存活
+            # 至 worker;multi_instance comm_seqno 同款机制):worker 发云
+            # 张量以此作 tag,与云侧 RangeNotify 登记对上
+            scheduler_output.lwd_chunk_seqnos = {request_id: seqno}
         return True
 
     def lwd_edge_notify_request(
@@ -344,7 +364,8 @@ class LwdEdgeScheduler(AsyncScheduler):
             )
 
     def _lwd_edge_next_seqno(self) -> int:
-        """seqno 单调分配;控制面登记与数据面 tag 都由它派生。"""
+        """seqno 单调分配(遗留入口,仅诊断用);生产路径 peek-then-advance
+        内联在 lwd_edge_notify(成功才进位,防空洞)。"""
         current = self._lwd_seqno
         self._lwd_seqno += 1
         return current
