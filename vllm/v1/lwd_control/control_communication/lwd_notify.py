@@ -68,11 +68,22 @@ class LwdHelloNotify(msgspec.Struct, gc=False, tag=True):
     pre_out_port: int
 
 
+class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):
+    """云->边步元数据预告(POST_OUT):先于隐藏张量到达,边侧据
+    hidden_num_elements 预挂精确尺寸 recv;req_ids/top_id_ths 按隐藏
+    行序(ModelRunnerOutput.lwd_c2e_meta 的线上形态)。"""
+
+    hidden_num_elements: int
+    top_id_ths: list[list[int]]
+    num_accepted_tokens: list[int]
+    req_ids: list[str]
+
+
 # typing.Union 而非 PEP 604 `|`:msgspec 解码器的全版本支持路径
 LwdNotify = Union[LwdRangeNotify, LwdRequestNotify, LwdAbortNotify]  # noqa: UP007
-# 云->边方向(POST_OUT 保留面):现在只有 HELLO,将来的结果回传/
+# 云->边方向(POST_OUT):HELLO 发现 + 步元数据;后续结果回传/
 # 重同步消息在此 union 上 additive 扩展
-LwdCloudNotify = Union[LwdHelloNotify]  # noqa: UP007
+LwdCloudNotify = Union[LwdHelloNotify, LwdC2eNotify]  # noqa: UP007
 
 _NOTIFY_DECODER = msgspec.msgpack.Decoder(LwdNotify)
 _CLOUD_NOTIFY_DECODER = msgspec.msgpack.Decoder(LwdCloudNotify)

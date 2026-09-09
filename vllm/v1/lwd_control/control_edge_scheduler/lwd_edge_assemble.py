@@ -17,6 +17,7 @@ LwdEdgeCore.step_with_batch_queue;本文件只负责装配与生命周期,
 from __future__ import annotations
 
 import os
+import queue
 import threading
 from dataclasses import dataclass
 
@@ -30,6 +31,7 @@ from vllm.v1.lwd_control.control_communication.lwd_control_subscriber import (
     LwdControlSubscriber,
 )
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
+    LwdC2eNotify,
     LwdHelloNotify,
     lwd_decode_cloud_notify,
 )
@@ -43,6 +45,9 @@ logger = init_logger(__name__)
 
 LWD_PRE_OUT_PORT_DEFAULT = 5558
 LWD_POST_OUT_PORT_DEFAULT = LWD_PRE_OUT_PORT_DEFAULT + 1
+
+# 云->边步元数据接缝队列容量(§9.12):生产端 lwd-post-in,消费端随数据面落位
+LWD_C2E_META_QUEUE_MAX = 1000
 
 _LWD_CONFIG_SECTION = "edge_cloud_config"
 _LWD_ENV_PREFIX = "VLLM_ASCEND_LWD_"
@@ -205,9 +210,11 @@ def lwd_edge_try_assemble(engine_core) -> bool:
         None, bind=False, queue_max=config.publish_queue_max
     )
     hello_event = threading.Event()
+    # 步元数据接缝队列(§9.12):生产端 lwd-post-in,消费端随数据面落位接线
+    engine_core.lwd_c2e_meta_queue = queue.Queue(maxsize=LWD_C2E_META_QUEUE_MAX)
     discovery = threading.Thread(
         target=_lwd_edge_discovery_loop,
-        args=(receiver, publisher, hello_event),
+        args=(receiver, publisher, hello_event, engine_core.lwd_c2e_meta_queue),
         name="lwd-post-in",
         daemon=True,
     )
@@ -241,18 +248,22 @@ def _lwd_edge_discovery_loop(
     receiver: LwdControlSubscriber,
     publisher: LwdControlPublisher,
     hello_event: threading.Event,
+    meta_queue: queue.Queue,
 ) -> None:
-    """发现线程(lwd-post-in):消费 POST_OUT,HELLO -> retarget PRE_OUT。
+    """POST_OUT 接收线程(lwd-post-in):HELLO -> retarget PRE_OUT;
+    LwdC2eNotify 步元数据 -> 入接缝队列(§9.12)。
 
-    常驻运行(不只首发):云换址重启后周期 HELLO 仍能驱动 retarget
-    先连新断旧(§9.1);retarget 队满失败靠周期重发自愈。
+    常驻运行(不只首发):retarget 队满失败靠 HELLO 重发自愈。
     """
     while not receiver.closed:
         msg = receiver.recv(timeout_ms=5000)
         if msg is None:
             continue
+        if isinstance(msg, LwdC2eNotify):
+            # 队满阻塞:元数据不可丢,背压沿 zmq 直达云侧步循环
+            meta_queue.put(msg)
+            continue
         if not isinstance(msg, LwdHelloNotify):
-            # 协议分面:POST_OUT 目前只承载 HELLO,坏帧已被订阅层丢弃
             logger.warning("[Lwd] drop unexpected POST_OUT frame %r", type(msg))
             continue
         endpoint = f"tcp://{msg.pre_out_host}:{msg.pre_out_port}"

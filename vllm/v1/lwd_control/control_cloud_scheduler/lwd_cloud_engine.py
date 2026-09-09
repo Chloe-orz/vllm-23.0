@@ -5,8 +5,9 @@ lwd_cloud_assemble 装配层)。
 父线程照跑父类原版(前端消息零复制零改动),PRE_OUT 循环独立成
 lwd-pre-out 专属线程,通道与门状态在该线程内先建后用(无线程竞态)。
 云侧双面(§9.1):PRE_OUT bind 收边;POST_OUT 经 master_addr connect
-边,周期 HELLO 通告云端点(边阻塞等待,决策 B 的唯一事实源),该面
-数据传输保留给后续云->边扩展。
+边,承载首拍 HELLO 通告(边阻塞等待,决策 B 的唯一事实源)与步内
+元数据 lwd_c2e_meta(经 lwd_handle_model_output 接缝先于隐藏张量
+发边,§9.12)。
 两类消息都汇入 input_queue(多生产者-单消费者):
 父类线程产前端消息,PRE_OUT 线程产 (ADD, (Request, 0)) / (ABORT, [rid]) ——
 主循环 _handle_client_request 原生分发,零改动。
@@ -28,6 +29,8 @@ runner 侧契约修复)。
 from __future__ import annotations
 
 import threading
+import time
+from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
@@ -42,6 +45,7 @@ from vllm.v1.lwd_control.control_communication.lwd_control_subscriber import (
 )
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LwdAbortNotify,
+    LwdC2eNotify,
     LwdHelloNotify,
     LwdRangeNotify,
     LwdRequestNotify,
@@ -50,10 +54,16 @@ from vllm.v1.lwd_control.control_communication.lwd_notify import (
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import LwdConfig
 from vllm.v1.request import Request
 
+if TYPE_CHECKING:
+    from vllm.v1.outputs import LwdC2eMeta, ModelRunnerOutput
+
 logger = init_logger(__name__)
 
-# HELLO 周期重发间隔(挂 PRE_OUT 循环的 recv 超时拍上,不另起定时器)
+# PRE_OUT recv 超时拍:仅作关停响应上限(HELLO 为首拍通告,无周期重发)
 LWD_HELLO_RESEND_INTERVAL_MS = 5000
+
+# 步元数据队满重试小睡:元数据不可丢(边侧据此预挂精确尺寸 recv)
+_LWD_C2E_SEND_RETRY_SLEEP_S = 0.05
 
 
 class LwdCloudEngineCore(EngineCoreProc):
@@ -80,7 +90,7 @@ class LwdCloudEngineCore(EngineCoreProc):
         self._lwd_hello = LwdHelloNotify(
             pre_out_host=config.pre_out_host, pre_out_port=config.pre_out_port
         )
-        # 首拍即通告(边可能已 bind 等待);此后周期重发覆盖边重启场景
+        # 首拍即通告(边可能已 bind 等待);发送走步内接缝,无常驻发送线程
         self._lwd_announce()
         # 门池:request 元数据查重与暂存,元数据到达即构建放行——数据
         # 到齐前是否开算由数据面 gate 负责(§9.12),引擎层不设卡。
@@ -116,8 +126,7 @@ class LwdCloudEngineCore(EngineCoreProc):
         无构造期竞态,socket 建用同线程(zmq 单线程亲和);建站失败经
         EXECUTOR_FAILED 通道升级为引擎致命错误,不静默降级。
 
-        recv 挂超时拍:空闲拍上重发 HELLO(边重启后重新发现的载体),
-        关停(closed)退出。"""
+        recv 挂超时拍:仅作关停响应上限,关停(closed)退出。"""
         try:
             self._lwd_setup_zmq()
         except Exception:
@@ -129,7 +138,6 @@ class LwdCloudEngineCore(EngineCoreProc):
             if msg is None:
                 if self._lwd_subscriber.closed:
                     break
-                self._lwd_announce()
                 continue
             self._lwd_dispatch(msg)
 
@@ -207,3 +215,27 @@ class LwdCloudEngineCore(EngineCoreProc):
             pooling_params=None,
             block_hasher=block_hasher,
         )
+    
+    def lwd_handle_model_output(
+        self, model_output: ModelRunnerOutput
+    ) -> ModelRunnerOutput:
+        """步内输出接缝(§9.12):取步元数据 lwd_c2e_meta 经 POST_OUT
+        先于隐藏张量发边;model_output 本身原样透传走原生。"""
+        meta = model_output.lwd_c2e_meta
+        if meta is not None:
+            self._lwd_publish_c2e(meta)
+        return model_output
+
+    def _lwd_publish_c2e(self, meta: LwdC2eMeta) -> None:
+        """步元数据发边:队满小睡重试(元数据不可丢,边侧据此预挂
+        精确尺寸 recv),关停(closed)退出。"""
+        notify = LwdC2eNotify(
+            hidden_num_elements=meta.hidden_num_elements,
+            top_id_ths=meta.top_id_ths,
+            num_accepted_tokens=meta.num_accepted_tokens,
+            req_ids=meta.req_ids,
+        )
+        while not self._lwd_post_out.closed:
+            if self._lwd_post_out.publish(notify):
+                return
+            time.sleep(_LWD_C2E_SEND_RETRY_SLEEP_S)
