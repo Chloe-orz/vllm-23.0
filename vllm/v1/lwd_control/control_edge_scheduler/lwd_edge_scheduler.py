@@ -32,6 +32,8 @@ from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
+    LWD_BATCH_TYPE_EMBED,
+    LWD_BATCH_TYPE_UNEMBED,
     LwdAbortNotify,
     LwdRangeNotify,
     LwdRequestNotify,
@@ -72,8 +74,10 @@ class LwdEdgeScheduler(AsyncScheduler):
         self._lwd_awaiting: dict[str, float] = {}
 
     def schedule(self) -> SchedulerOutput:
-        """单请求组批 + 原生分块决策;记录本步调度量供进度对账(§2.4)。"""
+        """单请求组批 + 原生分块决策 + EMBED 批型打标;记录本步调度量
+        供进度对账(§2.4)。"""
         scheduler_output = self._lwd_schedule_single()
+        scheduler_output.batch_type = LWD_BATCH_TYPE_EMBED
         self._lwd_last_scheduled = dict(scheduler_output.num_scheduled_tokens)
         return scheduler_output
 
@@ -344,3 +348,18 @@ class LwdEdgeScheduler(AsyncScheduler):
         current = self._lwd_seqno
         self._lwd_seqno += 1
         return current
+
+
+def lwd_build_unembed_batch(request_ids: list[str]) -> SchedulerOutput:
+    """组 UNEMBED 批(云结果派发,引擎步内调用;数据面按 batch_type 分流)。
+
+    云结果不经过原生 schedule,无原生 SO 可打标 —— 以 make_empty 为骨架、
+    批载荷(请求集合)由 num_scheduled_tokens 表达(值 1 = 单 token 位,
+    数据面按 unembed 语义解释,不视为 token 预算)。sched 模块 import
+    归属本文件(台账:调度器文件)。
+    """
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.batch_type = LWD_BATCH_TYPE_UNEMBED
+    scheduler_output.num_scheduled_tokens = {rid: 1 for rid in request_ids}
+    scheduler_output.total_num_scheduled_tokens = len(request_ids)
+    return scheduler_output

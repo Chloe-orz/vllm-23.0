@@ -84,6 +84,12 @@ LwdNotify = Union[LwdRangeNotify, LwdRequestNotify, LwdAbortNotify]  # noqa: UP0
 # 等后续在此 union 上 additive 扩展
 LwdCloudNotify = Union[LwdHelloNotify, LwdResultNotify]  # noqa: UP007
 
+# 数据面批型(SchedulerOutput.batch_type 取值,§9.12):embed = 边侧
+# embedding 批(prefill 侧),unembed = 边侧 lm_head 批(decode 结果侧);
+# 缺省 None = 原生完整前向批(非 lwd 路径)
+LWD_BATCH_TYPE_EMBED = "embed"
+LWD_BATCH_TYPE_UNEMBED = "unembed"
+
 _NOTIFY_DECODER = msgspec.msgpack.Decoder(LwdNotify)
 _CLOUD_NOTIFY_DECODER = msgspec.msgpack.Decoder(LwdCloudNotify)
 

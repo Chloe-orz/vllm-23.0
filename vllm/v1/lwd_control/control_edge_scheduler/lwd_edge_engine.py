@@ -27,7 +27,12 @@ import queue
 import threading
 
 from vllm.logger import init_logger
-from vllm.v1.engine import EngineCoreRequestType
+from vllm.v1.engine import (
+    EngineCoreOutput,
+    EngineCoreOutputs,
+    EngineCoreRequestType,
+    FinishReason,
+)
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
     LwdControlPublisher,
@@ -46,6 +51,7 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import (
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler import (
     LwdEdgeScheduler,
+    lwd_build_unembed_batch,
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_step_core import LwdLog
 
@@ -204,15 +210,79 @@ class LwdEdgeEngineCore(EngineCoreProc):
         return self._lwd_edge_step()
 
     def _lwd_edge_step(self) -> tuple[dict[int, object] | None, bool]:
-        """编排(原 LwdEdgeCore.step_with_batch_queue 迁入):
-        调度器 schedule() -> 发预告 -> 提交执行 -> 步末推进进度。"""
+        """编排:步首云结果消费(unembed→deliver) -> prefill 编排 ->
+        步末僵尸检查;返回 (云结果输出 | None, prefill 是否有工作)。"""
+        outputs, finished_reqs = self._lwd_edge_consume_results()
         executed: dict[str, int] = {}
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
             executed = self._lwd_edge_dispatch(scheduler_output)
             self._lwd_log.phase("edge step: %d reqs executed", len(executed))
         self.scheduler.lwd_edge_update_progress(executed)
+        for request_id in self.scheduler.lwd_edge_zombie_check():
+            outputs.append(
+                EngineCoreOutput(
+                    request_id, [], finish_reason=FinishReason.ABORT
+                )
+            )
+            finished_reqs.add(request_id)
+        if outputs:
+            return (
+                EngineCoreOutputs(
+                    outputs=outputs,
+                    finished_requests=finished_reqs or None,
+                ),
+                bool(executed),
+            )
         return None, bool(executed)
+
+    def _lwd_edge_consume_results(self) -> tuple[list, set]:
+        """drain 结果队列 -> 组 UNEMBED 批提交 worker(lm_head,数据面按
+        batch_type 分流)-> deliver 到 awaiting -> 组前端输出。
+
+        worker 返回按批型约定为 dict[request_id -> token_ids](假定接口);
+        LwdResultNotify 当前仅 request_id(占位),finished 暂按 True 处理,
+        消息补 finished 字段后改为透传。迟到结果 deliver 返回 False,
+        丢弃告警(幂等);UNEMBED 批与 prefill 排程串行,无顺序耦合。
+        """
+        notifies: list[LwdResultNotify] = []
+        while True:
+            try:
+                notifies.append(self.lwd_result_queue.get_nowait())
+            except queue.Empty:
+                break
+        if not notifies:
+            return [], set()
+        unembed_batch = lwd_build_unembed_batch([n.request_id for n in notifies])
+        result = self.model_executor.execute_model(unembed_batch).result()
+        token_map = result if isinstance(result, dict) else {}
+        if not isinstance(result, dict):
+            logger.warning(
+                "[Lwd] unembed batch returned %r (expected token map), "
+                "delivering empty tokens",
+                type(result),
+            )
+        outputs: list = []
+        finished_reqs: set = set()
+        for notify in notifies:
+            token_ids = list(token_map.get(notify.request_id, []))
+            if not self.scheduler.lwd_edge_deliver_tokens(
+                notify.request_id, token_ids, finished=True
+            ):
+                logger.warning(
+                    "[Lwd] drop stale cloud result for %s (not awaiting)",
+                    notify.request_id,
+                )
+                continue
+            outputs.append(
+                EngineCoreOutput(
+                    notify.request_id,
+                    token_ids,
+                    finish_reason=FinishReason.STOP,
+                )
+            )
+            finished_reqs.add(notify.request_id)
+        return outputs, finished_reqs
 
     def _lwd_edge_dispatch(self, scheduler_output) -> dict[str, int]:
         """调度器 lwd_edge_notify 发预告 + 原生 executor 同步提交。
