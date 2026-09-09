@@ -1105,3 +1105,51 @@ monkeypatch 不可达子进程,类选择必须在子进程内做。
    静态套件(lwd_check_budget/ruff check/py_compile)全绿。
    真机冒烟项(随 §10.6 backlog):长 prompt 组员 + 短请求混跑,
    断言 decode 步批内 `num_computed == num_prompt` 恒成立。
+
+### 10.16 结果面重开:云->边 worker 结果回传(2026-09-09,用户裁定)
+
+**裁定**:重开云->边结果面,修订 §9.1"无结果面"的裁剪范围——HELLO 发现
+仍在 POST_OUT(不动),worker 结果回传落独立新面 **RESULT_IN**
+(协议分面 §10.7 增至三面:PRE_OUT 边->云预告 / POST_OUT 云->边发现 /
+RESULT_IN 云->边结果)。动机:云 decode 结果(新 token)需回边组装输出。
+
+拓扑(全 additive,零上游改动):
+
+- 云侧:覆写 `LwdCloudEngineCore.process_output_sockets`(原生输出线程
+  仍是 `output_queue` **唯一消费者**,不另起第二消费者——多消费会劈开
+  输出序)。路由:带 per-request outputs 的数据帧(utility_output 为空
+  且 outputs 非空)tee 至结果面 `LwdControlPublisher`;utility/EEP/DP
+  wave/DEAD 等引擎控制输出仍按原生 client_index 回本端前端(前端
+  utility 应答与 DEAD 握手依赖它们,不可劫走)。结果帧队满小睡重试
+  (结果不可丢),关停以 `publisher.closed` 退出。
+- 边侧:`lwd_edge_try_assemble` 经 HELLO 门后起 `_lwd_edge_start_result_plane`:
+  bind RESULT_IN 订阅端(解码 = 上游 `MsgpackDecoder(EngineCoreOutputs)`),
+  新线程 lwd-result-in 收即入 `engine_core.lwd_cloud_result_queue`
+  (有界 1000,队满阻塞——背压沿 zmq 直达云 output_queue,与原生阻塞
+  send 等价)。队列消费点 = §9.12 数据面接缝(单消费者,随数据面落位接线)。
+- 端口:`LwdConfig.result_in_port`(默认 POST_OUT+1=5560),env
+  `VLLM_ASCEND_LWD_RESULT_IN_PORT`;bind 界面复用 `post_out_bind`。
+  云 connect `master_addr:result_in_port`(装配期即知,无 retarget)。
+
+并发裁定(对既有通信原语的审计结论,§2.4 背压补充):
+
+- `queue.Queue` 自带互斥,生产者并发安全,**不外加锁**;需要守住的
+  不变量是结构性而非锁性:每 socket 单线程(zmq 亲和,publisher 经
+  队列命令 retarget 已保证)、每队列单消费者、每 plane 独立
+  `LwdControlPublisher/Subscriber` 实例(结果面与 HELLO 面不共 socket
+  —— 共用会撞 `lwd_decode_cloud_notify` 联合解码器,结果帧被当坏帧丢弃)。
+- `MsgpackEncoder/Decoder` 实例线程绑定(aux_buffers 暂存态),每 plane
+  自建实例,勿共享;结果面编码器将 zero-copy 多 buffer 单帧化
+  (`b"".join`,PO decode 结果小,合帧拷贝可忽略)以适配单帧
+  `communicator.send`。
+- 原语加固(审计发现的缺陷,本节修):`LwdControlPublisher._send_thread`
+  原无异常出口,term 关停时 send 以 ETERM 逃逸 → 线程带未处理异常死亡
+  且跳过 `close()`(fd 泄漏)——改为 ETERM 收尾退出、其他 ZMQError 丢帧
+  告警保队列流动;`publish` 增加关停守卫(关停后入队 = 消息滞留无人
+  消费)与 `closed` 属性(结果面重试循环的退出位)。
+- 台账修订:`lwd_edge_assemble.py` 例外新增 `v1.engine`(结果面解码
+  定型)与 `v1.serial_utils`;`tools/lwd_check_budget.py` 同步。
+
+落地状态:S6 结果面 ✅(静态);真机冒烟(随 §10.6 backlog):
+边 bind 5560 → 云 output_queue 注入伪 EngineCoreOutputs → 边
+`lwd_cloud_result_queue` 收序保序断言;utility 帧不出现于结果面断言。

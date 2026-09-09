@@ -30,6 +30,9 @@ LWD_POST_OUT_PORT_DEFAULT = LWD_PRE_OUT_PORT_DEFAULT + 1
 # 云结果队列深度(接收线程 -> 引擎主线程;lwd-post-in 写 / 引擎步读)
 LWD_RESULT_QUEUE_MAX = 1024
 
+# 云->边步元数据接缝队列容量(§9.12):生产端 lwd-post-in,消费端随数据面落位
+LWD_C2E_META_QUEUE_MAX = 1000
+
 _LWD_CONFIG_SECTION = "lwd_config"
 # 传输层字段(pre_out_host 等)的历史段名;仅作兼容回退,新增部署用 lwd_config
 _LWD_LEGACY_SECTION = "edge_cloud_config"

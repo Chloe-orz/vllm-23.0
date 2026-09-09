@@ -68,27 +68,28 @@ class LwdHelloNotify(msgspec.Struct, gc=False, tag=True):
     pre_out_port: int
 
 
-class LwdResultNotify(msgspec.Struct, gc=False, tag=True):
-    """云->边结果通告(POST_OUT,占位首版:仅 request_id,载荷字段后续补充)。
+class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):
+    """云->边步元数据预告(POST_OUT):先于隐藏张量到达,边侧据
+    hidden_num_elements 预挂精确尺寸 recv;req_ids/top_id_ths 按隐藏
+    行序(ModelRunnerOutput.lwd_c2e_meta 的线上形态)。"""
 
-    边侧接收线程按类型分发入结果队列,由引擎步消费;unembedding
-    载荷/完结标志等字段在此 additive 扩展,解码器随 union 自动覆盖。
-    """
-
-    request_id: str
+    hidden_num_elements: int
+    top_id_ths: list[list[int]]
+    num_accepted_tokens: list[int]
+    req_ids: list[str]
 
 
 # typing.Union 而非 PEP 604 `|`:msgspec 解码器的全版本支持路径
 LwdNotify = Union[LwdRangeNotify, LwdRequestNotify, LwdAbortNotify]  # noqa: UP007
-# 云->边方向(POST_OUT 保留面):HELLO + 结果回传(占位),重同步消息
-# 等后续在此 union 上 additive 扩展
-LwdCloudNotify = Union[LwdHelloNotify, LwdResultNotify]  # noqa: UP007
 
 # 数据面批型(SchedulerOutput.batch_type 取值,§9.12):embed = 边侧
 # embedding 批(prefill 侧),unembed = 边侧 lm_head 批(decode 结果侧);
 # 缺省 None = 原生完整前向批(非 lwd 路径)
 LWD_BATCH_TYPE_EMBED = "embed"
 LWD_BATCH_TYPE_UNEMBED = "unembed"
+# 云->边方向(POST_OUT):HELLO 发现 + 步元数据;后续结果回传/
+# 重同步消息在此 union 上 additive 扩展
+LwdCloudNotify = Union[LwdHelloNotify, LwdC2eNotify]  # noqa: UP007
 
 _NOTIFY_DECODER = msgspec.msgpack.Decoder(LwdNotify)
 _CLOUD_NOTIFY_DECODER = msgspec.msgpack.Decoder(LwdCloudNotify)

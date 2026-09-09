@@ -55,13 +55,16 @@
 | 字段 | 类型 | 用途 |
 |------|------|------|
 | `_lwd_subscriber` | `LwdControlSubscriber` | PRE_OUT 接收句柄(zmq PULL, bind=True);在 PRE_OUT 线程内创建与使用(zmq 单线程亲和) |
-| `_lwd_gate_pending` | `dict[str, LwdRequestNotify]` | **门池**:收到元数据的线上消息。key 为 request_id,重复元数据告警丢弃;元数据到达即构建放行,正常时序下瞬时存亡 |
+| `_lwd_gate_pending` | `dict[str, LwdRequestNotify]` | **门池**:收到元数据的线上消息,等账本收齐。key 为 request_id,重复元数据告警丢弃 |
+| `_lwd_ready_tokens` | `dict[str, int]` | **就绪账本**:RangeNotify 逐段推进(`max(账本, offset+num_tokens)`),覆盖 `num_prompt_tokens` 即收齐放行;abort 时随门池清理 |
 
 两个字段均在 `_lwd_setup_zmq()` 中初始化,而该函数在 PRE_OUT 线程内、进入
 接收循环之前调用(先建后用,无构造期竞态)。
 
-> 注:原 `_lwd_gate_ready`(offset==0 开门集合)已裁撤——它只写不读,放行
-> 实际只由门池 pop 决定;数据到齐前的开算 gate 归数据面(§9.12)。
+> 注:原 `_lwd_gate_ready`(offset==0 开门集合)已裁撤(只写不读)。现行放行
+> 语义 = "账本收齐":引擎层等请求数据收齐才构建放行,云 prefill 不跑未收齐
+> 请求。当前账本以边侧预告近似到货(数据面未接),数据面落位后(§9.12)
+> 改由实际到货驱动。
 
 ### 3.3 调度器内部状态(`LwdCloudPhaseScheduler`)
 
@@ -112,15 +115,16 @@
 
 | 消息 | 行为 |
 |------|------|
-| `LwdRangeNotify` | 当前无动作(数据面登记接缝,§9.12;原 `offset==0` 首预告门已裁撤) |
-| `LwdRequestNotify` | rid 已在门池 → 告警丢弃;否则入池 + `_lwd_promote(rid)` 即构建放行 |
-| `LwdAbortNotify` | 清门池 + `aborts_queue.put` + `input_queue.put((ABORT,[rid]))`(与原生 abort 双队列同款:eager 处理 + 保持 input_queue 次序,调度器 abort 幂等) |
+| `LwdRangeNotify` | 推进就绪账本:`max(账本, offset + num_tokens)`(单调幂等,乱序只认连续前缀)→ 触发一次 `_lwd_promote(rid)` |
+| `LwdRequestNotify` | rid 已在门池 → 告警丢弃;否则入池 + `_lwd_promote(rid)`(账本收齐才真正放行) |
+| `LwdAbortNotify` | 清门池/账本 + `aborts_queue.put` + `input_queue.put((ABORT,[rid]))`(与原生 abort 双队列同款:eager 处理 + 保持 input_queue 次序,调度器 abort 幂等) |
 
 #### 4.1.5 `_lwd_promote(request_id)` — 私有,过门
 
-门池 pop wire;为 None 则 no-op;否则 `_lwd_build_request` 后
-`input_queue.put((ADD, (request, 0)))`,主循环走原生 `_handle_client_request`
-分发。日志 `[Lwd] cloud request %s admitted via gate`。
+门池查 wire;无则 no-op;账本(`_lwd_ready_tokens`)未覆盖
+`wire.num_prompt_tokens` 则留池等后续 range;收齐才 `_lwd_build_request` 后
+`input_queue.put((ADD, (request, 0)))`,并清门池/账本条目,主循环走原生
+`_handle_client_request` 分发。日志 `[Lwd] cloud request %s admitted (%d tokens ready)`。
 
 #### 4.1.6 `_lwd_build_request(wire) -> Request` — 私有,唯一建请求点
 
@@ -351,13 +355,15 @@ flowchart TD
 | 仅 `run_headless` 注入相位调度器 | 非 headless serve 下引擎类仍被选中但 `scheduler_cls` 不注入 → 云引擎 + 原生 AsyncScheduler 混搭;内嵌 `LLM()` 模式两挂点均不经过 |
 | MoE + DP 分支 | `run_engine_core` 的 MoE DP 分支走 `DPEngineCoreProc`,云引擎不被选中 |
 | 配置 | `additional_config.edge_cloud_config`:云角色需 `mode=prefill_only`、`role=cloud`,可选 `scheduler`(prefill_first/decode_first)、`pre_out_host/port`;env `VLLM_ASCEND_LWD_PRE_OUT_HOST/PORT/DEBUG` 只覆盖地址与调试 |
+| 云侧前缀缓存强制关闭 | serve 守卫写 `enable_prefix_caching = False`:占位零值 token 若以边侧真实哈希入缓存会污染后续命中,哈希链机制亦随之无消费方 |
 
 ### 8.2 已知缺口(控制面已建、待数据面/接线收敛)
 
 | # | 缺口 | 影响 | 计划归属 |
 |---|------|------|----------|
 | G1 | 边侧 `lwd_edge_notify_request` / `lwd_edge_abort` 出口无调用方 | 云侧当前实际收不到任何请求/abort,门池恒空 | 数据面落位(§9.12)接线 |
-| G2 | 开算 gate 未建(原 `offset==0` 首预告门已裁撤,元数据到达即放行) | 数据面落位后,数据到齐前云可能被调度提前开算;且判据不能沿用 `offset==0`——边侧前缀缓存命中时首张 range offset>0(v1 默认开前缀缓存),沿用会永不开门 | 数据面落位时建 gate:判据用"该请求首张 range"(first_chunk 标志或最小 seqno),前缀空洞由 block_hashes 在云侧补 |
+| G2 | 分段传算流水未实现(V1 收齐放行) | 请求等全部 range 到齐才进调度器,传输与计算不重叠,TTFT 为全量传输时长;若做流水需按就绪水位截断调度,且原生 waiting/running 两循环分别以 `num_prompt_tokens`/缓冲长度为界,截断须一并处理 | 数据面落位(§9.12)后设计 |
 | G3 | zombie 兜底未实现 | `zombie_log_interval_s` 为死配置;门池卡死无检测 | 数据面落位 |
 | G4 | `_lwd_subscriber` 无关停路径 | 引擎关停不收 PRE_OUT 通道,靠进程退出兜底 | 云侧关停收敛 |
 | G5 | `offset>0` 的 range 无任何登记/日志 | 数据面接缝就位前,非首 chunk 预告被静默忽略 | 数据面落位 |
+| G6 | 边侧前缀缓存命中会跳发头部段 | 边命中前缀时首个 range offset>0、头部无预告;预告近似下被掩盖(账本仍可被尾部段推满,但云算的头部无真实数据),数据面落位后请求将永远收不齐 | PO 模式边侧前缀缓存需关闭,或预告强制覆盖全 prompt(接线前置约束) |
