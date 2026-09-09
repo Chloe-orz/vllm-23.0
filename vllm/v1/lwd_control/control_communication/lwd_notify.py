@@ -54,10 +54,28 @@ class LwdAbortNotify(msgspec.Struct, gc=False, tag=True):
     request_id: str
 
 
+class LwdHelloNotify(msgspec.Struct, gc=False, tag=True):
+    """云->边发现通告(POST_OUT 面的周期性心跳帧)。
+
+    云侧启动即通告、此后周期重发:边重启后重新发现(边侧幂等)、
+    云换址重启后边侧 retarget PRE_OUT。pre_out_* 是边侧连接云端点
+    的唯一事实源(边侧不读配置里的 host——决策 B:单一事实源)。
+    pre_out_host 必须是边可路由的真实 IP(或同机 127.0.0.1),
+    0.0.0.0 不可作为通告值(serve 守卫拦截)。
+    """
+
+    pre_out_host: str
+    pre_out_port: int
+
+
 # typing.Union 而非 PEP 604 `|`:msgspec 解码器的全版本支持路径
 LwdNotify = Union[LwdRangeNotify, LwdRequestNotify, LwdAbortNotify]  # noqa: UP007
+# 云->边方向(POST_OUT 保留面):现在只有 HELLO,将来的结果回传/
+# 重同步消息在此 union 上 additive 扩展
+LwdCloudNotify = Union[LwdHelloNotify]  # noqa: UP007
 
 _NOTIFY_DECODER = msgspec.msgpack.Decoder(LwdNotify)
+_CLOUD_NOTIFY_DECODER = msgspec.msgpack.Decoder(LwdCloudNotify)
 
 
 def lwd_encode_notify(message: LwdNotify) -> bytes:
@@ -68,3 +86,13 @@ def lwd_encode_notify(message: LwdNotify) -> bytes:
 def lwd_decode_notify(data: bytes) -> LwdNotify:
     """传输字节解码为通知(订阅端唯一入口);坏包抛异常,由接收线程捕获丢弃。"""
     return _NOTIFY_DECODER.decode(data)
+
+
+def lwd_encode_cloud_notify(message: LwdCloudNotify) -> bytes:
+    """云->边通知编码(POST_OUT 发布端唯一入口)。"""
+    return msgspec.msgpack.encode(message)
+
+
+def lwd_decode_cloud_notify(data: bytes) -> LwdCloudNotify:
+    """云->边通知解码(POST_OUT 订阅端唯一入口);坏包抛异常由接收方丢弃。"""
+    return _CLOUD_NOTIFY_DECODER.decode(data)
