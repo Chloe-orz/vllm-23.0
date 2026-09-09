@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
         LwdControlPublisher,
     )
+    from vllm.v1.request import Request
 
 logger = init_logger(__name__)
 
@@ -55,6 +56,29 @@ class LwdEdgeScheduler(AsyncScheduler):
         scheduler_output = super().schedule()
         self._lwd_last_scheduled = dict(scheduler_output.num_scheduled_tokens)
         return scheduler_output
+
+    def lwd_edge_add_request(self, request: Request) -> None:
+        """边侧请求入口(core.py add_request 守卫的委托点,§9.12)。
+
+        边界校验先于入队:非法请求不得进入调度器;请求预告先行于本地
+        登记(源仓 §14.4 同款:云侧视图领先本地工作,只能准备不能计算);
+        abort_immediately 走 finish + abort 出口(原生 core.py 路径已被
+        守卫旁路,语义等价迁移)。
+        """
+        self._lwd_validate_request(request)
+        sampling_params = request.sampling_params
+        self.lwd_edge_notify_request(
+            request_id=request.request_id,
+            num_prompt_tokens=len(request.prompt_token_ids),
+            max_tokens=(
+                sampling_params.max_tokens if sampling_params is not None else 16
+            ),
+            block_hashes=list(request.block_hashes),
+        )
+        super().add_request(request)
+        if request.abort_immediately:
+            self.finish_requests([request.request_id], RequestStatus.FINISHED_ABORTED)
+            self.lwd_edge_abort([request.request_id])
 
     def lwd_edge_notify(self, scheduler_output: SchedulerOutput) -> bool:
         """对新调度的 prefill 发 LwdRangeNotify(seqno 先行)。
@@ -128,16 +152,22 @@ class LwdEdgeScheduler(AsyncScheduler):
     def lwd_edge_update_progress(self, executed: dict[str, int]) -> None:
         """步末对账实际执行量;prompt 全部嵌入完成即本地终结(§9.10)。
 
-        原生 _update_after_schedule 在调度时已乐观推进 num_computed,
-        此处按 executed 回退未执行部分(与 update_from_output 的拒绝回退
-        同款语义);终结不依赖任何模型输出,这是与原生路径的唯一语义差。
-        executed 的实际来源由数据面落位时对接(§9.12)。
+        对账基准是本步排程登记(_lwd_last_scheduled)而非 executed:原生
+        _update_after_schedule 在调度时已乐观推进 num_computed,步末必须
+        回退未派发的部分——notify 队满时 executed 缺项即全量回退(与
+        update_from_output 的拒绝回退同款语义),步末后 num_computed ==
+        本步实际派发水位,下一步原生调度自然复现同一范围。executed 必须
+        是本步排程集的子集(同步执行接缝保证;数据面落位时按 §9.12
+        重定义此接缝)。终结不依赖任何模型输出,这是与原生路径的唯一
+        语义差。
         """
         finished_ids: list[str] = []
-        for request_id, num_executed in executed.items():
+        for request_id in self._lwd_last_scheduled:
             request = self.requests.get(request_id)
             if request is None:
+                # 本步内已终结(abort/更早完成):迟到的对账无对象。
                 continue
+            num_executed = executed.get(request_id, 0)
             self._lwd_reconcile_progress(request, request_id, num_executed)
             if request.num_computed_tokens >= request.num_prompt_tokens:
                 finished_ids.append(request_id)
@@ -153,6 +183,46 @@ class LwdEdgeScheduler(AsyncScheduler):
         if num_undone > 0:
             request.num_computed_tokens -= num_undone
             request.is_prefill_chunk = True
+            # 最后一段排程时 _update_after_schedule 已为"预期采样输出帧"
+            # +1 占位符;边侧无采样,回退到未完成态时一并归零——否则重试
+            # 排程再次 +1,原生 running 循环按 num_tokens_with_spec + 占位
+            # 符 - num_computed 算出超出 prompt 的幻影 token。边侧从无
+            # 输出帧在途,归零即陈述事实。
+            request.num_output_placeholders = 0
+
+    @staticmethod
+    def _lwd_validate_request(request: Request) -> None:
+        """首版边界(源仓 dispatcher._validate 迁移,语义不变,§14.4/§14.10)。
+
+        违规即抛 ValueError:在请求进入调度器之前拒绝(core.py 守卫先
+        校验后入队),错误经 add_request 调用链回到客户端的 error 路径。
+        """
+        if request.prompt_embeds is not None:
+            raise ValueError(
+                f"[LWD] prefill-only mode does not accept client-provided "
+                f"prompt_embeds (request {request.request_id}); the edge "
+                "is the embedding owner"
+            )
+        if not request.prompt_token_ids:
+            raise ValueError(
+                f"[LWD] prefill-only mode requires a non-empty prompt "
+                f"(request {request.request_id})"
+            )
+        if request.pooling_params is not None:
+            raise ValueError(
+                "[LWD] prefill-only mode does not support pooling requests "
+                f"(request {request.request_id})"
+            )
+        if request.mm_features:
+            raise ValueError(
+                "[LWD] prefill-only mode does not support multimodal inputs "
+                f"(request {request.request_id})"
+            )
+        if request.use_structured_output:
+            raise ValueError(
+                "[LWD] prefill-only mode does not support structured output "
+                f"(request {request.request_id})"
+            )
 
     def _lwd_edge_next_seqno(self) -> int:
         """seqno 单调分配;控制面登记与数据面 tag 都由它派生。"""
