@@ -4,6 +4,8 @@
   1. 工作纯相位取代"按人口分伙":prefill 步算一切 prompt 工作(WAITING 首块
      + RUNNING 中的 prefill 尾巴),decode 步只算 prompt 已完结请求的 1-token
      采样 —— 长序列被 chunked prefill 截断的尾巴不再混进 decode 批;
+     单请求组批约束(§9.9 修订):prefill 批最多含一个请求(容器交换,
+     尾巴优先/队首放行),数据面 chunk 流按请求连续;
   2. 子类合并:LwdCloudPrefillFirst/DecodeFirst 收敛为本类,相位在构造期经
      LwdConfig 自解析(scheduler_cls 注入只带类身份,相位改走 vllm_config,
      §10.15);注册表/工厂删除,未知相位名告警回退 prefill_first;
@@ -37,6 +39,10 @@ class LwdCloudPhaseScheduler(AsyncScheduler):
         # One-shot flag: the last chosen phase produced an empty step and
         # the other population has work — try that phase next step.
         self._force_other_phase: bool = False
+        logger.info(
+            "[Lwd] cloud phase scheduler: single-request prefill batches "
+            "enforced (edge/cloud chunk stream stays per-request contiguous)"
+        )
 
     # ------------------------------------------------------------------ #
     # Phase resolution(§10.15:scheduler_cls 单类,相位经 LwdConfig)      #
@@ -88,16 +94,35 @@ class LwdCloudPhaseScheduler(AsyncScheduler):
     # Phase primitives(容器交换;原生 schedule() 零改动)                  #
     # ------------------------------------------------------------------ #
     def _schedule_pure_prefill(self) -> SchedulerOutput:
-        """一个纯 prefill 步:WAITING 全量 + running 中的尾巴可见;
-        decode-ready 藏起(其 1-token 采样不得混入 prefill 批)。"""
+        """一个纯 prefill 步,批内最多一个请求(§9.9 单请求组批约束)。
+
+        visible 集只放一个 prefill 工作单元:running 尾巴优先(藏其余
+        尾巴与全部 waiting),否则只放行 waiting 队首;decode-ready 照旧
+        藏起(其 1-token 采样不得混入 prefill 批)。单请求内 chunked
+        决策(预算截断/KV 抢占)照旧;藏起的 waiting 走队首回插,藏起
+        的尾巴接回 running 尾部,均保 FIFO。"""
         decode_ready, tails = self._lwd_split_running()
-        self.running = tails
+        hidden_waiting = self.waiting
+        self.waiting = create_request_queue(self.policy)
+        hidden_tails: list = []
+        if tails:
+            hidden_tails = tails[1:]
+            self.running = tails[:1]
+        else:
+            # decode-ready 藏起(与原版同语义);无尾巴时 running 清空
+            self.running = []
+            if hidden_waiting:
+                self.waiting.add_request(hidden_waiting.peek_request())
         try:
             out = super().schedule()
         finally:
             # schedule 期间该列表 = 幸存尾巴(被抢占的已弹出)
             # + 本步 waiting->running 的新请求,接在 decode-ready 之后。
-            self.running = decode_ready + self.running
+            leftover = self.waiting
+            self.waiting = hidden_waiting
+            while leftover:
+                self.waiting.prepend_request(leftover.pop_request())
+            self.running = decode_ready + self.running + hidden_tails
         return out
 
     def _schedule_pure_decode(self) -> SchedulerOutput:

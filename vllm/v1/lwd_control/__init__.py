@@ -32,9 +32,11 @@
   经 lwd_resolve_engine_cls 分流)+ serve.py 入口守卫(lwd_serve_guard)。
 
 分块模型(§9.9):不自造分割,复用原生 Scheduler.schedule() 的 chunked
-  prefill 决策;边侧纯 prefill = 原生调度 + 完结即本地终结
-  (lwd_edge_scheduler);云侧相位 = 原生调度的队列手术复用
-  (lwd_cloud_phase_scheduler,空步不重复调 schedule)。
+  prefill 决策;单请求组批约束(§9.9 修订):两侧 prefill 批最多含一个
+  请求(容器交换隐藏其余,单请求内 chunked/KV 决策照旧)——数据面
+  chunk 流按请求连续,云侧 fill 无跨请求 head-of-line;边侧纯 prefill =
+  原生调度 + 完结即本地终结(lwd_edge_scheduler);云侧相位 = 原生调度的
+  队列手术复用(lwd_cloud_phase_scheduler,空步不重复调 schedule)。
 
 目录布局(§10.3 支撑折入既有文件,框架不增文件):
   control_communication/(传输层,side-agnostic,只认方向不认边/云;
