@@ -27,8 +27,6 @@ logger = init_logger(__name__)
 
 LWD_PRE_OUT_PORT_DEFAULT = 5558
 LWD_POST_OUT_PORT_DEFAULT = LWD_PRE_OUT_PORT_DEFAULT + 1
-# 云结果队列深度(接收线程 -> 引擎主线程;lwd-post-in 写 / 引擎步读)
-LWD_RESULT_QUEUE_MAX = 1024
 
 # 云->边步元数据接缝队列容量(§9.12):生产端 lwd-post-in,消费端随数据面落位
 LWD_C2E_META_QUEUE_MAX = 1000

@@ -8,17 +8,17 @@
 装配时序(§9.1/§9.10):
   ① kv_transfer_config 预检:在场则降级原生(不建任何 lwd 状态,覆写
      方法按 _lwd_active=False 走 super(),语义同旧装配降级)。
-  ② 通信面先建:bind POST_OUT、延迟连接的 PRE_OUT publisher、结果队列、
-     lwd-post-in 发现线程,阻塞等首条 HELLO(hello_timeout_s fail-fast,
-     失败自清理两面后抛)。
+  ② 通信面先建:bind POST_OUT、延迟连接的 PRE_OUT publisher、云载荷
+     队列(lwd_c2e_meta_queue)、lwd-post-in 发现线程,阻塞等首条 HELLO
+     (hello_timeout_s fail-fast,失败自清理两面后抛)。
   ③ scheduler_cls 注入裸类后 super().__init__():调度器出生即
      LwdEdgeScheduler(零整实例重建);publisher 构造后回填(装配期完成,
      早于任何请求,等价构造注入——get_scheduler_cls 无法携带实参)。
 
 步进编排(原 LwdEdgeCore 迁入):step/step_with_batch_queue 覆写 =
+步首云载荷消费(c2e 元数据 -> UNEMBED 批 -> deliver -> 前端输出)+
 调度器 schedule(单请求组批) -> lwd_edge_notify 发预告(队满整步回退)
--> 原生 executor 同步执行 -> 步末对账;输出恒 (None, 是否有工作),
-云结果回传占用返回值首位待后续 Step 启用。
+-> 原生 executor 同步执行 -> 步末对账。
 """
 
 from __future__ import annotations
@@ -41,12 +41,11 @@ from vllm.v1.lwd_control.control_communication.lwd_control_subscriber import (
     LwdControlSubscriber,
 )
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
+    LwdC2eNotify,
     LwdHelloNotify,
-    LwdResultNotify,
     lwd_decode_cloud_notify,
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import (
-    LWD_RESULT_QUEUE_MAX,
     LwdConfig,
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler import (
@@ -56,6 +55,9 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler import (
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_step_core import LwdLog
 
 logger = init_logger(__name__)
+
+# 云->边步元数据接缝队列容量(§9.12):生产端 lwd-post-in,消费端随数据面落位
+LWD_C2E_META_QUEUE_MAX = 1000
 
 
 class LwdEdgeEngineCore(EngineCoreProc):
@@ -82,7 +84,10 @@ class LwdEdgeEngineCore(EngineCoreProc):
         self._lwd_publisher = LwdControlPublisher(
             None, bind=False, queue_max=config.publish_queue_max
         )
-        self.lwd_result_queue = queue.Queue(maxsize=LWD_RESULT_QUEUE_MAX)
+        # 云->边唯一载荷队列(§9.12):LwdC2eNotify 步元数据(兼结果回传
+        # 驱动);生产端 lwd-post-in,消费端引擎步(UNEMBED 派发)与数据面
+        # (预挂 recv);队满阻塞:元数据不可丢,背压沿 zmq 直达云侧
+        self.lwd_c2e_meta_queue = queue.Queue(maxsize=LWD_C2E_META_QUEUE_MAX)
         hello_event = threading.Event()
         discovery = threading.Thread(
             target=self._lwd_discovery_loop,
@@ -128,9 +133,10 @@ class LwdEdgeEngineCore(EngineCoreProc):
         HELLO -> retarget PRE_OUT(云端点唯一事实源,§9.1):常驻运行,
         云换址重启后周期 HELLO 仍能驱动先连新断旧;retarget 队满失败
         靠周期重发自愈。
-        LwdResultNotify -> 结果队列(不丢)+ WAKEUP 唤醒主循环:引擎可能
-        阻塞在 input_queue.get()(prefill 全部完成后 awaiting 无排程
-        工作),结果只进 lwd_result_queue 不会唤醒任何线程,必须敲门;
+        LwdC2eNotify(云->边唯一载荷)-> 元数据队列(阻塞 put:不可丢,
+        背压沿 zmq 直达云侧步循环)+ WAKEUP 唤醒主循环:引擎可能阻塞
+        在 input_queue.get()(prefill 全部完成后 awaiting 无排程工作),
+        元数据只进 lwd_c2e_meta_queue 不会唤醒任何线程,必须敲门;
         WAKEUP 分支原生即丢弃消息体,数据与唤醒分离,多投无害(空
         drain 一步即返回)。
         """
@@ -152,27 +158,13 @@ class LwdEdgeEngineCore(EngineCoreProc):
                         "[Lwd] PRE_OUT retarget deferred: publish queue full"
                     )
                 hello_event.set()
-            elif isinstance(msg, LwdResultNotify):
-                self._lwd_enqueue_result(msg)
+            elif isinstance(msg, LwdC2eNotify):
+                self.lwd_c2e_meta_queue.put(msg)
+                self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
             else:
-                # 协议分面:POST_OUT 只承载 HELLO 与结果,坏帧已被订阅层丢弃
+                # 协议分面:POST_OUT 只承载 HELLO 与步元数据(唯一载荷),
+                # 坏帧已被订阅层丢弃
                 logger.warning("[Lwd] drop unexpected POST_OUT frame %r", type(msg))
-
-    def _lwd_enqueue_result(self, msg: LwdResultNotify) -> None:
-        """云结果入队(唯一数据通道,不丢)+ WAKEUP 唤醒主循环。
-
-        队满自旋重试(结果不可失,与 publisher 背压可丢语义相反):
-        消费侧每步取空,积压只来自引擎长步;重试间隔与接收线程 5s
-        超时拍同量级,不阻塞 HELLO retarget 之外的职责。
-        """
-        while not self._lwd_post_out_receiver.closed:
-            try:
-                self.lwd_result_queue.put_nowait(msg)
-                break
-            except queue.Full:
-                logger.warning("[Lwd] result queue full, retrying (rid=%s)", msg.request_id)
-                threading.Event().wait(0.01)
-        self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
 
     def _lwd_shutdown_planes(self) -> None:
         """两面关停(幂等):receiver 先关(断输入),publisher 收尾。"""
@@ -210,9 +202,10 @@ class LwdEdgeEngineCore(EngineCoreProc):
         return self._lwd_edge_step()
 
     def _lwd_edge_step(self) -> tuple[dict[int, object] | None, bool]:
-        """编排:步首云结果消费(unembed→deliver) -> prefill 编排 ->
-        步末僵尸检查;返回 (云结果输出 | None, prefill 是否有工作)。"""
-        outputs, finished_reqs = self._lwd_edge_consume_results()
+        """编排:步首云载荷消费(c2e 元数据 -> unembed -> deliver) ->
+        prefill 编排 -> 步末僵尸检查;返回 (云结果输出 | None, prefill
+        是否有工作)。"""
+        outputs, finished_reqs = self._lwd_edge_consume_c2e()
         executed: dict[str, int] = {}
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
@@ -236,24 +229,29 @@ class LwdEdgeEngineCore(EngineCoreProc):
             )
         return None, bool(executed)
 
-    def _lwd_edge_consume_results(self) -> tuple[list, set]:
-        """drain 结果队列 -> 组 UNEMBED 批提交 worker(lm_head,数据面按
-        batch_type 分流)-> deliver 到 awaiting -> 组前端输出。
+    def _lwd_edge_consume_c2e(self) -> tuple[list, set]:
+        """drain 云载荷队列(LwdC2eNotify,云->边唯一载荷)-> 按 req_ids
+        组 UNEMBED 批提交 worker(lm_head,数据面按 batch_type 分流)->
+        deliver 到 awaiting -> 组前端输出。
 
-        worker 返回按批型约定为 dict[request_id -> token_ids](假定接口);
-        LwdResultNotify 当前仅 request_id(占位),finished 暂按 True 处理,
-        消息补 finished 字段后改为透传。迟到结果 deliver 返回 False,
-        丢弃告警(幂等);UNEMBED 批与 prefill 排程串行,无顺序耦合。
+        worker 返回按批型约定为 dict[request_id -> token_ids](假定
+        接口);c2e 元数据本体(hidden 尺寸/预挂 recv)归数据面消费,本层
+        只取 req_ids 驱动结果路径;完结判定暂按 True 处理,c2e 补完结
+        标志后改为透传。迟到载荷 deliver 返回 False,丢弃告警(幂等);
+        UNEMBED 批与 prefill 排程串行,无顺序耦合。
         """
-        notifies: list[LwdResultNotify] = []
+        notifies: list[LwdC2eNotify] = []
         while True:
             try:
-                notifies.append(self.lwd_result_queue.get_nowait())
+                notifies.append(self.lwd_c2e_meta_queue.get_nowait())
             except queue.Empty:
                 break
         if not notifies:
             return [], set()
-        unembed_batch = lwd_build_unembed_batch([n.request_id for n in notifies])
+        req_ids = [rid for notify in notifies for rid in notify.req_ids]
+        if not req_ids:
+            return [], set()
+        unembed_batch = lwd_build_unembed_batch(req_ids)
         result = self.model_executor.execute_model(unembed_batch).result()
         token_map = result if isinstance(result, dict) else {}
         if not isinstance(result, dict):
@@ -264,24 +262,24 @@ class LwdEdgeEngineCore(EngineCoreProc):
             )
         outputs: list = []
         finished_reqs: set = set()
-        for notify in notifies:
-            token_ids = list(token_map.get(notify.request_id, []))
+        for request_id in req_ids:
+            token_ids = list(token_map.get(request_id, []))
             if not self.scheduler.lwd_edge_deliver_tokens(
-                notify.request_id, token_ids, finished=True
+                request_id, token_ids, finished=True
             ):
                 logger.warning(
-                    "[Lwd] drop stale cloud result for %s (not awaiting)",
-                    notify.request_id,
+                    "[Lwd] drop stale cloud payload for %s (not awaiting)",
+                    request_id,
                 )
                 continue
             outputs.append(
                 EngineCoreOutput(
-                    notify.request_id,
+                    request_id,
                     token_ids,
                     finish_reason=FinishReason.STOP,
                 )
             )
-            finished_reqs.add(notify.request_id)
+            finished_reqs.add(request_id)
         return outputs, finished_reqs
 
     def _lwd_edge_dispatch(self, scheduler_output) -> dict[str, int]:

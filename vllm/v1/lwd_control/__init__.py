@@ -12,8 +12,8 @@
 通信模型(§9,双面拓扑):数据传输仅 边 -> 云 的 PRE_OUT
   (notify/add_request/abort,ZMQ PUSH:云 bind,边经 HELLO 发现后 connect);
   云 -> 边 的 POST_OUT(ZMQ PUSH:边 bind wildcard,云经 master_addr
-  connect)承载周期 HELLO 发现通告(云端点唯一事实源,决策 B)与
-  云结果回传(LwdResultNotify,载荷字段后续 additive 扩展);
+  connect)承载 HELLO 发现通告(云端点唯一事实源,决策 B)与
+  LwdC2eNotify 步元数据(云->边唯一载荷,兼结果回传驱动);
   无水位、无快路径。
 
 扩展模型(§10.14 边云同构):两侧引擎均经 core.py run_engine_core
