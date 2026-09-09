@@ -230,17 +230,20 @@ class LwdEdgeEngineCore(EngineCoreProc):
         return None, bool(executed)
 
     def _lwd_edge_consume_c2e(self) -> tuple[list, set]:
-        """drain 云载荷队列(LwdC2eNotify,云->边唯一载荷)-> 组 UNEMBED 批
-        (c2e 全量随批下发)提交 worker(lm_head,数据面按 batch_type 分流)
-        -> deliver 到 awaiting -> 组前端输出。
+        """drain 云载荷队列(LwdC2eNotify,云->边唯一载荷)-> 逐条处理:
+        带 hidden 行的通告组 UNEMBED 批提交 worker(c2e 全量随批下发)
+        取 token ids;纯终结通告(hidden_num_elements == 0)本地终结,
+        **不派发 worker**。token 逐条交付(finish_reason=None),仅在
+        finished 标记的请求上置 finish——流式/非流式由原生前端透明
+        处理(引擎层恒为增量)。
 
-        应答契约(定型):worker 经原生 future 返回 ModelRunnerResult 形态,
-        token ids 取 lwd_token_ids(request_id -> list[int];缺失/为 None/
-        空 = 该请求 unembed 失败)。错误路径:失败请求以 FinishReason.ERROR
-        终结前端等待(原生 ERROR 通道转 5xx),不静默降级为空 STOP 输出。
-        完结判定暂按 True 处理,c2e 补完结标志后改为透传。迟到载荷
-        deliver 返回 False,丢弃告警(幂等);UNEMBED 批与 prefill 排程
-        串行,无顺序耦合。
+        应答契约(定型):worker 经原生 future 返回 ModelRunnerResult
+        形态,token ids 取 lwd_token_ids(request_id -> list[int];缺失/
+        None/空 = 该请求 unembed 失败),失败以 FinishReason.ERROR
+        终结(原生 ERROR 通道转 5xx),不静默降级空 STOP。
+        finished 与 req_ids 对齐透传;缺省空列表 = 兼容"全部完结"
+        旧语义。迟到载荷 deliver 返回 False,丢弃告警(幂等);
+        UNEMBED 批与 prefill 排程串行,无顺序耦合。
         """
         notifies: list[LwdC2eNotify] = []
         while True:
@@ -250,41 +253,71 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 break
         if not notifies:
             return [], set()
-        req_ids = [rid for notify in notifies for rid in notify.req_ids]
-        if not req_ids:
-            return [], set()
-        unembed_batch = lwd_build_unembed_batch(notifies)
-        result = self.model_executor.execute_model(unembed_batch).result()
-        token_map = getattr(result, "lwd_token_ids", None)
-        if token_map is None:
-            logger.warning(
-                "[Lwd] unembed batch answer missing lwd_token_ids (%r), "
-                "finishing requests with ERROR",
-                type(result),
-            )
+
         outputs: list = []
         finished_reqs: set = set()
-        for request_id in req_ids:
-            token_ids = list(token_map.get(request_id, [])) if token_map else []
-            if not self.scheduler.lwd_edge_deliver_tokens(
-                request_id, token_ids, finished=True
-            ):
+
+        # 带 hidden 行的通告:组批一次提交 worker
+        rowed = [n for n in notifies if n.req_ids and n.hidden_num_elements > 0]
+        token_map: dict | None = None
+        if rowed:
+            unembed_batch = lwd_build_unembed_batch(rowed)
+            result = self.model_executor.execute_model(unembed_batch).result()
+            token_map = getattr(result, "lwd_token_ids", None)
+            if token_map is None:
                 logger.warning(
-                    "[Lwd] drop stale cloud payload for %s (not awaiting)",
-                    request_id,
+                    "[Lwd] unembed batch answer missing lwd_token_ids (%r), "
+                    "finishing requests with ERROR",
+                    type(result),
                 )
-                continue
-            finish_reason = (
-                FinishReason.STOP if token_ids else FinishReason.ERROR
-            )
-            outputs.append(
-                EngineCoreOutput(
-                    request_id,
-                    token_ids,
-                    finish_reason=finish_reason,
+
+        def _lwd_finish_flag(notify: LwdC2eNotify, index: int) -> bool:
+            # finished 与 req_ids 对齐;缺省/未对齐回退旧语义(全部完结)
+            if len(notify.finished) == len(notify.req_ids):
+                return bool(notify.finished[index])
+            return True
+
+        for notify in notifies:
+            has_rows = bool(notify.req_ids) and notify.hidden_num_elements > 0
+            for index, request_id in enumerate(notify.req_ids):
+                finished = _lwd_finish_flag(notify, index)
+                token_ids: list[int] = []
+                if has_rows:
+                    token_ids = (
+                        list(token_map.get(request_id, [])) if token_map else []
+                    )
+                    if not token_ids:
+                        # 行在批里但无 token = unembed 失败(错误路径)
+                        finished = True
+                if not self.scheduler.lwd_edge_deliver_tokens(
+                    request_id, token_ids, finished=finished
+                ):
+                    logger.warning(
+                        "[Lwd] drop stale cloud payload for %s (not awaiting)",
+                        request_id,
+                    )
+                    continue
+                if not token_ids and not finished:
+                    # 空 token 且未完结:无内容可交付,跳过(不出空输出)
+                    continue
+                if token_ids:
+                    finish_reason = (
+                        FinishReason.STOP if finished else None
+                    )
+                else:
+                    # 纯终结通告(无行)或失败:只发 finish
+                    finish_reason = (
+                        FinishReason.ERROR if has_rows else FinishReason.STOP
+                    )
+                outputs.append(
+                    EngineCoreOutput(
+                        request_id,
+                        token_ids,
+                        finish_reason=finish_reason,
+                    )
                 )
-            )
-            finished_reqs.add(request_id)
+                if finished:
+                    finished_reqs.add(request_id)
         return outputs, finished_reqs
 
     def _lwd_edge_dispatch(self, scheduler_output) -> dict[str, int]:

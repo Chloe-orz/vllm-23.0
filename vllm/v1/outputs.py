@@ -251,6 +251,13 @@ class LwdC2eMeta:
     num_accepted_tokens: list[int]
     # Request ids in hidden row order (rows are grouped by request).
     req_ids: list[str]
+    # Per-request completion flags aligned with ``req_ids`` (additive,
+    # default empty = legacy "all finished"). A request finishing on this
+    # step still appears here with its final hidden rows (if any); a
+    # finish-only notify carries ``hidden_num_elements == 0`` with just
+    # the finished requests listed — the edge then finishes them locally
+    # without dispatching an unembed batch.
+    finished: list[bool] = field(default_factory=list)
 
 
 # ModelRunnerOutput is serialized and sent to the scheduler process.

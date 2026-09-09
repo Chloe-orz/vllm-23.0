@@ -72,12 +72,17 @@ class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):
     """云->边步元数据通告(POST_OUT,云->边唯一载荷类型):先于隐藏张量
     到达,边侧据 hidden_num_elements 预挂精确尺寸 recv;req_ids/
     top_id_ths 按隐藏行序(ModelRunnerOutput.lwd_c2e_meta 的线上形态)。
-    结果回传(unembedding/用户输出)亦由本类型承载驱动。"""
+
+    finished 与 req_ids 对齐(additive,缺省空 = 兼容"全部完结"旧语义):
+    云侧逐 decode 步回传 token 时逐条 False,终结步置 True;纯终结
+    通告 = hidden_num_elements 为 0、仅列完结请求——边侧本地终结,
+    不派发 unembed 批。"""
 
     hidden_num_elements: int
     top_id_ths: list[list[int]]
     num_accepted_tokens: list[int]
     req_ids: list[str]
+    finished: list[bool] = []
 
 
 # typing.Union 而非 PEP 604 `|`:msgspec 解码器的全版本支持路径
