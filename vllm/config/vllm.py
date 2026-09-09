@@ -30,6 +30,7 @@ from vllm.utils import random_uuid
 from vllm.utils.hashing import safe_hash
 
 from .attention import AttentionConfig
+from .lwd import LwdConfig
 from .cache import CacheConfig
 from .compilation import CompilationConfig, CompilationMode, CUDAGraphMode
 from .device import DeviceConfig
@@ -361,6 +362,11 @@ class VllmConfig:
     """Additional config for specified platform. Different platforms may
     support different configs. Make sure the configs are valid for the platform
     you are using. Contents must be hashable."""
+    lwd_config: "LwdConfig | None" = None
+    """LWD (layerwise disaggregated) config, parsed from
+    ``additional_config["lwd_config"]`` in ``__post_init__``. Holds the
+    LWD behavior settings; the parallel-topology knobs live in the
+    aggregated ``parallel_config.lwd_config`` (LwdParallelConfig)."""
     instance_id: str = ""
     """The ID of the vLLM instance."""
     optimization_level: OptimizationLevel = OptimizationLevel.O2
@@ -849,6 +855,18 @@ class VllmConfig:
 
         # To give each torch profile run a unique instance name.
         self.instance_id = f"{time.time_ns()}"
+
+        # LWD (layerwise disaggregated) bootstrap: parse the JSON config body into
+        # VllmConfig.lwd_config, then mirror the master switch, role and CLI NPU
+        # counts into the aggregated ParallelConfig.lwd_config object.
+        additional = self.additional_config if isinstance(self.additional_config, dict) else {}
+        self.lwd_config = LwdConfig.from_dict(additional.get("lwd_config") or {})
+        if self.lwd_config.enabled:
+            parallel_lwd = self.parallel_config.lwd_config
+            parallel_lwd.enable_lwd = True
+            parallel_lwd.is_edge_node = self.lwd_config.is_edge
+            if self.lwd_config.is_edge and parallel_lwd.edge_npu_count <= 0:
+                raise ValueError("--edge-npu-count must be positive on the LWD edge process")
 
         if self.performance_mode != "balanced":
             logger.info_once("Performance mode set to '%s'.", self.performance_mode)
