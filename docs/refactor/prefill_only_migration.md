@@ -1068,3 +1068,40 @@ monkeypatch 不可达子进程,类选择必须在子进程内做。
    整体删除 —— 引擎过门即投 input_queue,原生 `add_request` 随到随
    调度;调度器只剩纯相位排批(prefill_first/decode_first),注册表
    二维收敛一维(相位名),`LwdConfig.admission_name` 配置项删除。
+
+### 10.15 相位调度器:工作纯相位 + 子类合并(2026-09-09,用户裁定)
+
+> 背景:源"按人口分伙"形态下,decode 步只按请求人群隔离(RUNNING),
+> 被 chunked prefill 截断的长序列尾巴在 decode 步与真 decode token 混批;
+> 同时 PrefillFirst/DecodeFirst 子类的存在只是 scheduler_cls 类身份注入
+> 的参数载体。本节两项裁定均推翻/简化 §10.8 相应条目。
+
+1. **工作纯相位(推翻 §10.8 照搬差异清单 3 的"按人口分伙"基线)**:
+   - 工作纯度唯一判据 `num_computed_tokens < num_prompt_tokens`
+     (RUNNING 且 prompt 未完结 = prefill 尾巴;前提:云不启用 spec
+     decode,eagle 的 shift_computed_tokens 会使判据失真);
+   - prefill 步可见集 = WAITING 全量 + running 中的尾巴(decode-ready
+     藏起);decode 步可见集 = running 中 prompt 已完结者(waiting 与
+     尾巴藏起)—— 尾巴只在 prefill 相推进,decode 批零 prefill 计算;
+   - 空步翻转条件同步:decode 空步且 (waiting ∨ 有尾巴) 翻 prefill;
+     prefill 空步且 running 非空仍翻 decode(KV 压力排水);
+   - 行为变化(验收知悉):prefill 步从"抢占不可达"变为可抢占且被抢
+     者只会是尾巴;running 恢复时 decode-ready 与尾巴各自保序、交叉
+     顺序重排(FIFO 轻微偏斜);prefill 步内原生循环 running 段先于
+     waiting 段,尾巴先于新请求首 chunk 扣 token_budget(原人口语义
+     下 waiting 先行)——与组整批诉求相交,组调度预检需计入在途尾巴
+     占用;decode_first 档位尾巴推进要等 decode-ready 排空(判据改为
+     `not has_decode_ready`,尾巴不再借 decode 步蹭进);
+   - 手法不变:容器交换跑一次 super().schedule(),原生 schedule()
+     零改动。
+2. **子类合并(简化 §10.10"类身份注入"的参数载体形态)**:
+   LwdCloudPrefillFirstScheduler/LwdCloudDecodeFirstScheduler 删除,
+   注册表与 `get_pure_phase_scheduler_cls` 工厂删除;单类
+   `LwdCloudPhaseScheduler` 构造期经 `LwdConfig.from_env_and_config`
+   自解析 `scheduler_name`(函数级 import lwd_edge_assemble,无环;
+   未知相位名告警回退 prefill_first)。serve 守卫改为直接注入类对象,
+   `LwdConfig.scheduler_name` 配置键不变。
+   预算核对:lwd_edge_assemble import 不触碰违禁表,无新增例外;
+   静态套件(lwd_check_budget/ruff check/py_compile)全绿。
+   真机冒烟项(随 §10.6 backlog):长 prompt 组员 + 短请求混跑,
+   断言 decode 步批内 `num_computed == num_prompt` 恒成立。
