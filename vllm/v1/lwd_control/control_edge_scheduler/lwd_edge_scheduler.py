@@ -7,6 +7,12 @@
 输出 token(num_tokens_with_spec 恒等于 num_prompt_tokens),且 prompt
 嵌入完成的当步即被 lwd_edge_update_progress 本地终结,原生 RUNNING 段
 每步只会调度剩余 prefill,decode 分支不可达。
+
+单请求组批约束(§9.9 修订):prefill 批最多含一个请求——容器交换
+只放行一个 prefill 工作单元(running 尾巴优先,否则 waiting 队首),
+原生 schedule() 结构上见不到第二个请求。单请求内的 chunked 决策
+(预算截断/KV 抢占)照旧。目的:数据面 chunk 流按请求连续(全局
+seqno 链上单请求 chunk 相邻),消除跨请求交错带来的配对/重组复杂度。
 """
 
 from __future__ import annotations
@@ -17,6 +23,7 @@ from typing import TYPE_CHECKING
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LwdAbortNotify,
     LwdRangeNotify,
@@ -52,10 +59,51 @@ class LwdEdgeScheduler(AsyncScheduler):
         self._lwd_last_scheduled: dict[str, int] = {}
 
     def schedule(self) -> SchedulerOutput:
-        """全量复用原生分块决策;记录本步调度量供进度对账(§2.4 未派发重试)。"""
-        scheduler_output = super().schedule()
+        """单请求组批 + 原生分块决策;记录本步调度量供进度对账(§2.4)。"""
+        scheduler_output = self._lwd_schedule_single()
         self._lwd_last_scheduled = dict(scheduler_output.num_scheduled_tokens)
         return scheduler_output
+
+    def _lwd_schedule_single(self) -> SchedulerOutput:
+        """单请求组批约束(§9.9 修订):本步 prefill 批最多一个请求。
+
+        容器交换:visible 集只放一个 prefill 工作单元——running 尾巴
+        优先(藏其余尾巴与全部 waiting),否则只放行 waiting 队首。
+        原生 schedule() 结构上见不到第二个请求,批无法跨请求;单请求
+        内 chunked 决策(预算截断/KV 抢占)照旧。藏起的 waiting 走
+        队首回插(未调度的 head 与抢占回插者),藏起的尾巴接回
+        running 尾部,均保 FIFO。
+        """
+        tail = next(
+            (r for r in self.running if r.num_computed_tokens < r.num_prompt_tokens),
+            None,
+        )
+        hidden_waiting = self.waiting
+        self.waiting = create_request_queue(self.policy)
+        hidden_tails: list = []
+        if tail is not None:
+            hidden_tails = [
+                r
+                for r in self.running
+                if r is not tail and r.num_computed_tokens < r.num_prompt_tokens
+            ]
+            if hidden_tails:
+                self.running = [
+                    r
+                    for r in self.running
+                    if r is tail or r.num_computed_tokens >= r.num_prompt_tokens
+                ]
+        elif hidden_waiting:
+            self.waiting.add_request(hidden_waiting.peek_request())
+        try:
+            return super().schedule()
+        finally:
+            leftover = self.waiting
+            self.waiting = hidden_waiting
+            while leftover:
+                self.waiting.prepend_request(leftover.pop_request())
+            if hidden_tails:
+                self.running = self.running + hidden_tails
 
     def lwd_edge_add_request(self, request: Request) -> None:
         """边侧请求入口(core.py add_request 守卫的委托点,§9.12)。
