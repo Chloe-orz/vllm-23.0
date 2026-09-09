@@ -27,6 +27,7 @@ import queue
 import threading
 
 from vllm.logger import init_logger
+from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
     LwdControlPublisher,
@@ -36,6 +37,7 @@ from vllm.v1.lwd_control.control_communication.lwd_control_subscriber import (
 )
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LwdHelloNotify,
+    LwdResultNotify,
     lwd_decode_cloud_notify,
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import (
@@ -115,10 +117,16 @@ class LwdEdgeEngineCore(EngineCoreProc):
         )
 
     def _lwd_discovery_loop(self, hello_event: threading.Event) -> None:
-        """发现线程(lwd-post-in):消费 POST_OUT,HELLO -> retarget PRE_OUT。
+        """发现线程(lwd-post-in):消费 POST_OUT,按类型分发。
 
-        常驻运行(不只首发):云换址重启后周期 HELLO 仍能驱动 retarget
-        先连新断旧(§9.1);retarget 队满失败靠周期重发自愈。
+        HELLO -> retarget PRE_OUT(云端点唯一事实源,§9.1):常驻运行,
+        云换址重启后周期 HELLO 仍能驱动先连新断旧;retarget 队满失败
+        靠周期重发自愈。
+        LwdResultNotify -> 结果队列(不丢)+ WAKEUP 唤醒主循环:引擎可能
+        阻塞在 input_queue.get()(prefill 全部完成后 awaiting 无排程
+        工作),结果只进 lwd_result_queue 不会唤醒任何线程,必须敲门;
+        WAKEUP 分支原生即丢弃消息体,数据与唤醒分离,多投无害(空
+        drain 一步即返回)。
         """
         receiver = self._lwd_post_out_receiver
         publisher = self._lwd_publisher
@@ -126,17 +134,39 @@ class LwdEdgeEngineCore(EngineCoreProc):
             msg = receiver.recv(timeout_ms=5000)
             if msg is None:
                 continue
-            if not isinstance(msg, LwdHelloNotify):
-                # 协议分面:POST_OUT 目前只承载 HELLO,坏帧已被订阅层丢弃
+            if isinstance(msg, LwdHelloNotify):
+                endpoint = f"tcp://{msg.pre_out_host}:{msg.pre_out_port}"
+                if not hello_event.is_set():
+                    logger.info(
+                        "[Lwd] cloud discovered via HELLO: PRE_OUT -> %s", endpoint
+                    )
+                if not publisher.retarget(endpoint):
+                    # 队满丢令:周期重发(5s)会再来,下条 HELLO 重试
+                    logger.warning(
+                        "[Lwd] PRE_OUT retarget deferred: publish queue full"
+                    )
+                hello_event.set()
+            elif isinstance(msg, LwdResultNotify):
+                self._lwd_enqueue_result(msg)
+            else:
+                # 协议分面:POST_OUT 只承载 HELLO 与结果,坏帧已被订阅层丢弃
                 logger.warning("[Lwd] drop unexpected POST_OUT frame %r", type(msg))
-                continue
-            endpoint = f"tcp://{msg.pre_out_host}:{msg.pre_out_port}"
-            if not hello_event.is_set():
-                logger.info("[Lwd] cloud discovered via HELLO: PRE_OUT -> %s", endpoint)
-            if not publisher.retarget(endpoint):
-                # 队满丢令:周期重发(5s)会再来,下条 HELLO 重试
-                logger.warning("[Lwd] PRE_OUT retarget deferred: publish queue full")
-            hello_event.set()
+
+    def _lwd_enqueue_result(self, msg: LwdResultNotify) -> None:
+        """云结果入队(唯一数据通道,不丢)+ WAKEUP 唤醒主循环。
+
+        队满自旋重试(结果不可失,与 publisher 背压可丢语义相反):
+        消费侧每步取空,积压只来自引擎长步;重试间隔与接收线程 5s
+        超时拍同量级,不阻塞 HELLO retarget 之外的职责。
+        """
+        while not self._lwd_post_out_receiver.closed:
+            try:
+                self.lwd_result_queue.put_nowait(msg)
+                break
+            except queue.Full:
+                logger.warning("[Lwd] result queue full, retrying (rid=%s)", msg.request_id)
+                threading.Event().wait(0.01)
+        self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
 
     def _lwd_shutdown_planes(self) -> None:
         """两面关停(幂等):receiver 先关(断输入),publisher 收尾。"""
