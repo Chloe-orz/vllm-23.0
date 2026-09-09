@@ -17,6 +17,7 @@ LwdEdgeCore.step_with_batch_queue;本文件只负责装配与生命周期,
 from __future__ import annotations
 
 import os
+import queue
 import threading
 from dataclasses import dataclass
 
@@ -43,6 +44,8 @@ logger = init_logger(__name__)
 
 LWD_PRE_OUT_PORT_DEFAULT = 5558
 LWD_POST_OUT_PORT_DEFAULT = LWD_PRE_OUT_PORT_DEFAULT + 1
+# 云结果队列深度(接收线程 -> 引擎主线程;lwd-post-in 写 / LwdEdgeCore 步读)
+LWD_RESULT_QUEUE_MAX = 1024
 
 _LWD_CONFIG_SECTION = "lwd_config"
 # 传输层字段(pre_out_host 等)的历史段名;仅作兼容回退,新增部署用 lwd_config
@@ -242,6 +245,10 @@ def lwd_edge_try_assemble(engine_core) -> bool:
         )
     _lwd_edge_install_scheduler(engine_core, publisher)
     engine_core.lwd_edge_post_out_receiver = receiver
+    # 云结果队列(Step 2 仅建队列):接收线程(lwd-post-in)按类型分发写入
+    # (LwdResultNotify 入队,实现待后续 Step),LwdEdgeCore 步首 drain 读取
+    # (待后续 Step);队满语义为结果不可丢(写入侧自旋重试,随写入实现落位)。
+    engine_core.lwd_edge_result_queue = queue.Queue(maxsize=LWD_RESULT_QUEUE_MAX)
     engine_core.step_wrapper = LwdEdgeCore(
         LwdEdgeEnginePortAdapter(engine_core), config.lwd_step_settings()
     )
