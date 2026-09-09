@@ -3,7 +3,8 @@
 > 范围:`vllm/vllm/v1/lwd_control/control_cloud_scheduler/` 包内全部组件
 > (`lwd_cloud_engine.py`、`lwd_cloud_phase_scheduler.py`)
 > 上游文档:`prefill_only_migration.md`(总体迁移方案,本文引用其 §9/§10 术语)、
-> `lwd_control_communication_composition.md`(传输层设计,本文只消费不定义)
+> `lwd_control_communication_design.md`(传输层组件设计,本文只消费不定义)、
+> `lwd_control_communication_composition.md`(传输层组合化重构方案)
 > 代码基线:含"PRE_OUT 循环独立线程化"改造(见 §4.1.2);行号会漂移,引用以函数名为准
 
 ---

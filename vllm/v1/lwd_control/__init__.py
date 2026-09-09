@@ -135,8 +135,8 @@ def lwd_serve_guard(vllm_config) -> None:
     """serve.py run_headless 入口守卫(§10.1):云角色构造期注入相位调度器。
 
     位置在 vllm_config 建成之后、任何引擎构造之前 —— 写
-    scheduler_config.scheduler_cls(经源工厂按 config.scheduler_name
-    一维选类,准入固定 immediate,§10.14;类对象跨进程按模块引用
+    scheduler_config.scheduler_cls(单类 LwdCloudPhaseScheduler,相位由
+    调度器构造期经 LwdConfig 自解析,§10.15;类对象跨进程按模块引用
     序列化,EngineCore.__init__ core.py:139 get_scheduler_cls 构造期
     解析),引擎即以相位调度器出生,无需事后整实例替换(§10.8)。
     云引擎类由 run_engine_core 的 lwd_resolve_engine_cls 子进程内
@@ -147,6 +147,9 @@ def lwd_serve_guard(vllm_config) -> None:
     非空、pre_out_host 非 0.0.0.0(HELLO 通告值必须可路由,§9.1)。
     """
     from vllm.logger import init_logger
+    from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_phase_scheduler import (
+        LwdCloudPhaseScheduler,
+    )
     from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import (
         LwdConfig,
         is_lwd_prefill_only,
@@ -158,16 +161,9 @@ def lwd_serve_guard(vllm_config) -> None:
     if config.is_edge_node:
         return
     _lwd_cloud_deploy_guard(vllm_config, config)
-    from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_phase_scheduler import (
-        get_pure_phase_scheduler_cls,
-    )
-
-    vllm_config.scheduler_config.scheduler_cls = get_pure_phase_scheduler_cls(
-        config.scheduler_name
-    )
+    vllm_config.scheduler_config.scheduler_cls = LwdCloudPhaseScheduler
     init_logger(__name__).info(
-        "[Lwd] prefill_only cloud: scheduler %s injected (construction-time)",
-        config.scheduler_name,
+        "[Lwd] prefill_only cloud: phase scheduler injected (construction-time)"
     )
 
 
