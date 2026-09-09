@@ -118,9 +118,6 @@ class EngineCore:
 
         self.log_stats = log_stats
 
-        # Lwd prefill-only step delegation target (None = native, docs/refactor).
-        self.step_wrapper = None
-
         # Setup Model.
         self.model_executor = executor_class(vllm_config)
         if executor_fail_callback is not None:
@@ -235,10 +232,6 @@ class EngineCore:
         # environment variable overrides after this point)
         enable_envs_cache()
 
-        # Lwd prefill-only assembly point: no-op unless the mode is enabled.
-        from vllm.v1.lwd_control import lwd_try_assemble
-
-        lwd_try_assemble(self)
 
     @instrument(span_name="Prepare model")
     def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
@@ -352,15 +345,6 @@ class EngineCore:
         `request_wave`: indicate which wave of requests this is expected to
         belong to in DP case
         """
-        # Lwd prefill-only: single handoff to the edge scheduler — boundary
-        # validation before the request enters the scheduler, the request
-        # notify to the cloud right after (sole control-plane exit, §9.12).
-        # Native entry checks (pooling task, kv_transfer) are subsumed:
-        # both modes are rejected by the edge boundary.
-        if self.step_wrapper is not None:
-            self.scheduler.lwd_edge_add_request(request)  # type: ignore[attr-defined]
-            return
-
         # Validate the request_id type.
         if not isinstance(request.request_id, str):
             raise TypeError(
@@ -394,12 +378,6 @@ class EngineCore:
 
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""
-
-        # Lwd prefill-only: forward the abort to the cloud before native
-        # cleanup (sole control-plane exit, §9.12); in-flight isends cannot
-        # be withdrawn, the cloud discards the extras on finish (§14.7).
-        if self.step_wrapper is not None:
-            self.scheduler.lwd_edge_abort(request_ids)  # type: ignore[attr-defined]
 
         # TODO: The scheduler doesn't really need to know the
         # specific finish reason, TBD whether we propagate that
@@ -469,11 +447,6 @@ class EngineCore:
         Returns tuple of outputs and a flag indicating whether the model
         was executed.
         """
-        # Lwd prefill-only: same delegation as step_with_batch_queue — this
-        # path is selected when batch_queue is None (step_fn wiring).
-        if self.step_wrapper is not None:
-            return self.step_wrapper.step_with_batch_queue()
-
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
@@ -524,10 +497,6 @@ class EngineCore:
         batch in the job queue is finished.
         3. Update the scheduler from the output.
         """
-        # Lwd prefill-only step delegation: the wrapper replaces step semantics.
-        if self.step_wrapper is not None:
-            return self.step_wrapper.step_with_batch_queue()
-
         batch_queue = self.batch_queue
         assert batch_queue is not None
 
@@ -639,11 +608,6 @@ class EngineCore:
 
     def shutdown(self):
         logger.debug_once("[shutdown] EngineCore: tearing down local resources")
-        # Lwd prefill-only channel teardown (no-op unless assembled).
-        if self.step_wrapper is not None:
-            from vllm.v1.lwd_control import lwd_shutdown
-
-            lwd_shutdown(self)
         self.structured_output_manager.clear_backend()
         if self.model_executor:
             self.model_executor.shutdown()
@@ -1196,8 +1160,8 @@ class EngineCoreProc(EngineCore):
                 parallel_config.data_parallel_size = 1
                 parallel_config.data_parallel_size_local = 1
                 parallel_config.data_parallel_rank = 0
-                # Lwd prefill-only cloud engine selection: no-op unless the
-                # mode is enabled (vanilla EngineCoreProc elsewhere).
+                # Lwd prefill-only engine selection (edge/cloud): no-op
+                # unless the mode is enabled (vanilla EngineCoreProc).
                 from vllm.v1.lwd_control import lwd_resolve_engine_cls
 
                 engine_cls = lwd_resolve_engine_cls(vllm_config) or EngineCoreProc
