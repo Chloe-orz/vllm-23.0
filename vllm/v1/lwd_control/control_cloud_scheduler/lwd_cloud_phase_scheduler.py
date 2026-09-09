@@ -36,9 +36,16 @@ class LwdCloudPhaseScheduler(AsyncScheduler):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._lwd_prefill_first = self._lwd_resolve_phase()
-        # One-shot flag: the last chosen phase produced an empty step and
-        # the other population has work — try that phase next step.
-        self._force_other_phase: bool = False
+        # One-shot nudges: a phase produced an empty step while the other
+        # population has work — force THAT phase next step. Direction is
+        # explicit per flag(源实现同款):"other" 相对空步相位而非当前偏好,
+        # 单标志按偏好取反会把空 decode 后的翻回 prefill 错翻成 decode,
+        # 造成空 decode 步死循环(prefill 饿死)。
+        self._force_prefill_once: bool = False
+        self._force_decode_once: bool = False
+        # True iff the last EXECUTED (non-empty) step was a prefill batch
+        # — drives the no-consecutive-prefill invariant in schedule().
+        self._last_step_was_prefill: bool = False
         logger.info(
             "[Lwd] cloud phase scheduler: single-request prefill batches "
             "enforced (edge/cloud chunk stream stays per-request contiguous)"
@@ -165,19 +172,34 @@ class LwdCloudPhaseScheduler(AsyncScheduler):
     # ------------------------------------------------------------------ #
     def schedule(self) -> SchedulerOutput:
         prefer_prefill = self._prefer_prefill()
-        if self._force_other_phase:
-            prefer_prefill = not prefer_prefill
-            self._force_other_phase = False
+        if self._force_prefill_once:
+            self._force_prefill_once = False
+            prefer_prefill = True
+        elif self._force_decode_once:
+            self._force_decode_once = False
+            prefer_prefill = False
+        # [invariant] Prefill never executes two steps in a row: after an
+        # EXECUTED prefill batch, decode always gets the next step while
+        # any request is running.  Consecutive prefill is allowed only
+        # when the decode step in between came back EMPTY (nothing
+        # schedulable) — the empty decode flips back via _force_prefill_once.
+        # (源实现 pure_phase_scheduler.py 同款不变量,迁移补回。)
+        if prefer_prefill and self._last_step_was_prefill and self.running:
+            prefer_prefill = False
+        self._last_step_was_prefill = False
 
         if prefer_prefill:
             out = self._schedule_pure_prefill()
             if self._is_empty(out) and self.running:
                 # Prefill blocked (KV pressure). Yield the empty cleanup step
                 # and let the next step run decode so KV pressure can drain.
-                self._force_other_phase = True
+                self._force_decode_once = True
+            else:
+                self._last_step_was_prefill = True
             return out
         out = self._schedule_pure_decode()
         if self._is_empty(out) and (self.waiting or self._lwd_has_prefill_tails()):
             # Decode 无活但有 waiting/尾巴:翻回 prefill 让尾巴推进。
-            self._force_other_phase = True
+            # 这正是不变量的"除非没有 D"出口:中间的 D 步空转,P 才连续。
+            self._force_prefill_once = True
         return out
