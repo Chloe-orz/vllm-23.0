@@ -3,9 +3,16 @@
 原生 AsyncScheduler 的两个前提在边侧不成立:prompt 算完会转 decode、
 请求只能由模型输出终结;边侧无本地解码,故需专用调度器。
 
+生命周期(嵌入完 → awaiting → 云结果终结):
+  prompt 嵌入完成的当步,update_progress 走原生 finish_requests 清出
+  调度器(释放边侧 KV/通知 worker)并登记 _lwd_awaiting;前端未收到
+  输出继续等待;终结由云结果(lwd_edge_deliver_tokens,token ids 由
+  边侧 worker unembedding 产生)驱动,迟到结果幂等丢弃,awaiting
+  超时僵尸兜底(lwd_edge_zombie_check)。
+
 纯 prefill 的实现依据:schedule() 全量复用原生——边侧请求从不产生
 输出 token(num_tokens_with_spec 恒等于 num_prompt_tokens),且 prompt
-嵌入完成的当步即被 lwd_edge_update_progress 本地终结,原生 RUNNING 段
+嵌入完成的当步即被 lwd_edge_update_progress 清出调度器,原生 RUNNING 段
 每步只会调度剩余 prefill,decode 分支不可达。
 
 单请求组批约束(§9.9 修订):prefill 批最多含一个请求——容器交换
@@ -41,6 +48,8 @@ logger = init_logger(__name__)
 
 _LWD_ADD_RETRY_STEPS = 3
 _LWD_ADD_RETRY_INTERVAL_S = 0.1
+# awaiting(嵌入完待云结果)僵尸上限:超时本地 abort 兜底(云崩溃/结果丢失)
+_LWD_AWAITING_TIMEOUT_S = 300.0
 
 
 class LwdEdgeScheduler(AsyncScheduler):
@@ -52,11 +61,15 @@ class LwdEdgeScheduler(AsyncScheduler):
         publisher: LwdControlPublisher | None = None,
         **kwargs,
     ) -> None:
-        """publisher 经装配期注入(scheduler_cls 以 partial 携带通道)。"""
+        """构造注入 publisher(scheduler_cls 以 partial 携带通道)。"""
         super().__init__(*args, **kwargs)
         self.lwd_edge_publisher = publisher
         self._lwd_seqno = 0
         self._lwd_last_scheduled: dict[str, int] = {}
+        # awaiting:嵌入完待云结果的 request_id -> 登记时刻(单调钟);
+        # 请求本体已走原生 finish_requests 清出调度器(释放边侧 KV),
+        # 前端 OutputProcessor 未收到输出会继续等待 —— 正是 awaiting 语义
+        self._lwd_awaiting: dict[str, float] = {}
 
     def schedule(self) -> SchedulerOutput:
         """单请求组批 + 原生分块决策;记录本步调度量供进度对账(§2.4)。"""
@@ -187,18 +200,22 @@ class LwdEdgeScheduler(AsyncScheduler):
         )
 
     def lwd_edge_abort(self, request_ids: list[str]) -> None:
-        """发 LwdAbortNotify;本地终结走原生 abort 路径,此处只管出口。"""
+        """发 LwdAbortNotify + awaiting 摘除;调度器内清理走原生路径。
+
+        awaiting 请求已不在调度器视野(嵌入完结时清出),原生
+        finish_requests 触不到它,须在此显式摘除,否则僵尸检查误报。"""
         publisher = self.lwd_edge_publisher
-        if publisher is None:
-            return
         for request_id in request_ids:
+            self._lwd_awaiting.pop(request_id, None)
+            if publisher is None:
+                continue
             if not publisher.publish(LwdAbortNotify(request_id=request_id)):
                 logger.warning(
                     "[Lwd] drop abort signal for %s: publish queue full", request_id
                 )
 
     def lwd_edge_update_progress(self, executed: dict[str, int]) -> None:
-        """步末对账实际执行量;prompt 全部嵌入完成即本地终结(§9.10)。
+        """步末对账实际执行量;prompt 全部嵌入完成即转入 awaiting(§9.10)。
 
         对账基准是本步排程登记(_lwd_last_scheduled)而非 executed:原生
         _update_after_schedule 在调度时已乐观推进 num_computed,步末必须
@@ -206,8 +223,13 @@ class LwdEdgeScheduler(AsyncScheduler):
         update_from_output 的拒绝回退同款语义),步末后 num_computed ==
         本步实际派发水位,下一步原生调度自然复现同一范围。executed 必须
         是本步排程集的子集(同步执行接缝保证;数据面落位时按 §9.12
-        重定义此接缝)。终结不依赖任何模型输出,这是与原生路径的唯一
-        语义差。
+        重定义此接缝)。
+
+        嵌入完结 = 边侧工作结束而非请求结束:走原生 finish_requests 做
+        全套簿记(移出 running/requests、释放边侧 KV、进 finished_req_ids
+        通知 worker 释放缓存——引擎睡眠期该通知滞后到下一个排程步,
+        可接受),同时登记 _lwd_awaiting;前端未收到任何输出会继续等待,
+        终结由云结果的 deliver 语义驱动(lwd_edge_deliver_tokens)。
         """
         finished_ids: list[str] = []
         for request_id in self._lwd_last_scheduled:
@@ -221,7 +243,52 @@ class LwdEdgeScheduler(AsyncScheduler):
                 finished_ids.append(request_id)
         if finished_ids:
             self.finish_requests(finished_ids, RequestStatus.FINISHED_STOPPED)
+            now = time.monotonic()
+            for request_id in finished_ids:
+                self._lwd_awaiting[request_id] = now
         self._lwd_last_scheduled = {}
+
+    def lwd_edge_deliver_tokens(
+        self, request_id: str, token_ids: list[int], finished: bool
+    ) -> bool:
+        """云结果投递(awaiting 消费点,引擎步内调用;token_ids 由边侧
+        worker unembedding 产生,内容本层不消费,仅作生命周期对账)。
+
+        - 请求在 _lwd_awaiting:登记即认领;finished=True 时出 awaiting
+          (请求本体已在嵌入完结时清出调度器,无需再 finish);
+        - 请求不在(已 abort/更早完结/未知):迟到结果,返回 False 由
+          调用方丢弃告警(幂等,不复活)。
+
+        返回是否成功投递到活请求;token_ids/finished 的输出组包归引擎层
+        (EngineCoreOutputs 构造,后续 Step)。
+        """
+        if request_id not in self._lwd_awaiting:
+            return False
+        if finished:
+            del self._lwd_awaiting[request_id]
+        return True
+
+    def lwd_edge_zombie_check(self) -> list[str]:
+        """awaiting 僵尸检查(引擎步末调用):超时请求本地 abort 兜底。
+
+        云崩溃/add notify 丢失等导致结果永不到达时,awaiting 登记会
+        泄漏;超时摘除并告警,由引擎层生成 abort 语义的输出终结前端
+        等待(云侧 zombie 检测的同款兜底,方向相反)。
+        """
+        now = time.monotonic()
+        zombie_ids = [
+            request_id
+            for request_id, since in self._lwd_awaiting.items()
+            if now - since > _LWD_AWAITING_TIMEOUT_S
+        ]
+        for request_id in zombie_ids:
+            del self._lwd_awaiting[request_id]
+            logger.warning(
+                "[Lwd] awaiting request %s timed out after %.0fs, abort locally",
+                request_id,
+                _LWD_AWAITING_TIMEOUT_S,
+            )
+        return zombie_ids
 
     def _lwd_reconcile_progress(
         self, request, request_id: str, num_executed: int
