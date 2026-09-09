@@ -27,6 +27,10 @@ logger = init_logger(__name__)
 
 LWD_PRE_OUT_PORT_DEFAULT = 5558
 LWD_POST_OUT_PORT_DEFAULT = LWD_PRE_OUT_PORT_DEFAULT + 1
+# 等云首拍 HELLO 的预算:HELLO 在云 EngineCore.__init__ 全部完成(权重/
+# KV/图编译 capture)后才发出,预算须覆盖云全量启动——边不开图、云开图
+# 是本场景固定形态,默认按其给 600s;部署可经 hello_timeout_s/env 覆盖
+LWD_HELLO_TIMEOUT_S_DEFAULT = 600.0
 
 # 云->边步元数据接缝队列容量(§9.12):生产端 lwd-post-in,消费端随数据面落位
 LWD_C2E_META_QUEUE_MAX = 1000
@@ -46,7 +50,7 @@ class LwdConfig:
     pre_out_port: int = LWD_PRE_OUT_PORT_DEFAULT
     post_out_port: int = LWD_POST_OUT_PORT_DEFAULT
     post_out_bind: str = "*"
-    hello_timeout_s: float = 30.0
+    hello_timeout_s: float = LWD_HELLO_TIMEOUT_S_DEFAULT
     scheduler_name: str = "prefill_first"
     publish_queue_max: int = LWD_PUBLISH_QUEUE_MAX
     zombie_log_interval_s: float = 30.0
@@ -83,7 +87,9 @@ class LwdConfig:
             pre_out_port=int(section.get("pre_out_port", LWD_PRE_OUT_PORT_DEFAULT)),
             post_out_port=int(section.get("post_out_port", LWD_POST_OUT_PORT_DEFAULT)),
             post_out_bind=str(section.get("post_out_bind", "*")),
-            hello_timeout_s=float(section.get("hello_timeout_s", 30.0)),
+            hello_timeout_s=float(
+                section.get("hello_timeout_s", LWD_HELLO_TIMEOUT_S_DEFAULT)
+            ),
             scheduler_name=str(section.get("scheduler", "prefill_first")),
             publish_queue_max=int(
                 section.get("publish_queue_max", LWD_PUBLISH_QUEUE_MAX)
