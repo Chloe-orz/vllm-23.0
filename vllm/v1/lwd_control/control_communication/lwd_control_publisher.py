@@ -83,7 +83,7 @@ class LwdControlPublisher:
         """换连接目标(队列命令,发布线程执行 socket 操作保亲和)。
 
         命令丢失(队满)返回 False:调用方保持旧目标,等下一条
-        HELLO 重试——发现面是周期性的,丢了不致命。
+        HELLO 重试——首拍通告前队列必空,此处几乎不可达。
         """
         if self._closed:
             return False

@@ -41,8 +41,7 @@ class LwdControlCommunicator:
         """换连接目标(仅持有线程调用):先连新再断旧,换址期消息不丢。
 
         ZMQ connect 惰性且可并存多管道,先连新端点使后续消息有路可
-        走,再摘除旧端点注册;同址重复调用幂等(首条 HELLO 与周期
-        重发都到时只连一次)。
+        走,再摘除旧端点注册;同址重复调用幂等(重复 HELLO 误发时只连一次)。
         """
         if endpoint == self._endpoint:
             return

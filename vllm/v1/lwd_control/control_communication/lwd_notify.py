@@ -55,10 +55,11 @@ class LwdAbortNotify(msgspec.Struct, gc=False, tag=True):
 
 
 class LwdHelloNotify(msgspec.Struct, gc=False, tag=True):
-    """云->边发现通告(POST_OUT 面的周期性心跳帧)。
+    """云->边发现通告(POST_OUT 面,首拍一次,无周期重发)。
 
-    云侧启动即通告、此后周期重发:边重启后重新发现(边侧幂等)、
-    云换址重启后边侧 retarget PRE_OUT。pre_out_* 是边侧连接云端点
+    云侧启动即通告一次:边侧装配期阻塞等待的唯一发现窗口(裁定:
+    不考虑云换址/边重启自愈,任一侧重启即整组重拉)。
+    pre_out_* 是边侧连接云端点
     的唯一事实源(边侧不读配置里的 host——决策 B:单一事实源)。
     pre_out_host 必须是边可路由的真实 IP(或同机 127.0.0.1),
     0.0.0.0 不可作为通告值(serve 守卫拦截)。

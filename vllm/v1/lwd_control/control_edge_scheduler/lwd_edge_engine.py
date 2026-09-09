@@ -128,11 +128,12 @@ class LwdEdgeEngineCore(EngineCoreProc):
         )
 
     def _lwd_discovery_loop(self, hello_event: threading.Event) -> None:
-        """发现线程(lwd-post-in):消费 POST_OUT,按类型分发。
+        """接收线程(lwd-post-in):消费 POST_OUT,按类型分发。
 
-        HELLO -> retarget PRE_OUT(云端点唯一事实源,§9.1):常驻运行,
-        云换址重启后周期 HELLO 仍能驱动先连新断旧;retarget 队满失败
-        靠周期重发自愈。
+        HELLO -> retarget PRE_OUT(云端点唯一事实源,§9.1):首拍一次通告,
+        无周期重发(裁定:不考虑云换址重启/边重启重连的自愈——任一
+        侧重启即整组重拉,边侧装配期 30s 等待是唯一发现窗口);retarget
+        队满无下条 HELLO 可等,必须本线程内自旋重试到成功。
         LwdC2eNotify(云->边唯一载荷)-> 元数据队列(阻塞 put:不可丢,
         背压沿 zmq 直达云侧步循环)+ WAKEUP 唤醒主循环:引擎可能阻塞
         在 input_queue.get()(prefill 全部完成后 awaiting 无排程工作),
@@ -152,11 +153,15 @@ class LwdEdgeEngineCore(EngineCoreProc):
                     logger.info(
                         "[Lwd] cloud discovered via HELLO: PRE_OUT -> %s", endpoint
                     )
-                if not publisher.retarget(endpoint):
-                    # 队满丢令:周期重发(5s)会再来,下条 HELLO 重试
+                while not publisher.retarget(endpoint):
+                    # 首拍唯一通告:无下条 HELLO 可等,队满只能本线程自旋
+                    # 重试(构造期队列为空,此处几乎不可达,防御性保活)
+                    if receiver.closed:
+                        break
                     logger.warning(
-                        "[Lwd] PRE_OUT retarget deferred: publish queue full"
+                        "[Lwd] PRE_OUT retarget deferred (queue full), retrying"
                     )
+                    threading.Event().wait(0.05)
                 hello_event.set()
             elif isinstance(msg, LwdC2eNotify):
                 self.lwd_c2e_meta_queue.put(msg)
