@@ -63,11 +63,21 @@ class LwdEdgeScheduler(AsyncScheduler):
         publisher: LwdControlPublisher | None = None,
         **kwargs,
     ) -> None:
-        """构造注入 publisher(scheduler_cls 以 partial 携带通道)。"""
+        """publisher 经构造注入(scheduler_cls 以 partial 携带通道)。"""
         super().__init__(*args, **kwargs)
         self.lwd_edge_publisher = publisher
         self._lwd_seqno = 0
         self._lwd_last_scheduled: dict[str, int] = {}
+        # 前缀缓存:manager 级关命中,配置级保留使能(embed-only 语义锚点)。
+        # - 必须关:get_computed_blocks 命中会跳过 token 排程 → 首条
+        #   RangeNotify offset≠0 → 云侧首预告门(offset==0)永不开(R4);
+        #   且命中块在 EMBED 批下从未写入 KV(幻影块),free 走缓存路径
+        #   登记残留持续占块池(R11)。关闭后命中恒空、free 直接归还。
+        # - 不能在配置级关(enable_prefix_caching=False):request_block_
+        #   hasher 只在配置级使能时创建,关掉则 Request.block_hashes 恒空
+        #   → LwdRequestNotify 带空链 → 云侧前缀缓存整体失效(云 prompt
+        #   是占位零值 token,只能靠边侧真实内容哈希链命中,§10.13)。
+        self.kv_cache_manager.enable_caching = False
         # awaiting:嵌入完待云结果的 request_id -> 登记时刻(单调钟);
         # 请求本体已走原生 finish_requests 清出调度器(释放边侧 KV),
         # 前端 OutputProcessor 未收到输出会继续等待 —— 正是 awaiting 语义
