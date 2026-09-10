@@ -5,17 +5,16 @@
 全部状态收进子类字段,不外挂引擎属性。
 
 构造约束:
-  ① kv_transfer_config 在场则降级原生:调度器注入会丢失 connector
-     握手态,prefill_only 不支持 kv_connector;降级态 _lwd_active=False,
-     所有覆写方法走 super(),行为等同原生引擎。
-  ② 通信面先于引擎主体构建:bind POST_OUT、建云载荷队列与接收线程,
+  ① 通信面先于引擎主体构建:bind POST_OUT、建云载荷队列与接收线程,
      阻塞等云首拍 HELLO——HELLO 在云引擎全量初始化(权重/KV/图编译)
      完成后才发出,等到了它才允许边侧对外就绪;超时(hello_timeout_s,
      默认 600s,须覆盖云全量启动时长)自清理两面后 fail-fast。
      HELLO 首拍一次、无周期重发,不考虑任一侧重启自愈:重启即整组重拉,
      构造期等待是边侧唯一的发现窗口。
-  ③ 调度器经 scheduler_cls 注入裸类,引擎构造完成后回填 publisher
+  ② 调度器经 scheduler_cls 注入裸类,引擎构造完成后回填 publisher
      (早于任何请求,等价构造注入)。
+  部署约束:本模式不支持 kv_connector(边侧无真实 KV 可传,connector
+  的执行钩子亦无依附点),边云部署不应携带 kv_transfer 配置。
 
 步进编排:步首消费云载荷(c2e -> UNEMBED 批 -> token 交付/请求终结)
 + prefill 编排(单请求组批 -> 范围预告 -> 原生 executor 同步执行 ->
@@ -77,18 +76,10 @@ class LwdEdgeEngineCore(EngineCoreProc):
     """边 PO 引擎:通信面装配 + 调度器注入 + step/add/abort/shutdown 覆写。"""
 
     def __init__(self, *args, **kwargs) -> None:
-        self._lwd_active = False
         vllm_config = args[0]
         config = LwdConfig.from_env_and_config(vllm_config)
         self._lwd_config = config
         self._lwd_log = LwdLog(config.debug)
-        if vllm_config.kv_transfer_config is not None:
-            logger.warning(
-                "[Lwd] kv_connector enabled on edge: degrade to native engine"
-            )
-            super().__init__(*args, **kwargs)
-            return
-
         # 通信面:bind POST_OUT 订阅面 + 延迟连接的 PRE_OUT 发布面;
         # 云端点由 HELLO 通告决定(边不预知云地址)
         self._edge_receiver = self._lwd_build_post_out(config)
@@ -117,7 +108,6 @@ class LwdEdgeEngineCore(EngineCoreProc):
             )
 
         vllm_config.scheduler_config.scheduler_cls = LwdEdgeScheduler
-        self._lwd_active = True
         # UNEMBED 批派发号:每派发 +1,DOWN 通道按步序配对,seqno 供
         # 诊断/数据面对账;与 UP 链的 RangeNotify.seqno 相互独立
         self._lwd_unembed_seqno = 0
@@ -192,25 +182,17 @@ class LwdEdgeEngineCore(EngineCoreProc):
     # ------------------------------------------------------------------ #
     def add_request(self, request, request_wave: int = 0) -> None:
         """边校验 + 云预告 + 本地入队。"""
-        if not self._lwd_active:
-            super().add_request(request, request_wave)
-            return
         self.scheduler.lwd_edge_add_request(request)
 
     def abort_requests(self, request_ids: list[str]) -> None:
         """abort 信号先出云,再走原生本地清理。"""
-        if self._lwd_active:
-            self.scheduler.lwd_edge_abort(request_ids)
+        self.scheduler.lwd_edge_abort(request_ids)
         super().abort_requests(request_ids)
 
     def step(self):
-        if not self._lwd_active:
-            return super().step()
         return self._lwd_edge_step()
 
     def step_with_batch_queue(self):
-        if not self._lwd_active:
-            return super().step_with_batch_queue()
         return self._lwd_edge_step()
 
     def _lwd_edge_step(self) -> tuple[dict[int, object] | None, bool]:
@@ -348,7 +330,6 @@ class LwdEdgeEngineCore(EngineCoreProc):
         return dict(scheduler_output.num_scheduled_tokens)
 
     def shutdown(self) -> None:
-        """两面关停后走原生;降级路径两面未建,容忍缺省。"""
-        if self._lwd_active:
-            self._lwd_shutdown_planes()
+        """两面关停后走原生;初始化失败路径两面可能未建,容忍缺省。"""
+        self._lwd_shutdown_planes()
         super().shutdown()
