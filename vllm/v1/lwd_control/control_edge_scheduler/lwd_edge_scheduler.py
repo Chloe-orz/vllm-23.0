@@ -372,19 +372,9 @@ class LwdEdgeScheduler(AsyncScheduler):
                 f"prompt_embeds (request {request.request_id}); the edge "
                 "is the embedding owner"
             )
-        if not request.prompt_token_ids:
-            raise ValueError(
-                f"[LWD] prefill-only mode requires a non-empty prompt "
-                f"(request {request.request_id})"
-            )
         if request.pooling_params is not None:
             raise ValueError(
                 "[LWD] prefill-only mode does not support pooling requests "
-                f"(request {request.request_id})"
-            )
-        if request.mm_features:
-            raise ValueError(
-                "[LWD] prefill-only mode does not support multimodal inputs "
                 f"(request {request.request_id})"
             )
         if request.use_structured_output:

@@ -13,8 +13,6 @@
      构造期等待是边侧唯一的发现窗口。
   ② 调度器经 scheduler_cls 注入裸类,引擎构造完成后回填 publisher
      (早于任何请求,等价构造注入)。
-  部署约束:本模式不支持 kv_connector(边侧无真实 KV 可传,connector
-  的执行钩子亦无依附点),边云部署不应携带 kv_transfer 配置。
 
 步进编排:步首消费云载荷(c2e -> UNEMBED 批 -> token 交付/请求终结)
 + prefill 编排(单请求组批 -> 范围预告 -> 原生 executor 同步执行 ->
