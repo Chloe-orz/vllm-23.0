@@ -8,8 +8,7 @@
        -> 嵌入完结:走原生 finish_requests 清出调度器(释放边侧 KV
           簿记、通知 worker 释放缓存),登记 awaiting
        -> AWAITING(等待云结果;前端未收到输出继续等待)
-       -> 云结果终结(lwd_edge_deliver_tokens);迟到结果幂等丢弃;
-          awaiting 超时僵尸兜底(lwd_edge_zombie_check)。
+       -> 云结果终结(lwd_edge_deliver_tokens);迟到结果幂等丢弃。
 
 纯 prefill 的实现依据:schedule() 全量复用原生——边侧请求从不产生
 输出 token(num_tokens_with_spec 恒等于 num_prompt_tokens),且嵌入
@@ -56,8 +55,6 @@ logger = init_logger(__name__)
 # add 预告发布重试:次数 x 递增间隔(共约 3s),耗尽即请求级报错
 _LWD_ADD_RETRY_STEPS = 5
 _LWD_ADD_RETRY_INTERVAL_S = 0.2
-# awaiting 僵尸上限:超时本地 abort + 通知云停止(云崩溃/结果丢失兜底)
-_LWD_AWAITING_TIMEOUT_S = 300.0
 
 
 class LwdEdgeScheduler(AsyncScheduler):
@@ -230,8 +227,7 @@ class LwdEdgeScheduler(AsyncScheduler):
         秒级窗口内腾出),耗尽即抛 RuntimeError——异常沿 add_request
         调用链回前端 error 通道,用户立即得到失败;不做无限阻塞
         重试(发布点在引擎主线程,云宕机会把整个引擎卡死在 add)。
-        此时请求未入队、云侧零残留,无需补发 abort;已入队请求的
-        云宕机由 awaiting 僵尸超时兜底。"""
+        此时请求未入队、云侧零残留,无需补发 abort。"""
         publisher = self.lwd_edge_publisher
         if publisher is None:
             return
@@ -271,7 +267,7 @@ class LwdEdgeScheduler(AsyncScheduler):
         """发 LwdAbortNotify + 摘除 awaiting;调度器内清理走原生路径。
 
         awaiting 请求已不在调度器视野(嵌入完结时清出),原生
-        finish_requests 触不到它,须在此显式摘除,否则僵尸检查误报。"""
+        finish_requests 触不到它,须在此显式摘除,防迟到云结果被误认领。"""
         publisher = self.lwd_edge_publisher
         for request_id in request_ids:
             self._lwd_awaiting.pop(request_id, None)
@@ -331,30 +327,6 @@ class LwdEdgeScheduler(AsyncScheduler):
         if finished:
             del self._lwd_awaiting[request_id]
         return True
-
-    def lwd_edge_zombie_check(self) -> list[str]:
-        """awaiting 僵尸检查(引擎步末调用),返回超时请求列表。
-
-        云崩溃/结果丢失导致结果永不到达时,awaiting 登记会泄漏且
-        前端永久等待。超时请求由引擎层生成 ABORT 输出终结前端;
-        出口复用 lwd_edge_abort:向云发 LwdAbortNotify(云停止该请求
-        后续 c2e 与 decode,不白算)+ 摘除 awaiting(幂等)。"""
-        now = time.monotonic()
-        zombie_ids = [
-            request_id
-            for request_id, since in self._lwd_awaiting.items()
-            if now - since > _LWD_AWAITING_TIMEOUT_S
-        ]
-        if zombie_ids:
-            self.lwd_edge_abort(zombie_ids)
-            for request_id in zombie_ids:
-                logger.warning(
-                    "[Lwd] awaiting request %s timed out after %.0fs, "
-                    "abort locally + notify cloud",
-                    request_id,
-                    _LWD_AWAITING_TIMEOUT_S,
-                )
-        return zombie_ids
 
     def _lwd_reconcile_progress(
         self, request, request_id: str, num_executed: int

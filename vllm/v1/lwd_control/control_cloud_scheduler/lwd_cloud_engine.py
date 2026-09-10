@@ -235,8 +235,7 @@ class LwdCloudEngineCore(EngineCoreProc):
     ) -> list[int]:
         """req_ids 对齐的逐请求完成码:本步任一 EngineCoreOutputs 里带
         finish_reason 的输出取其码;仅进 finished_requests 的缺口按 ABORT
-        兜底;其余 LWD_NOT_FINISHED(边侧保持 awaiting,由后续步通告或
-        僵尸兜底收口)。"""
+        兜底;其余 LWD_NOT_FINISHED(边侧保持 awaiting,由后续步通告收口)。"""
         reasons: dict[str, int] = {}
         for outputs in engine_core_outputs.values():
             for out in outputs.outputs:

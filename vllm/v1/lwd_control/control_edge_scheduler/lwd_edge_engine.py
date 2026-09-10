@@ -16,7 +16,7 @@
 
 步进编排:步首消费云载荷(c2e -> UNEMBED 批 -> token 交付/请求终结)
 + prefill 编排(单请求组批 -> 范围预告 -> 原生 executor 同步执行 ->
-步末对账)+ 步末 awaiting 僵尸检查。
+步末对账)。
 """
 
 from __future__ import annotations
@@ -194,7 +194,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
         return self._lwd_edge_step()
 
     def _lwd_edge_step(self) -> tuple[dict[int, object] | None, bool]:
-        """单步编排:云载荷消费 -> prefill 编排 -> 僵尸检查;
+        """单步编排:云载荷消费 -> prefill 编排 -> 步末对账;
         返回 (云侧结果输出 | None, prefill 是否有工作)。"""
         outputs, finished_reqs = self._lwd_edge_consume_c2e()
         executed: dict[str, int] = {}
@@ -203,13 +203,6 @@ class LwdEdgeEngineCore(EngineCoreProc):
             executed = self._lwd_edge_dispatch(scheduler_output)
             self._lwd_log.phase("edge step: %d reqs executed", len(executed))
         self.scheduler.lwd_edge_update_progress(executed)
-        for request_id in self.scheduler.lwd_edge_zombie_check():
-            outputs.append(
-                EngineCoreOutput(
-                    request_id, [], finish_reason=FinishReason.ABORT
-                )
-            )
-            finished_reqs.add(request_id)
         if outputs:
             return (
                 EngineCoreOutputs(
