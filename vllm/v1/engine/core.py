@@ -232,6 +232,7 @@ class EngineCore:
         # environment variable overrides after this point)
         enable_envs_cache()
 
+
     @instrument(span_name="Prepare model")
     def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
         start = time.time()
@@ -446,7 +447,6 @@ class EngineCore:
         Returns tuple of outputs and a flag indicating whether the model
         was executed.
         """
-
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
@@ -468,6 +468,10 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        # Lwd model-output seam: after native update_from_output so the
+        # handler sees engine_core_outputs (per-request finish_reason) and
+        # can derive per-request finish flags for the edge.
+        model_output = self.lwd_process_model_output(model_output, engine_core_outputs)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
@@ -497,7 +501,6 @@ class EngineCore:
         batch in the job queue is finished.
         3. Update the scheduler from the output.
         """
-
         batch_queue = self.batch_queue
         assert batch_queue is not None
 
@@ -567,9 +570,10 @@ class EngineCore:
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
-        engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output
-        )
+        # Lwd model-output seam: after native update_from_output so the
+        # handler sees engine_core_outputs (per-request finish_reason) and
+        # can derive per-request finish flags for the edge.
+        model_output = self.lwd_process_model_output(model_output, engine_core_outputs)
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
@@ -596,6 +600,26 @@ class EngineCore:
             batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
 
         return engine_core_outputs, model_executed
+
+    def lwd_process_model_output(
+        self,
+        model_output: ModelRunnerOutput,
+        engine_core_outputs: dict[int, EngineCoreOutputs],
+    ) -> ModelRunnerOutput:
+        """Lwd model-output 扩展接口(步内输出接缝):接收步内 model_output 与
+        update_from_output 产物 engine_core_outputs,调用子类覆写的处理方法;
+        接口自身承载固定编排。"""
+        return self.lwd_handle_model_output(model_output, engine_core_outputs)
+
+    def lwd_handle_model_output(
+        self,
+        model_output: ModelRunnerOutput,
+        engine_core_outputs: dict[int, EngineCoreOutputs],
+    ) -> ModelRunnerOutput:
+        """子类继承 EngineCore 后覆写本方法以消费步内输出;engine_core_outputs
+        携带本步逐请求 finish_reason(原生停止条件判定),父类默认原样透传,
+        未覆写时原生行为不变。"""
+        return model_output
 
     def _process_aborts_queue(self):
         if not self.aborts_queue.empty():
@@ -1161,7 +1185,12 @@ class EngineCoreProc(EngineCore):
                 parallel_config.data_parallel_size = 1
                 parallel_config.data_parallel_size_local = 1
                 parallel_config.data_parallel_rank = 0
-                engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+                # Lwd prefill-only engine selection (edge/cloud): no-op
+                # unless the mode is enabled (vanilla EngineCoreProc).
+                from vllm.v1.lwd_control import lwd_resolve_engine_cls
+
+                engine_cls = lwd_resolve_engine_cls(vllm_config) or EngineCoreProc
+                engine_core = engine_cls(*args, engine_index=dp_rank, **kwargs)
 
             assert engine_core is not None
 
