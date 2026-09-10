@@ -105,9 +105,6 @@ class LwdEdgeEngineCore(EngineCoreProc):
             )
 
         vllm_config.scheduler_config.scheduler_cls = LwdEdgeScheduler
-        # UNEMBED 批派发号:每派发 +1,DOWN 通道按步序配对,seqno 供
-        # 诊断/数据面对账;与 UP 链的 RangeNotify.seqno 相互独立
-        self._lwd_unembed_seqno = 0
         super().__init__(*args, **kwargs)
         self.scheduler.lwd_edge_publisher = self._edge_sender
         logger.info(
@@ -258,9 +255,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
         rowed = [n for n in notifies if n.req_ids and n.hidden_num_elements > 0]
         token_map: dict | None = None
         if rowed:
-            unembed_seqno = getattr(self, "_lwd_unembed_seqno", 0)
-            self._lwd_unembed_seqno = unembed_seqno + 1
-            unembed_batch = lwd_build_unembed_batch(rowed, unembed_seqno)
+            unembed_batch = lwd_build_unembed_batch(rowed)
             result = self.model_executor.execute_model(unembed_batch).result()
             token_map = getattr(result, "lwd_token_ids", None)
             if token_map is None:

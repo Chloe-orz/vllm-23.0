@@ -383,13 +383,14 @@ class LwdEdgeScheduler(AsyncScheduler):
                 f"(request {request.request_id})"
             )
 
-def lwd_build_unembed_batch(notifies: list, seqno: int) -> SchedulerOutput:
+def lwd_build_unembed_batch(notifies: list) -> SchedulerOutput:
     """组 UNEMBED 批(引擎步内调用,云载荷派发给边 worker 做 lm_head)。
 
     云结果不经过原生 schedule,无原生排程产物可用——以 make_empty
     为骨架:
     - lwd_batch 携带 LwdUnembedBatch:req_ids(隐藏行序)/
-      num_accept_tokens/top_id_ths 逐请求透传自 c2e;recv_num_elements
+      num_accept_tokens/top_id_ths 逐请求透传自 c2e;批序号将随 c2e
+      通告携带(规划),当前占位 0;recv_num_elements
       (DOWN 通道每请求接收元素数)与 out_token_idxs(生成序号)控制面
       不可知,留空由数据面按 DOWN 张量实收推导;
     - 请求集合同步镜像到 num_scheduled_tokens(值 1 = 单 token 位,
@@ -404,7 +405,6 @@ def lwd_build_unembed_batch(notifies: list, seqno: int) -> SchedulerOutput:
     scheduler_output.total_num_scheduled_tokens = len(req_ids)
     scheduler_output.lwd_batch = LwdBatch(
         batch_type=LwdBatchType.LWD_UNEMBED,
-        seqno=seqno,
         batch_meta=LwdUnembedBatch(
             req_ids=req_ids,
             num_accept_tokens=[
