@@ -96,6 +96,13 @@ class LwdCloudEngineCore(EngineCoreProc):
         # 到齐前是否开算由数据面 gate 负责(§9.12),引擎层不设卡。
         # 门状态归 socket IO 线程独占;调度器只经 input_queue 被主循环碰。
         self._lwd_gate_pending: dict[str, LwdRequestNotify] = {}
+        # UP 链 seqno 登记(边→云→云 worker 的最后一跳,§9.12 接缝):
+        # rid -> [chunk 序 seqno 列表],RangeNotify 到达即登记;调度器
+        # 出 prefill 批时取快照挂 SO.lwd_up_seqnos 随批下发云 worker
+        # (数据面 UP recv 配对键,与边侧 SO.lwd_batch.seqno 同源同值)。
+        # registry 引用交付调度器(IO 线程登记 / 主循环读,dict 赋值原子)。
+        self._lwd_seqno_registry: dict[str, list[int]] = {}
+        self.scheduler.lwd_seqno_registry = self._lwd_seqno_registry
         logger.info(
             "[Lwd] cloud engine assembled: PRE_OUT bind %s, POST_OUT announce -> "
             "%s:%s via master %s",
@@ -157,10 +164,15 @@ class LwdCloudEngineCore(EngineCoreProc):
         super().shutdown()
 
     def _lwd_dispatch(self, msg) -> None:
-        """PRE_OUT 三类分派(本 IO 线程):元数据转 Request / abort 终结。"""
+        """PRE_OUT 三类分派(本 IO 线程):元数据转 Request / abort 终结 /
+        范围预告登记 seqno。"""
         if isinstance(msg, LwdRangeNotify):
-            # 范围预告当前无消费点(§9.12):元数据到达即已构建放行,seqno/
-            # offset 登记与开算 gate 随数据面落位再接
+            # 范围预告:登记 UP 链 seqno(数据面配对键,§9.12)。幂等去重
+            # 按"单调性"(seqno 不大于该请求已登记尾号即重复,边侧队满
+            # 重试天然产生重复预告,重试复用同一号不产生新登记)。
+            seqnos = self._lwd_seqno_registry.setdefault(msg.request_id, [])
+            if not seqnos or msg.seqno > seqnos[-1]:
+                seqnos.append(msg.seqno)
             return
         if isinstance(msg, LwdAbortNotify):
             self._lwd_gate_pending.pop(msg.request_id, None)

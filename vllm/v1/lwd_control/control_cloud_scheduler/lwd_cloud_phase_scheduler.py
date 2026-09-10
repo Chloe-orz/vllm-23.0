@@ -130,6 +130,16 @@ class LwdCloudPhaseScheduler(AsyncScheduler):
             while leftover:
                 self.waiting.prepend_request(leftover.pop_request())
             self.running = decode_ready + self.running + hidden_tails
+        # UP 链 seqno 随批下发云 worker(§9.12 数据面接缝):取登记表
+        # 快照挂 SO 动态属性(无 slots 存活至 worker),worker 的 UP recv
+        # 以此配对边侧发来的 embeds 张量(与边侧 SO.lwd_batch.seqno 同源)。
+        # registry 由云引擎 IO 线程交付(缺省 = 未启用,挂空不扰原生)。
+        if hasattr(self, "lwd_seqno_registry"):
+            registry = self.lwd_seqno_registry
+            out.lwd_up_seqnos = {
+                request_id: list(registry.get(request_id, []))
+                for request_id in out.num_scheduled_tokens
+            }
         return out
 
     def _schedule_pure_decode(self) -> SchedulerOutput:
