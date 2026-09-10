@@ -5,16 +5,13 @@
 全部状态收进子类字段,不外挂引擎属性。
 
 构造约束:
-  ① kv_transfer_config 在场则降级原生:调度器注入会丢失 connector
-     握手态,prefill_only 不支持 kv_connector;降级态 _lwd_active=False,
-     所有覆写方法走 super(),行为等同原生引擎。
-  ② 通信面先于引擎主体构建:bind POST_OUT、建云载荷队列与接收线程,
+  ① 通信面先于引擎主体构建:bind POST_OUT、建云载荷队列与接收线程,
      阻塞等云首拍 HELLO——HELLO 在云引擎全量初始化(权重/KV/图编译)
      完成后才发出,等到了它才允许边侧对外就绪;超时(hello_timeout_s,
      默认 600s,须覆盖云全量启动时长)自清理两面后 fail-fast。
      HELLO 首拍一次、无周期重发,不考虑任一侧重启自愈:重启即整组重拉,
      构造期等待是边侧唯一的发现窗口。
-  ③ 调度器经 scheduler_cls 注入裸类,引擎构造完成后回填 publisher
+  ② 调度器经 scheduler_cls 注入裸类,引擎构造完成后回填 publisher
      (早于任何请求,等价构造注入)。
 
 步进编排:步首消费云载荷(c2e -> UNEMBED 批 -> token 交付/请求终结)
@@ -77,22 +74,13 @@ class LwdEdgeEngineCore(EngineCoreProc):
     """边 PO 引擎:通信面装配 + 调度器注入 + step/add/abort/shutdown 覆写。"""
 
     def __init__(self, *args, **kwargs) -> None:
-        self._lwd_active = False
         vllm_config = args[0]
         config = LwdConfig.from_env_and_config(vllm_config)
-        self._lwd_config = config
         self._lwd_log = LwdLog(config.debug)
-        if vllm_config.kv_transfer_config is not None:
-            logger.warning(
-                "[Lwd] kv_connector enabled on edge: degrade to native engine"
-            )
-            super().__init__(*args, **kwargs)
-            return
-
         # 通信面:bind POST_OUT 订阅面 + 延迟连接的 PRE_OUT 发布面;
         # 云端点由 HELLO 通告决定(边不预知云地址)
-        self._lwd_post_out_receiver = self._lwd_build_post_out(config)
-        self._lwd_publisher = LwdControlPublisher(
+        self._edge_receiver = self._lwd_build_post_out(config)
+        self._edge_sender = LwdControlPublisher(
             None, bind=False, queue_max=config.publish_queue_max
         )
         # 云->边唯一载荷队列:生产端接收线程,消费端引擎步;数据面经
@@ -101,7 +89,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
         self.lwd_c2e_meta_queue = queue.Queue(maxsize=LWD_C2E_META_QUEUE_MAX)
         hello_event = threading.Event()
         discovery = threading.Thread(
-            target=self._lwd_discovery_loop,
+            target=self._receive_thread,
             args=(hello_event,),
             name="lwd-post-in",
             daemon=True,
@@ -117,12 +105,8 @@ class LwdEdgeEngineCore(EngineCoreProc):
             )
 
         vllm_config.scheduler_config.scheduler_cls = LwdEdgeScheduler
-        self._lwd_active = True
-        # UNEMBED 批派发号:每派发 +1,DOWN 通道按步序配对,seqno 供
-        # 诊断/数据面对账;与 UP 链的 RangeNotify.seqno 相互独立
-        self._lwd_unembed_seqno = 0
         super().__init__(*args, **kwargs)
-        self.scheduler.lwd_edge_publisher = self._lwd_publisher
+        self.scheduler.lwd_edge_publisher = self._edge_sender
         logger.info(
             "[Lwd] edge engine assembled: POST_OUT bind %s, PRE_OUT discovered",
             config.lwd_post_out_bind_endpoint(),
@@ -139,8 +123,8 @@ class LwdEdgeEngineCore(EngineCoreProc):
             decoder=lwd_decode_cloud_notify,
         )
 
-    def _lwd_discovery_loop(self, hello_event: threading.Event) -> None:
-        """POST_OUT 接收线程(lwd-post-in),按消息类型分发。
+    def _receive_thread(self, hello_event: threading.Event) -> None:
+        """POST_OUT 接收线程体,按消息类型分发。
 
         HELLO -> retarget PRE_OUT:云端点唯一事实源,首拍一次通告;
         retarget 队满时无下条 HELLO 可等,须本线程自旋重试到成功
@@ -152,8 +136,8 @@ class LwdEdgeEngineCore(EngineCoreProc):
         消息体,数据与唤醒分离,多投无害(空 drain 一步即返回)。
         其余帧(坏帧已被订阅层丢弃后仍不认识的类型)告警丢弃。
         """
-        receiver = self._lwd_post_out_receiver
-        publisher = self._lwd_publisher
+        receiver = self._edge_receiver
+        publisher = self._edge_sender
         while not receiver.closed:
             msg = receiver.recv(timeout_ms=5000)
             if msg is None:
@@ -180,37 +164,32 @@ class LwdEdgeEngineCore(EngineCoreProc):
 
     def _lwd_shutdown_planes(self) -> None:
         """两面关停(幂等):receiver 先关断输入,publisher 收尾。"""
-        receiver = getattr(self, "_lwd_post_out_receiver", None)
+        receiver = getattr(self, "_edge_receiver", None)
         if receiver is not None:
             receiver.shutdown()
-        publisher = getattr(self, "_lwd_publisher", None)
+        publisher = getattr(self, "_edge_sender", None)
         if publisher is not None:
             publisher.shutdown()
 
     # ------------------------------------------------------------------ #
     # 引擎接口覆写                                                        #
     # ------------------------------------------------------------------ #
-    def add_request(self, request, request_wave: int = 0) -> None:
-        """边校验 + 云预告 + 本地入队。"""
-        if not self._lwd_active:
-            super().add_request(request, request_wave)
-            return
+    def add_request(self, request, _request_wave: int = 0) -> None:
+        """边校验 + 云预告 + 本地入队。
+
+        _request_wave:原生主循环按位置传入(core.py ADD 分发),本模式
+        无 DP wave 语义,仅保形参契约,不消费。"""
         self.scheduler.lwd_edge_add_request(request)
 
     def abort_requests(self, request_ids: list[str]) -> None:
         """abort 信号先出云,再走原生本地清理。"""
-        if self._lwd_active:
-            self.scheduler.lwd_edge_abort(request_ids)
+        self.scheduler.lwd_edge_abort(request_ids)
         super().abort_requests(request_ids)
 
     def step(self):
-        if not self._lwd_active:
-            return super().step()
         return self._lwd_edge_step()
 
     def step_with_batch_queue(self):
-        if not self._lwd_active:
-            return super().step_with_batch_queue()
         return self._lwd_edge_step()
 
     def _lwd_edge_step(self) -> tuple[dict[int, object] | None, bool]:
@@ -243,7 +222,8 @@ class LwdEdgeEngineCore(EngineCoreProc):
     def _lwd_edge_consume_c2e(self) -> tuple[list, set]:
         """消费云载荷(LwdC2eNotify,云->边唯一载荷)并产出前端输出。
 
-        通告分两类:
+        通告分两类,逐条处理(一条通告一个 UNEMBED 批,批间顺序 =
+        到达顺序;一条通告对应一个 DOWN 张量,一一批配对无需切分拼接):
         - 带 hidden 行(hidden_num_elements > 0):组 UNEMBED 批提交
           worker 做 lm_head,c2e 全量随批下发(数据面据
           hidden_num_elements 对齐 DOWN 张量,元数据先于张量到达);
@@ -273,28 +253,27 @@ class LwdEdgeEngineCore(EngineCoreProc):
         outputs: list = []
         finished_reqs: set = set()
 
-        rowed = [n for n in notifies if n.req_ids and n.hidden_num_elements > 0]
-        token_map: dict | None = None
-        if rowed:
-            unembed_seqno = getattr(self, "_lwd_unembed_seqno", 0)
-            self._lwd_unembed_seqno = unembed_seqno + 1
-            unembed_batch = lwd_build_unembed_batch(rowed, unembed_seqno)
-            result = self.model_executor.execute_model(unembed_batch).result()
-            token_map = getattr(result, "lwd_token_ids", None)
-            if token_map is None:
-                logger.warning(
-                    "[Lwd] unembed batch answer missing lwd_token_ids (%r), "
-                    "finishing requests with ERROR",
-                    type(result),
-                )
-
         def _lwd_finish_flag(notify: LwdC2eNotify, index: int) -> bool:
             if len(notify.finished) == len(notify.req_ids):
                 return bool(notify.finished[index])
             return True
 
         for notify in notifies:
+            # 逐条通告逐批执行:一条 c2e = 云一个 decode 步 = 一个 DOWN
+            # 张量,一一批使数据面配对无需切分拼接;行序 = 批内 req_ids
+            # 序,与张量行序一致
             has_rows = bool(notify.req_ids) and notify.hidden_num_elements > 0
+            token_map: dict | None = None
+            if has_rows:
+                unembed_batch = lwd_build_unembed_batch([notify])
+                result = self.model_executor.execute_model(unembed_batch).result()
+                token_map = getattr(result, "lwd_token_ids", None)
+                if token_map is None:
+                    logger.warning(
+                        "[Lwd] unembed batch answer missing lwd_token_ids (%r), "
+                        "finishing requests with ERROR",
+                        type(result),
+                    )
             for index, request_id in enumerate(notify.req_ids):
                 finished = _lwd_finish_flag(notify, index)
                 token_ids: list[int] = []
@@ -348,7 +327,6 @@ class LwdEdgeEngineCore(EngineCoreProc):
         return dict(scheduler_output.num_scheduled_tokens)
 
     def shutdown(self) -> None:
-        """两面关停后走原生;降级路径两面未建,容忍缺省。"""
-        if self._lwd_active:
-            self._lwd_shutdown_planes()
+        """两面关停后走原生;初始化失败路径两面可能未建,容忍缺省。"""
+        self._lwd_shutdown_planes()
         super().shutdown()
