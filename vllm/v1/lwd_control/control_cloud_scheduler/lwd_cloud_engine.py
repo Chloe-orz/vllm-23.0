@@ -137,6 +137,10 @@ class LwdCloudEngineCore(EngineCoreProc):
             seqnos = self._lwd_seqno_registry.setdefault(msg.request_id, [])
             if not seqnos or msg.seqno > seqnos[-1]:
                 seqnos.append(msg.seqno)
+            # 每条预告都点名入队(重复预告即重复点名,剔除-调度-拼回幂等,
+            # 无副作用;PRE_OUT 只 append,调度主线程单独 popleft,deque
+            # 单操作原子)
+            self.scheduler.prefill_notify_queue.append(msg.request_id)
             return
         if isinstance(msg, LwdAbortNotify):
             self._lwd_gate_pending.pop(msg.request_id, None)

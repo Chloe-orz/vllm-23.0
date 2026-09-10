@@ -30,8 +30,8 @@ class LwdCloudPhaseScheduler(AsyncScheduler):
         self._force_decode_once: bool = False
         # 上一个非空步是否为 prefill,驱动 schedule() 的禁连续 prefill 不变量
         self._last_step_was_prefill: bool = False
-        # prefill 通知队列:边侧发来的待 prefill 请求,每步取队首调度
-        self.prefill_notify_queue: deque[Request] = deque()
+        # prefill 通知队列:边侧预告解锁的待调度 req_id,每步取队首点名
+        self.prefill_notify_queue: deque[str] = deque()
         logger.info(
             "[Lwd] cloud phase scheduler: single-request prefill batches "
             "enforced (edge/cloud chunk stream stays per-request contiguous)"
@@ -124,7 +124,7 @@ class LwdCloudPhaseScheduler(AsyncScheduler):
         """纯 prefill 步:prefill_notify_queue 有请求则取队首 req_id 单独
         调度(按原队列归位,waiting/skipped 来源走原生准入);没有则空集
         进窗口,等价空步,三队列原样保留。"""
-        req_ids = [q.popleft().request_id] if (q := self.prefill_notify_queue) else []
+        req_ids = [q.popleft()] if (q := self.prefill_notify_queue) else []
         out = self._lwd_schedule_for_visible_reqs(req_ids)
         # UP 链 seqno 随批下发云 worker(§9.12 数据面接缝):取登记表
         # 快照挂 SO 动态属性(无 slots 存活至 worker),worker 的 UP recv
