@@ -77,7 +77,6 @@ class LwdCloudEngineCore(EngineCoreProc):
         传输保留给后续云->边扩展。建站失败仍走 EXECUTOR_FAILED 升级。
         """
         config = LwdConfig.from_env_and_config(self.vllm_config)
-        self._lwd_config = config
         self._lwd_subscriber = LwdControlSubscriber(
             config.lwd_pre_out_endpoint(), bind=True
         )

@@ -76,7 +76,6 @@ class LwdEdgeEngineCore(EngineCoreProc):
     def __init__(self, *args, **kwargs) -> None:
         vllm_config = args[0]
         config = LwdConfig.from_env_and_config(vllm_config)
-        self._lwd_config = config
         self._lwd_log = LwdLog(config.debug)
         # 通信面:bind POST_OUT 订阅面 + 延迟连接的 PRE_OUT 发布面;
         # 云端点由 HELLO 通告决定(边不预知云地址)
@@ -178,8 +177,11 @@ class LwdEdgeEngineCore(EngineCoreProc):
     # ------------------------------------------------------------------ #
     # 引擎接口覆写                                                        #
     # ------------------------------------------------------------------ #
-    def add_request(self, request, request_wave: int = 0) -> None:
-        """边校验 + 云预告 + 本地入队。"""
+    def add_request(self, request, _request_wave: int = 0) -> None:
+        """边校验 + 云预告 + 本地入队。
+
+        _request_wave:原生主循环按位置传入(core.py ADD 分发),本模式
+        无 DP wave 语义,仅保形参契约,不消费。"""
         self.scheduler.lwd_edge_add_request(request)
 
     def abort_requests(self, request_ids: list[str]) -> None:
