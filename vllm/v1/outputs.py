@@ -251,6 +251,13 @@ class LwdC2eMeta:
     num_accepted_tokens: list[int]
     # Request ids in hidden row order (rows are grouped by request).
     req_ids: list[str]
+    # Per-request completion flags aligned with ``req_ids`` (additive,
+    # default empty = legacy "all finished"). A request finishing on this
+    # step still appears here with its final hidden rows (if any); a
+    # finish-only notify carries ``hidden_num_elements == 0`` with just
+    # the finished requests listed — the edge then finishes them locally
+    # without dispatching an unembed batch.
+    finished: list[bool] = field(default_factory=list)
 
 
 # ModelRunnerOutput is serialized and sent to the scheduler process.
@@ -270,6 +277,13 @@ class ModelRunnerOutput:
     # prefill_only LWD cloud->edge step metadata (scheduler forwards it
     # to the edge via the control plane; None on non-LWD deployments).
     lwd_c2e_meta: LwdC2eMeta | None = None
+
+    # prefill_only LWD edge unembed answer (edge data plane fills it on
+    # batch_type="unembed" batches: request_id -> sampled token ids from
+    # the local lm_head over cloud-provided hidden rows; None on non-LWD
+    # deployments and on failed unembed batches — the engine turns a
+    # missing value on an unembed batch into a per-request ERROR finish).
+    lwd_token_ids: dict[str, list[int]] | None = None
 
     # [num_reqs, max_num_logprobs + 1]
     # [num_reqs, max_num_logprobs + 1]

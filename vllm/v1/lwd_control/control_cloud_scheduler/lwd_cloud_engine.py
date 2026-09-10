@@ -59,8 +59,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# PRE_OUT recv 超时拍:仅作关停响应上限(HELLO 为首拍通告,无周期重发)
-LWD_HELLO_RESEND_INTERVAL_MS = 5000
+# PRE_OUT recv 超时拍:仅作关停响应上限(HELLO 首拍一次,无重发)
+LWD_PRE_OUT_RECV_TIMEOUT_MS = 5000
 
 # 步元数据队满重试小睡:元数据不可丢(边侧据此预挂精确尺寸 recv)
 _LWD_C2E_SEND_RETRY_SLEEP_S = 0.05
@@ -72,7 +72,7 @@ class LwdCloudEngineCore(EngineCoreProc):
     def _lwd_setup_zmq(self) -> None:
         """介入 ZMQ 双面(§9.1):PRE_OUT bind 收边 + POST_OUT connect 通告边。
 
-        POST_OUT 经 master_addr 连边(边 bind),承载周期 HELLO——
+        POST_OUT 经 master_addr 连边(边 bind),承载首拍 HELLO——
         云端点(pre_out_*)的唯一事实源;该面当前仅发现用途,数据
         传输保留给后续云->边扩展。建站失败仍走 EXECUTOR_FAILED 升级。
         """
@@ -134,7 +134,7 @@ class LwdCloudEngineCore(EngineCoreProc):
             self.input_queue.put_nowait((EngineCoreRequestType.EXECUTOR_FAILED, b""))
             return
         while True:
-            msg = self._lwd_subscriber.recv(timeout_ms=LWD_HELLO_RESEND_INTERVAL_MS)
+            msg = self._lwd_subscriber.recv(timeout_ms=LWD_PRE_OUT_RECV_TIMEOUT_MS)
             if msg is None:
                 if self._lwd_subscriber.closed:
                     break
@@ -142,7 +142,8 @@ class LwdCloudEngineCore(EngineCoreProc):
             self._lwd_dispatch(msg)
 
     def _lwd_announce(self) -> None:
-        """HELLO 通告(幂等):队满失败不重试,周期拍自愈。"""
+        """HELLO 通告(首拍一次,无周期重发):队满失败不重试——边侧
+    30s 等待超时 fail-fast 兜底(整组重拉恢复)。"""
         self._lwd_post_out.publish(self._lwd_hello)
 
     def shutdown(self) -> None:

@@ -240,6 +240,11 @@ class SchedulerOutput:
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
 
+    # Lwd prefill-only batch type for the data plane ("embed"/"unembed"):
+    # the worker/model-runner branches on it instead of the native full
+    # forward. None = native batch (non-lwd paths unaffected).
+    batch_type: str | None = None
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

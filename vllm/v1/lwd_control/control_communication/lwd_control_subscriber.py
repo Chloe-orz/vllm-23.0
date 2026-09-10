@@ -30,7 +30,7 @@ class LwdControlSubscriber:
     """控制面订阅端;阻塞 recv 一条解码一条,等待节奏由调用方定。
 
     recv(timeout_ms) 超时与关停都返回 None,以 closed 属性区分——
-    周期超时给调用方做心跳位(云侧 HELLO 重发即挂在此返回值上)。
+    周期超时给调用方做心跳位(云侧空闲拍即挂在此返回值上)。
     """
 
     def __init__(

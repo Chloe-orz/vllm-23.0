@@ -55,10 +55,11 @@ class LwdAbortNotify(msgspec.Struct, gc=False, tag=True):
 
 
 class LwdHelloNotify(msgspec.Struct, gc=False, tag=True):
-    """云->边发现通告(POST_OUT 面的周期性心跳帧)。
+    """云->边发现通告(POST_OUT 面,首拍一次,无周期重发)。
 
-    云侧启动即通告、此后周期重发:边重启后重新发现(边侧幂等)、
-    云换址重启后边侧 retarget PRE_OUT。pre_out_* 是边侧连接云端点
+    云侧启动即通告一次:边侧装配期阻塞等待的唯一发现窗口(裁定:
+    不考虑云换址/边重启自愈,任一侧重启即整组重拉)。
+    pre_out_* 是边侧连接云端点
     的唯一事实源(边侧不读配置里的 host——决策 B:单一事实源)。
     pre_out_host 必须是边可路由的真实 IP(或同机 127.0.0.1),
     0.0.0.0 不可作为通告值(serve 守卫拦截)。
@@ -69,20 +70,32 @@ class LwdHelloNotify(msgspec.Struct, gc=False, tag=True):
 
 
 class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):
-    """云->边步元数据预告(POST_OUT):先于隐藏张量到达,边侧据
-    hidden_num_elements 预挂精确尺寸 recv;req_ids/top_id_ths 按隐藏
-    行序(ModelRunnerOutput.lwd_c2e_meta 的线上形态)。"""
+    """云->边步元数据通告(POST_OUT,云->边唯一载荷类型):先于隐藏张量
+    到达,边侧据 hidden_num_elements 预挂精确尺寸 recv;req_ids/
+    top_id_ths 按隐藏行序(ModelRunnerOutput.lwd_c2e_meta 的线上形态)。
+
+    finished 与 req_ids 对齐(additive,缺省空 = 兼容"全部完结"旧语义):
+    云侧逐 decode 步回传 token 时逐条 False,终结步置 True;纯终结
+    通告 = hidden_num_elements 为 0、仅列完结请求——边侧本地终结,
+    不派发 unembed 批。"""
 
     hidden_num_elements: int
     top_id_ths: list[list[int]]
     num_accepted_tokens: list[int]
     req_ids: list[str]
+    finished: list[bool] = []
 
 
 # typing.Union 而非 PEP 604 `|`:msgspec 解码器的全版本支持路径
 LwdNotify = Union[LwdRangeNotify, LwdRequestNotify, LwdAbortNotify]  # noqa: UP007
-# 云->边方向(POST_OUT):HELLO 发现 + 步元数据;后续结果回传/
-# 重同步消息在此 union 上 additive 扩展
+
+# 数据面批型(SchedulerOutput.batch_type 取值,§9.12):embed = 边侧
+# embedding 批(prefill 侧),unembed = 边侧 lm_head 批(decode 结果侧);
+# 缺省 None = 原生完整前向批(非 lwd 路径)
+LWD_BATCH_TYPE_EMBED = "embed"
+LWD_BATCH_TYPE_UNEMBED = "unembed"
+# 云->边方向(POST_OUT):HELLO 发现 + 步元数据(唯一载荷,兼结果回传
+# 驱动);重同步消息在此 union 上 additive 扩展
 LwdCloudNotify = Union[LwdHelloNotify, LwdC2eNotify]  # noqa: UP007
 
 _NOTIFY_DECODER = msgspec.msgpack.Decoder(LwdNotify)

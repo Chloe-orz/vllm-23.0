@@ -1,43 +1,25 @@
-"""边侧 L3 装配:EngineCore.__init__ 守卫调用的单点开关(§8.2/§9.8)。
+"""两侧共享的配置支撑(§10.3 折入):LwdConfig(env/additional_config 唯一
+解析入口)与 is_lwd_prefill_only(模式判定唯一实现)。
 
-单向语义:无云结果/水位 drain,步进逻辑全部收编进
-LwdEdgeCore.step_with_batch_queue;本文件只负责装配与生命周期,
-原 6 个 monkey-patch 由 core.py in-tree 守卫分支替代。
+边云装配均已收进引擎子类(§10.14 对齐:边 LwdEdgeEngineCore / 云
+LwdCloudEngineCore,类选择点出生即子类),本文件不再承载装配/端口
+适配/生命周期,仅保留配置解析;云侧装配经 import 复用,内核模块收
+plain 值。
 
-双面拓扑(§9.1):边 bind POST_OUT(云经 master_addr 来连,承载
-周期 HELLO),PRE_OUT 延迟连接、目标端点由 HELLO 通告唯一决定
-(决策 B:边不读 pre_out_host 做连接);装配阻塞等首条 HELLO,
-超时 fail-fast。
-
-本文件同时承载两侧共享的配置支撑(§10.3 折入):LwdConfig
-(env/additional_config 唯一解析入口)与 is_lwd_prefill_only
-(模式判定唯一实现);云侧装配经 import 复用,内核模块收 plain 值。
+配置源(生效配置类优先):vllm_config.lwd_config(vllm/config/lwd.py,
+additional_config["lwd_config"] 于 VllmConfig.__post_init__ 解析)提供
+enabled/role/mode;传输层字段(pre_out_host 等)取 lwd_config 段,旧
+edge_cloud_config 段兼容回退;env(VLLM_ASCEND_LWD_*)只覆盖地址与开关。
 """
 
 from __future__ import annotations
 
 import os
-import queue
-import threading
 from dataclasses import dataclass
 
 from vllm.logger import init_logger
-from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
     LWD_PUBLISH_QUEUE_MAX,
-    LwdControlPublisher,
-)
-from vllm.v1.lwd_control.control_communication.lwd_control_subscriber import (
-    LwdControlSubscriber,
-)
-from vllm.v1.lwd_control.control_communication.lwd_notify import (
-    LwdC2eNotify,
-    LwdHelloNotify,
-    lwd_decode_cloud_notify,
-)
-from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_core import LwdEdgeCore
-from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler import (
-    LwdEdgeScheduler,
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_step_core import LwdStepSettings
 
@@ -45,6 +27,10 @@ logger = init_logger(__name__)
 
 LWD_PRE_OUT_PORT_DEFAULT = 5558
 LWD_POST_OUT_PORT_DEFAULT = LWD_PRE_OUT_PORT_DEFAULT + 1
+# 等云首拍 HELLO 的预算:HELLO 在云 EngineCore.__init__ 全部完成(权重/
+# KV/图编译 capture)后才发出,预算须覆盖云全量启动——边不开图、云开图
+# 是本场景固定形态,默认按其给 600s;部署可经 hello_timeout_s/env 覆盖
+LWD_HELLO_TIMEOUT_S_DEFAULT = 600.0
 
 # 云->边步元数据接缝队列容量(§9.12):生产端 lwd-post-in,消费端随数据面落位
 LWD_C2E_META_QUEUE_MAX = 1000
@@ -64,7 +50,7 @@ class LwdConfig:
     pre_out_port: int = LWD_PRE_OUT_PORT_DEFAULT
     post_out_port: int = LWD_POST_OUT_PORT_DEFAULT
     post_out_bind: str = "*"
-    hello_timeout_s: float = 30.0
+    hello_timeout_s: float = LWD_HELLO_TIMEOUT_S_DEFAULT
     scheduler_name: str = "prefill_first"
     publish_queue_max: int = LWD_PUBLISH_QUEUE_MAX
     zombie_log_interval_s: float = 30.0
@@ -101,7 +87,9 @@ class LwdConfig:
             pre_out_port=int(section.get("pre_out_port", LWD_PRE_OUT_PORT_DEFAULT)),
             post_out_port=int(section.get("post_out_port", LWD_POST_OUT_PORT_DEFAULT)),
             post_out_bind=str(section.get("post_out_bind", "*")),
-            hello_timeout_s=float(section.get("hello_timeout_s", 30.0)),
+            hello_timeout_s=float(
+                section.get("hello_timeout_s", LWD_HELLO_TIMEOUT_S_DEFAULT)
+            ),
             scheduler_name=str(section.get("scheduler", "prefill_first")),
             publish_queue_max=int(
                 section.get("publish_queue_max", LWD_PUBLISH_QUEUE_MAX)
@@ -185,159 +173,3 @@ def _lwd_read_env_float(name: str) -> float | None:
     except ValueError:
         logger.warning("[Lwd] ignore invalid env %s%s=%r", _LWD_ENV_PREFIX, name, raw)
         return None
-
-
-class LwdEdgeEnginePortAdapter:
-    """边侧端口适配器(§10.3 落位装配文件):仅承载边侧编排触达的两个方法。
-
-    台账登记的 engine_core 属性容忍点(§7.3-C5);内核零属性触达。
-    """
-
-    def __init__(self, engine_core) -> None:
-        self._engine_core = engine_core
-
-    def lwd_scheduler(self):
-        return self._engine_core.scheduler
-
-    def lwd_execute_model(self, scheduler_output):
-        executor = self._engine_core.model_executor
-        return executor.execute_model(scheduler_output).result()
-
-
-def lwd_edge_try_assemble(engine_core) -> bool:
-    """装配点(core.py __init__ 尾守卫调用):非 PO 立即返回 False,零副作用。
-
-    PO 时:bind POST_OUT 订阅面,建延迟连接的 PRE_OUT 发布面,起
-    lwd-post-in 发现线程并阻塞等首条 HELLO(超时 fail-fast,§9.1);
-    scheduler_cls 以 partial(LwdEdgeScheduler, publisher=...)注入
-    (调度器即控制面出口,§9.12),建 LwdEdgeCore 并赋给
-    engine_core.step_wrapper(core.py step 守卫的唯一委托对象,§9.8)。
-    """
-    vllm_config = engine_core.vllm_config
-    if not is_lwd_prefill_only(vllm_config):
-        return False
-    config = LwdConfig.from_env_and_config(vllm_config)
-    if not config.is_edge_node:
-        return False
-    if engine_core.scheduler.get_kv_connector() is not None:
-        # 调度器重建会丢失 connector 握手态:PO 不支持 kv_connector,降级原生
-        logger.warning(
-            "[Lwd] kv_connector enabled on edge: skip Lwd assembly, degrade to native"
-        )
-        return False
-    receiver = _lwd_edge_build_post_out(config)
-    publisher = LwdControlPublisher(
-        None, bind=False, queue_max=config.publish_queue_max
-    )
-    hello_event = threading.Event()
-    # 步元数据接缝队列(§9.12):生产端 lwd-post-in,消费端随数据面落位接线
-    engine_core.lwd_c2e_meta_queue = queue.Queue(maxsize=LWD_C2E_META_QUEUE_MAX)
-    discovery = threading.Thread(
-        target=_lwd_edge_discovery_loop,
-        args=(receiver, publisher, hello_event, engine_core.lwd_c2e_meta_queue),
-        name="lwd-post-in",
-        daemon=True,
-    )
-    discovery.start()
-    if not hello_event.wait(config.hello_timeout_s):
-        _lwd_edge_shutdown_planes(receiver, publisher)
-        raise RuntimeError(
-            f"[Lwd] edge assembly failed: no cloud HELLO within "
-            f"{config.hello_timeout_s}s on POST_OUT "
-            f"(bind {config.lwd_post_out_bind_endpoint()}; check cloud "
-            f"master_addr connectivity and POST_OUT port)"
-        )
-    _lwd_edge_install_scheduler(engine_core, publisher)
-    engine_core.lwd_edge_post_out_receiver = receiver
-    engine_core.step_wrapper = LwdEdgeCore(
-        LwdEdgeEnginePortAdapter(engine_core), config.lwd_step_settings()
-    )
-    return True
-
-
-def _lwd_edge_build_post_out(config: LwdConfig) -> LwdControlSubscriber:
-    """bind POST_OUT 订阅面(云经 master_addr 主动来连;边不预知云地址)。"""
-    return LwdControlSubscriber(
-        config.lwd_post_out_bind_endpoint(),
-        bind=True,
-        decoder=lwd_decode_cloud_notify,
-    )
-
-
-def _lwd_edge_discovery_loop(
-    receiver: LwdControlSubscriber,
-    publisher: LwdControlPublisher,
-    hello_event: threading.Event,
-    meta_queue: queue.Queue,
-) -> None:
-    """POST_OUT 接收线程(lwd-post-in):HELLO -> retarget PRE_OUT;
-    LwdC2eNotify 步元数据 -> 入接缝队列(§9.12)。
-
-    常驻运行(不只首发):retarget 队满失败靠 HELLO 重发自愈。
-    """
-    while not receiver.closed:
-        msg = receiver.recv(timeout_ms=5000)
-        if msg is None:
-            continue
-        if isinstance(msg, LwdC2eNotify):
-            # 队满阻塞:元数据不可丢,背压沿 zmq 直达云侧步循环
-            meta_queue.put(msg)
-            continue
-        if not isinstance(msg, LwdHelloNotify):
-            logger.warning("[Lwd] drop unexpected POST_OUT frame %r", type(msg))
-            continue
-        endpoint = f"tcp://{msg.pre_out_host}:{msg.pre_out_port}"
-        if not hello_event.is_set():
-            logger.info("[Lwd] cloud discovered via HELLO: PRE_OUT -> %s", endpoint)
-        if not publisher.retarget(endpoint):
-            # 队满丢令:周期重发(5s)会再来,下条 HELLO 重试
-            logger.warning("[Lwd] PRE_OUT retarget deferred: publish queue full")
-        hello_event.set()
-
-
-def _lwd_edge_shutdown_planes(
-    receiver: LwdControlSubscriber | None, publisher: LwdControlPublisher | None
-) -> None:
-    """两面关停(幂等):receiver 先关(断输入),publisher 收尾。"""
-    if receiver is not None:
-        receiver.shutdown()
-    if publisher is not None:
-        publisher.shutdown()
-
-
-def _lwd_edge_install_scheduler(engine_core, publisher) -> None:
-    """以 LwdEdgeScheduler 重建调度器(publisher 经构造注入,§9.10)。
-
-    __init__ 尾装配晚于原生调度器构建,只能整实例替换:装配点无在途
-    请求,重建仅多一次前缀缓存管理器构建;入口期注入 scheduler_cls
-    可免此重建(上游接线/数据面落位时一并处理,记入设计文档 backlog)。
-    """
-    vllm_config = engine_core.vllm_config
-    native_scheduler = engine_core.scheduler
-    block_size, hash_block_size = resolve_kv_cache_block_sizes(
-        native_scheduler.kv_cache_config, vllm_config
-    )
-    engine_core.scheduler = LwdEdgeScheduler(
-        vllm_config=vllm_config,
-        kv_cache_config=native_scheduler.kv_cache_config,
-        structured_output_manager=engine_core.structured_output_manager,
-        log_stats=engine_core.log_stats,
-        block_size=block_size,
-        hash_block_size=hash_block_size,
-        publisher=publisher,
-    )
-
-
-def lwd_edge_shutdown(engine_core) -> None:
-    """通道关停(core.py shutdown 守卫分支调用;装配层掌生命周期)。
-
-    超时 fail-fast 路径已在装配点自清理;此处覆盖正常关停:
-    PRE_OUT(publisher 挂在调度器上)与 POST_OUT(receiver 挂在
-    engine_core 属性上)两面都关。
-    """
-    scheduler = engine_core.scheduler
-    publisher = None
-    if isinstance(scheduler, LwdEdgeScheduler):
-        publisher = scheduler.lwd_edge_publisher
-    receiver = getattr(engine_core, "lwd_edge_post_out_receiver", None)
-    _lwd_edge_shutdown_planes(receiver, publisher)
