@@ -223,12 +223,10 @@ class LwdEdgeEngineCore(EngineCoreProc):
     def _lwd_edge_consume_c2e(self) -> tuple[list, set]:
         """消费云载荷(LwdC2eNotify,云->边唯一载荷)并产出前端输出。
 
-        通告分两类,逐条处理(一条通告一个 UNEMBED 批,批间顺序 =
-        到达顺序;一条通告对应一个 DOWN 张量,一一批配对无需切分拼接):
-        - 带 hidden 行(hidden_num_elements > 0):组 UNEMBED 批提交
-          worker 做 lm_head,c2e 全量随批下发(数据面据
-          hidden_num_elements 对齐 DOWN 张量,元数据先于张量到达);
-        - 纯终结通告(无行):本地终结请求,不派发 worker。
+        逐条通告交付(批间顺序 = 到达顺序),分流与交付逻辑收在
+        _lwd_deliver_notify:先以完成码判 finish——完结通告走本地
+        终结流程(不下发 worker);未完结组 UNEMBED 批提交 worker 做
+        lm_head(一条通告对应一个 DOWN 张量,一一批配对无需切分拼接)。
 
         token 逐条交付(finish_reason=None),终结步透传云侧完成码
         (STOP/LENGTH 等),流式/非流式由原生前端透明处理,引擎层恒为
@@ -254,63 +252,125 @@ class LwdEdgeEngineCore(EngineCoreProc):
         outputs: list = []
         finished_reqs: set = set()
 
-        def _lwd_finish_reason(notify: LwdC2eNotify, index: int) -> FinishReason | None:
-            """finish_reasons 由云侧按 req_ids 逐位推导,构造上严格对齐;
-            错配即 IndexError fail-fast,不做静默兜底。"""
-            code = notify.finish_reasons[index]
-            return None if code == LWD_NOT_FINISHED else FinishReason(code)
-
         for notify in notifies:
-            # 逐条通告逐批执行:一条 c2e = 云一个 decode 步 = 一个 DOWN
-            # 张量,一一批使数据面配对无需切分拼接;行序 = 批内 req_ids
-            # 序,与张量行序一致
-            has_rows = bool(notify.req_ids) and notify.hidden_num_elements > 0
-            token_map: dict | None = None
-            if has_rows:
-                unembed_batch = lwd_build_unembed_batch([notify])
-                result = self.model_executor.execute_model(unembed_batch).result()
-                token_map = getattr(result, "lwd_token_ids", None)
-                if token_map is None:
-                    logger.warning(
-                        "[Lwd] unembed batch answer missing lwd_token_ids (%r), "
-                        "finishing requests with ERROR",
-                        type(result),
-                    )
+            # 通告级以完成码分流,一条通告一次交付
+            self._lwd_deliver_notify(notify, outputs, finished_reqs)
+        return outputs, finished_reqs
+
+    def _lwd_deliver_notify(
+        self, notify: LwdC2eNotify, outputs: list, finished_reqs: set,
+    ) -> None:
+        """单条 c2e 通告的完整交付流程。
+
+        先以完成码判 finish:finish_reasons 全非哨兵 = 完结通告,走
+        本地终结流程——不下发 worker,逐请求以云侧完成码空输出终结
+        (原样透传 STOP/LENGTH 等);未完结则组 UNEMBED 批下发 worker
+        做 unembed,应答后逐请求交付 token。行序 = req_ids 序,与
+        DOWN 张量行序一致;一条通告对应一个 DOWN 张量,一一批配对
+        无需切分拼接。
+
+        finish_reasons 与 req_ids 逐位严格对齐(云侧逐位推导),错配
+        IndexError fail-fast,无缺省兜底;协约:完结通告不携带
+        hidden 行,违约丢弃并告警;迟到载荷(请求不在 awaiting)幂等
+        丢弃。应答契约:token ids 取 ModelRunnerOutput.lwd_token_ids,
+        缺失/为空 = unembed 失败,ERROR 优先于云侧完成码,不静默降级
+        为空输出。"""
+
+        # ---- finish 流程:不下发 worker,本地终结 ----
+        if notify.req_ids and all(
+            code != LWD_NOT_FINISHED for code in notify.finish_reasons
+        ):
+            if notify.hidden_num_elements > 0:
+                logger.warning(
+                    "[Lwd] finish-marked notify carries hidden rows, "
+                    "rows dropped (cloud protocol violation)"
+                )
             for index, request_id in enumerate(notify.req_ids):
-                finish_reason = _lwd_finish_reason(notify, index)
-                finished = finish_reason is not None
-                token_ids: list[int] = []
-                if has_rows:
-                    token_ids = (
-                        list(token_map.get(request_id, [])) if token_map else []
-                    )
-                    if not token_ids:
-                        # 行在批里但无 token = unembed 失败,ERROR 优先于云侧码
-                        finish_reason = FinishReason.ERROR
-                        finished = True
                 if not self.scheduler.lwd_edge_deliver_tokens(
-                    request_id, token_ids, finished=finished
+                    request_id, [], finished=True
                 ):
                     logger.warning(
                         "[Lwd] drop stale cloud payload for %s (not awaiting)",
                         request_id,
                     )
                     continue
-                if not token_ids and not finished:
-                    # 无内容且未完结:不出空输出
-                    continue
-                if token_ids and not finished:
-                    finish_reason = None  # 增量步:云侧码为未完成哨兵
                 outputs.append(
                     EngineCoreOutput(
                         request_id,
-                        token_ids,
-                        finish_reason=finish_reason,
+                        [],
+                        finish_reason=self._lwd_finish_code(notify, index),
                     )
                 )
-                if finished:
-                    finished_reqs.add(request_id)
-        return outputs, finished_reqs
+                finished_reqs.add(request_id)
+            return
+
+        # ---- 未完结:下发 worker 处理 ----
+        if not notify.req_ids or notify.hidden_num_elements <= 0:
+            # 无行且未完结:无内容可交付,防御跳过
+            return
+        future = self._lwd_dispatch_unembed(notify)
+        self._lwd_deliver_unembed(notify, future, outputs, finished_reqs)
+
+    def _lwd_dispatch_unembed(self, notify: LwdC2eNotify):
+        """UNEMBED 批提交侧:组批并以 non_block 提交 worker,立即返回
+        future(不等执行)。同步路径提交后立即收割;异步路径
+        (batch_queue)将 (notify, future) 入队,收割阶段再等 future——
+        提交与等待的边界即本函数返回处。"""
+        unembed_batch = lwd_build_unembed_batch(notify)
+        return self.model_executor.execute_model(
+            unembed_batch, non_block=True
+        )
+
+    def _lwd_deliver_unembed(
+        self, notify: LwdC2eNotify, future, outputs: list, finished_reqs: set,
+    ) -> None:
+        """UNEMBED 批收割侧:等 worker 应答取 token_map,逐请求交付
+        token。不感知提交时机,只消费 (notify, future)。应答契约:
+        token ids 取 lwd_token_ids,缺失/为空 = unembed 失败,ERROR
+        优先于云侧完成码;迟到载荷幂等丢弃。"""
+        result = future.result()
+        token_map = getattr(result, "lwd_token_ids", None)
+        if token_map is None:
+            logger.warning(
+                "[Lwd] unembed batch answer missing lwd_token_ids (%r), "
+                "finishing requests with ERROR",
+                type(result),
+            )
+        for index, request_id in enumerate(notify.req_ids):
+            finish_reason = self._lwd_finish_code(notify, index)
+            finished = finish_reason is not None
+            token_ids = list(token_map.get(request_id, [])) if token_map else []
+            if not token_ids:
+                # 行在批里但无 token = unembed 失败,ERROR 优先于云侧码
+                finish_reason = FinishReason.ERROR
+                finished = True
+            if not self.scheduler.lwd_edge_deliver_tokens(
+                request_id, token_ids, finished=finished
+            ):
+                logger.warning(
+                    "[Lwd] drop stale cloud payload for %s (not awaiting)",
+                    request_id,
+                )
+                continue
+            if not token_ids and not finished:
+                # 无内容且未完结:不出空输出
+                continue
+            outputs.append(
+                EngineCoreOutput(
+                    request_id, token_ids, finish_reason=finish_reason
+                )
+            )
+            if finished:
+                finished_reqs.add(request_id)
+
+    @staticmethod
+    def _lwd_finish_code(
+        notify: LwdC2eNotify, index: int
+    ) -> FinishReason | None:
+        """逐请求完成码:哨兵 = 未完结(None);否则透传 FinishReason。
+        与 req_ids 按位严格对齐,错配 IndexError fail-fast。"""
+        code = notify.finish_reasons[index]
+        return None if code == LWD_NOT_FINISHED else FinishReason(code)
 
     def _lwd_edge_dispatch(self, scheduler_output) -> dict[str, int]:
         """范围预告 + 原生 executor 同步提交,返回每请求执行 token 数。
