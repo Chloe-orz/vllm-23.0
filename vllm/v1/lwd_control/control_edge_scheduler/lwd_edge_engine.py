@@ -109,6 +109,10 @@ class LwdEdgeEngineCore(EngineCoreProc):
         # 于引擎构造完成后回填(构造期完成,早于任何请求,等价构造注入)
         vllm_config.scheduler_config.scheduler_cls = LwdEdgeScheduler
         self._lwd_active = True
+        # UNEMBED 批派发号(LwdBatch.seqno,每派发 +1;DOWN 通道按步序
+        # 配对,seqno 供诊断/数据面对账,与 UP 链的 RangeNotify.seqno
+        # 独立计数)
+        self._lwd_unembed_seqno = 0
         super().__init__(*args, **kwargs)
         self.scheduler.lwd_edge_publisher = self._lwd_publisher
         logger.info(
@@ -266,7 +270,9 @@ class LwdEdgeEngineCore(EngineCoreProc):
         rowed = [n for n in notifies if n.req_ids and n.hidden_num_elements > 0]
         token_map: dict | None = None
         if rowed:
-            unembed_batch = lwd_build_unembed_batch(rowed)
+            unembed_seqno = getattr(self, "_lwd_unembed_seqno", 0)
+            self._lwd_unembed_seqno = unembed_seqno + 1
+            unembed_batch = lwd_build_unembed_batch(rowed, unembed_seqno)
             result = self.model_executor.execute_model(unembed_batch).result()
             token_map = getattr(result, "lwd_token_ids", None)
             if token_map is None:

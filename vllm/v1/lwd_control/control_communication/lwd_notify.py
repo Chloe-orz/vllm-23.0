@@ -59,13 +59,11 @@ class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):
 
 # typing.Union 而非 PEP 604 `|`:msgspec 解码器的全版本支持路径
 LwdNotify = Union[LwdRangeNotify, LwdRequestNotify, LwdAbortNotify]  # noqa: UP007
-
-# 数据面批型:embed = 边侧 embedding 批,unembed = 边侧 lm_head 批;
-# 缺省 None = 原生完整前向批(非 lwd 路径)
-LWD_BATCH_TYPE_EMBED = "embed"
-LWD_BATCH_TYPE_UNEMBED = "unembed"
-# 云->边方向(POST_OUT):HELLO 发现 + 步元数据;重同步消息 additive 扩展
+# 云->边方向(POST_OUT):HELLO 发现 + 步元数据(唯一载荷,兼结果回传
+# 驱动);重同步消息在此 union 上 additive 扩展
 LwdCloudNotify = Union[LwdHelloNotify, LwdC2eNotify]  # noqa: UP007
+# 数据面批型定义归 vllm/v1/core/sched/output.py(LwdBatch/LwdBatchType/
+# LwdEmbedBatch/LwdUnembedBatch,f8182fd5 定稿),协议层不重复声明
 
 _NOTIFY_DECODER = msgspec.msgpack.Decoder(LwdNotify)
 _CLOUD_NOTIFY_DECODER = msgspec.msgpack.Decoder(LwdCloudNotify)
