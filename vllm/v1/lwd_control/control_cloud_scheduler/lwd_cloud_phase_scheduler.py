@@ -132,6 +132,7 @@ class LwdCloudPhaseScheduler(AsyncScheduler):
         # registry 由云引擎 IO 线程交付(缺省 = 未启用,挂空不扰原生)。
         if hasattr(self, "lwd_seqno_registry"):
             registry = self.lwd_seqno_registry
+            out.lwd_batch = LwdBatch()
             out.lwd_batch.seqnos = {
                 request_id: list(registry.get(request_id, []))
                 for request_id in out.num_scheduled_tokens
