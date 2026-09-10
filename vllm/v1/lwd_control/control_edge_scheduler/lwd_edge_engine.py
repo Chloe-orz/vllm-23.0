@@ -91,8 +91,8 @@ class LwdEdgeEngineCore(EngineCoreProc):
 
         # 通信面:bind POST_OUT 订阅面 + 延迟连接的 PRE_OUT 发布面;
         # 云端点由 HELLO 通告决定(边不预知云地址)
-        self._lwd_post_out_receiver = self._lwd_build_post_out(config)
-        self._lwd_publisher = LwdControlPublisher(
+        self._edge_receiver = self._lwd_build_post_out(config)
+        self._edge_sender = LwdControlPublisher(
             None, bind=False, queue_max=config.publish_queue_max
         )
         # 云->边唯一载荷队列:生产端接收线程,消费端引擎步;数据面经
@@ -101,7 +101,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
         self.lwd_c2e_meta_queue = queue.Queue(maxsize=LWD_C2E_META_QUEUE_MAX)
         hello_event = threading.Event()
         discovery = threading.Thread(
-            target=self._lwd_discovery_loop,
+            target=self._receive_thread,
             args=(hello_event,),
             name="lwd-post-in",
             daemon=True,
@@ -122,7 +122,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
         # 诊断/数据面对账;与 UP 链的 RangeNotify.seqno 相互独立
         self._lwd_unembed_seqno = 0
         super().__init__(*args, **kwargs)
-        self.scheduler.lwd_edge_publisher = self._lwd_publisher
+        self.scheduler.lwd_edge_publisher = self._edge_sender
         logger.info(
             "[Lwd] edge engine assembled: POST_OUT bind %s, PRE_OUT discovered",
             config.lwd_post_out_bind_endpoint(),
@@ -139,8 +139,8 @@ class LwdEdgeEngineCore(EngineCoreProc):
             decoder=lwd_decode_cloud_notify,
         )
 
-    def _lwd_discovery_loop(self, hello_event: threading.Event) -> None:
-        """POST_OUT 接收线程(lwd-post-in),按消息类型分发。
+    def _receive_thread(self, hello_event: threading.Event) -> None:
+        """POST_OUT 接收线程体,按消息类型分发。
 
         HELLO -> retarget PRE_OUT:云端点唯一事实源,首拍一次通告;
         retarget 队满时无下条 HELLO 可等,须本线程自旋重试到成功
@@ -152,8 +152,8 @@ class LwdEdgeEngineCore(EngineCoreProc):
         消息体,数据与唤醒分离,多投无害(空 drain 一步即返回)。
         其余帧(坏帧已被订阅层丢弃后仍不认识的类型)告警丢弃。
         """
-        receiver = self._lwd_post_out_receiver
-        publisher = self._lwd_publisher
+        receiver = self._edge_receiver
+        publisher = self._edge_sender
         while not receiver.closed:
             msg = receiver.recv(timeout_ms=5000)
             if msg is None:
@@ -180,10 +180,10 @@ class LwdEdgeEngineCore(EngineCoreProc):
 
     def _lwd_shutdown_planes(self) -> None:
         """两面关停(幂等):receiver 先关断输入,publisher 收尾。"""
-        receiver = getattr(self, "_lwd_post_out_receiver", None)
+        receiver = getattr(self, "_edge_receiver", None)
         if receiver is not None:
             receiver.shutdown()
-        publisher = getattr(self, "_lwd_publisher", None)
+        publisher = getattr(self, "_edge_sender", None)
         if publisher is not None:
             publisher.shutdown()
 
