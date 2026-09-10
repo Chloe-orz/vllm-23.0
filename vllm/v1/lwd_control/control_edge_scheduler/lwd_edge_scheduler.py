@@ -405,9 +405,9 @@ def lwd_build_unembed_batch(notifies: list) -> SchedulerOutput:
     scheduler_output.total_num_scheduled_tokens = len(req_ids)
     scheduler_output.lwd_batch = LwdBatch(
         batch_type=LwdBatchType.LWD_UNEMBED,
+        seqno=-1, # 需要从 c2e 通告
         batch_meta=LwdUnembedBatch(
             req_ids=req_ids,
-            seqno=-1, # 需要从 c2e 通告
             num_accept_tokens=[
                 n for notify in notifies for n in notify.num_accepted_tokens
             ],

@@ -222,7 +222,8 @@ class LwdEdgeEngineCore(EngineCoreProc):
     def _lwd_edge_consume_c2e(self) -> tuple[list, set]:
         """消费云载荷(LwdC2eNotify,云->边唯一载荷)并产出前端输出。
 
-        通告分两类:
+        通告分两类,逐条处理(一条通告一个 UNEMBED 批,批间顺序 =
+        到达顺序;一条通告对应一个 DOWN 张量,一一批配对无需切分拼接):
         - 带 hidden 行(hidden_num_elements > 0):组 UNEMBED 批提交
           worker 做 lm_head,c2e 全量随批下发(数据面据
           hidden_num_elements 对齐 DOWN 张量,元数据先于张量到达);
@@ -252,26 +253,27 @@ class LwdEdgeEngineCore(EngineCoreProc):
         outputs: list = []
         finished_reqs: set = set()
 
-        rowed = [n for n in notifies if n.req_ids and n.hidden_num_elements > 0]
-        token_map: dict | None = None
-        if rowed:
-            unembed_batch = lwd_build_unembed_batch(rowed)
-            result = self.model_executor.execute_model(unembed_batch).result()
-            token_map = getattr(result, "lwd_token_ids", None)
-            if token_map is None:
-                logger.warning(
-                    "[Lwd] unembed batch answer missing lwd_token_ids (%r), "
-                    "finishing requests with ERROR",
-                    type(result),
-                )
-
         def _lwd_finish_flag(notify: LwdC2eNotify, index: int) -> bool:
             if len(notify.finished) == len(notify.req_ids):
                 return bool(notify.finished[index])
             return True
 
         for notify in notifies:
+            # 逐条通告逐批执行:一条 c2e = 云一个 decode 步 = 一个 DOWN
+            # 张量,一一批使数据面配对无需切分拼接;行序 = 批内 req_ids
+            # 序,与张量行序一致
             has_rows = bool(notify.req_ids) and notify.hidden_num_elements > 0
+            token_map: dict | None = None
+            if has_rows:
+                unembed_batch = lwd_build_unembed_batch([notify])
+                result = self.model_executor.execute_model(unembed_batch).result()
+                token_map = getattr(result, "lwd_token_ids", None)
+                if token_map is None:
+                    logger.warning(
+                        "[Lwd] unembed batch answer missing lwd_token_ids (%r), "
+                        "finishing requests with ERROR",
+                        type(result),
+                    )
             for index, request_id in enumerate(notify.req_ids):
                 finished = _lwd_finish_flag(notify, index)
                 token_ids: list[int] = []
