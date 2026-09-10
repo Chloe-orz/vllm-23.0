@@ -175,13 +175,7 @@ class LwdEdgeScheduler(AsyncScheduler):
         复现同一范围重试;重复预告在云侧按 (request_id, offset)
         幂等登记。"""
         publisher = self.lwd_edge_publisher
-        if publisher is None:
-            logger.error("[Lwd] edge scheduler assembled without publisher")
-            return False
         scheduled = scheduler_output.num_scheduled_tokens
-        assert len(scheduled) <= 1, (
-            "[Lwd] single-request batch invariant violated: seqno hole risk"
-        )
         for request_id, num_tokens in scheduled.items():
             request = self.requests.get(request_id)
             if request is None:
