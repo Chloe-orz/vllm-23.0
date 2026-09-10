@@ -231,8 +231,8 @@ class LwdEdgeEngineCore(EngineCoreProc):
 
         token 逐条交付(finish_reason=None),仅在 finished 标记的请求
         上置 finish——流式/非流式由原生前端透明处理,引擎层恒为增量;
-        finished 与 req_ids 对齐,缺省空列表按"全部完结"解释(兼容
-        未带完结标志的云侧)。
+        finished 与 req_ids 构造上严格对齐(云侧逐位推导),错配即
+        IndexError fail-fast,无缺省兜底。
 
         应答契约:worker 经原生 future 返回 ModelRunnerResult 形态,
         token ids 取 lwd_token_ids(request_id -> list[int]);缺失/为空
@@ -254,9 +254,9 @@ class LwdEdgeEngineCore(EngineCoreProc):
         finished_reqs: set = set()
 
         def _lwd_finish_flag(notify: LwdC2eNotify, index: int) -> bool:
-            if len(notify.finished) == len(notify.req_ids):
-                return bool(notify.finished[index])
-            return True
+            """finished 由云侧按 req_ids 逐位推导,构造上严格对齐;
+            错配即 IndexError fail-fast,不做静默兜底。"""
+            return bool(notify.finished[index])
 
         for notify in notifies:
             # 逐条通告逐批执行:一条 c2e = 云一个 decode 步 = 一个 DOWN
