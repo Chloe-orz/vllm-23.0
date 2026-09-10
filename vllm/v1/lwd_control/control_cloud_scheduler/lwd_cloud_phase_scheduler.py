@@ -3,10 +3,13 @@
 
 from __future__ import annotations
 
+from collections import deque
+
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.core.sched.request_queue import create_request_queue
+from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
+from vllm.v1.request import Request
 
 logger = init_logger(__name__)
 
@@ -27,6 +30,8 @@ class LwdCloudPhaseScheduler(AsyncScheduler):
         self._force_decode_once: bool = False
         # 上一个非空步是否为 prefill,驱动 schedule() 的禁连续 prefill 不变量
         self._last_step_was_prefill: bool = False
+        # prefill 通知队列:边侧发来的待 prefill 请求,每步取队首调度
+        self.prefill_notify_queue: deque[Request] = deque()
         logger.info(
             "[Lwd] cloud phase scheduler: single-request prefill batches "
             "enforced (edge/cloud chunk stream stays per-request contiguous)"
@@ -52,50 +57,75 @@ class LwdCloudPhaseScheduler(AsyncScheduler):
         return True
 
     @staticmethod
-    def _lwd_is_prefill_tail(request) -> bool:
-        """RUNNING 且 prompt 未算完 = prefill 尾巴(尾巴只允许进 prefill 步)。"""
-        return request.num_computed_tokens < request.num_prompt_tokens
-
-    def _lwd_split_running(self) -> tuple[list, list]:
-        """running 二分为 (decode_ready, tails),各自保持 FIFO 序。"""
-        decode_ready: list = []
-        tails: list = []
-        for request in self.running:
-            (tails if self._lwd_is_prefill_tail(request) else decode_ready).append(
-                request
-            )
-        return decode_ready, tails
+    def _lwd_is_decode(request) -> bool:
+        """prompt 已算完 = decode 态(可采样);未算完的是 prefill 尾巴。"""
+        return request.num_computed_tokens >= request.num_prompt_tokens
 
     def _lwd_has_prefill_tails(self) -> bool:
-        return any(self._lwd_is_prefill_tail(r) for r in self.running)
+        return any(not self._lwd_is_decode(r) for r in self.running)
 
     def _lwd_has_decode_ready(self) -> bool:
-        return any(not self._lwd_is_prefill_tail(r) for r in self.running)
+        return any(self._lwd_is_decode(r) for r in self.running)
 
-    def _schedule_pure_prefill(self) -> SchedulerOutput:
-        """纯 prefill 步,批内最多一个请求:尾巴优先,否则放行 waiting 队首;
-        其余全部藏起,跑原生 schedule() 后 finally 复原,均保 FIFO。"""
-        decode_ready, tails = self._lwd_split_running()
-        hidden_waiting = self.waiting
-        self.waiting = create_request_queue(self.policy)
-        hidden_tails: list = []
-        if tails:
-            hidden_tails = tails[1:]
-            self.running = tails[:1]
-        else:
-            # 无尾巴时 running 清空,decode-ready 不混入 prefill 批
-            self.running = []
-            if hidden_waiting:
-                self.waiting.add_request(hidden_waiting.peek_request())
+    def _lwd_collect_decode_requests(self) -> list[str]:
+        """收集所有 decode 态(prompt 已算完)请求的 req_id。
+
+        按 running/waiting/skipped 顺序遍历三队列,输出可直接作为
+        _lwd_schedule_for_visible_reqs 的入参。"""
+        return [
+            req.request_id
+            for queue in (self.running, self.waiting, self.skipped_waiting)
+            for req in queue
+            if self._lwd_is_decode(req)
+        ]
+
+    # ------------------------------------------------------------------ #
+    # Phase primitives(容器交换;原生 schedule() 零改动)                  #
+    # ------------------------------------------------------------------ #
+    def _lwd_new_queue(self, reqs: list[Request]) -> RequestQueue:
+        """新建调度策略队列并装入 reqs。"""
+        queue = create_request_queue(self.policy)
+        for req in reqs:
+            queue.add_request(req)
+        return queue
+
+    def _lwd_schedule_for_visible_reqs(self, req_ids: list[str]) -> SchedulerOutput:
+        """把 req_ids 指定的请求从三队列剔除、单独调度,步后按原队列拼回。
+
+        waiting/skipped 来源的请求走原生准入窗口(allocate/状态迁移/
+        记账一样不少),running 来源的走续跑。拼回:仍被调度的接在隐藏
+        running 之后,被抢占的排 waiting 尾部,被跳过的排 skipped 队首。"""
+        picked = {self.requests[req_id] for req_id in req_ids}
+        from_running = [req for req in self.running if req in picked]
+        from_waiting = [req for req in self.waiting if req in picked]
+        from_skipped = [req for req in self.skipped_waiting if req in picked]
+        # 剔除后保存队列状态(隐藏集)
+        self.running = [req for req in self.running if req not in picked]
+        self.waiting.remove_requests(from_waiting)
+        self.skipped_waiting.remove_requests(from_skipped)
+        saved = (self.running, self.waiting, self.skipped_waiting)
+        # 被剔除的请求按原队列归位成可见集,单独调度
+        self.running = from_running
+        self.waiting = self._lwd_new_queue(from_waiting)
+        self.skipped_waiting = self._lwd_new_queue(from_skipped)
         try:
             out = super().schedule()
         finally:
-            # schedule 期间该列表 = 幸存尾巴 + 本步 waiting->running 的新请求
-            leftover = self.waiting
-            self.waiting = hidden_waiting
-            while leftover:
-                self.waiting.prepend_request(leftover.pop_request())
-            self.running = decode_ready + self.running + hidden_tails
+            # 按原队列拼回:running 存活者接尾,waiting 被抢占者排队尾,
+            # skipped 被跳过者排队首
+            post = (self.running, self.waiting, self.skipped_waiting)
+            self.running, self.waiting, self.skipped_waiting = saved
+            self.running += post[0]
+            self.waiting.extend(post[1])
+            self.skipped_waiting.prepend_requests(post[2])
+        return out
+
+    def _schedule_pure_prefill(self) -> SchedulerOutput:
+        """纯 prefill 步:prefill_notify_queue 有请求则取队首 req_id 单独
+        调度(按原队列归位,waiting/skipped 来源走原生准入);没有则空集
+        进窗口,等价空步,三队列原样保留。"""
+        req_ids = [q.popleft().request_id] if (q := self.prefill_notify_queue) else []
+        out = self._lwd_schedule_for_visible_reqs(req_ids)
         # UP 链 seqno 随批下发云 worker(§9.12 数据面接缝):取登记表
         # 快照挂 SO 动态属性(无 slots 存活至 worker),worker 的 UP recv
         # 以此配对边侧发来的 embeds 张量(与边侧 SO.lwd_batch.seqno 同源)。
@@ -109,22 +139,10 @@ class LwdCloudPhaseScheduler(AsyncScheduler):
         return out
 
     def _schedule_pure_decode(self) -> SchedulerOutput:
-        """纯 decode 步:waiting 与 prefill 尾巴都藏起,批内只剩已完结请求的采样。"""
-        hidden_waiting = self.waiting
-        self.waiting = create_request_queue(self.policy)
-        decode_ready, tails = self._lwd_split_running()
-        self.running = decode_ready
-        try:
-            out = super().schedule()
-        finally:
-            newly_waiting = self.waiting
-            self.waiting = hidden_waiting
-            # 临时队列防御性清空并回插队首(保 FIFO)
-            while newly_waiting:
-                self.waiting.append(newly_waiting.popleft())
-            # 被抢占请求已随上两行回插队首;复原被藏的尾巴(保 FIFO)
-            self.running = tails + self.running
-        return out
+        """纯 decode 步:收集全部 decode 态请求,剔除单独调度后按落点拼回。"""
+        return self._lwd_schedule_for_visible_reqs(
+            self._lwd_collect_decode_requests()
+        )
 
     @staticmethod
     def _is_empty(out: SchedulerOutput) -> bool:
