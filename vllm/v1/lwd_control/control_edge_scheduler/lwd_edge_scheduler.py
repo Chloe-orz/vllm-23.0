@@ -364,7 +364,7 @@ class LwdEdgeScheduler(AsyncScheduler):
         add_request 调用链回到客户端 error 路径。
 
         边界 = 边侧能力面:边是 embedding 属主(拒绝客户端自带
-        prompt_embeds),只处理纯文本补全(拒 pooling/多模态/结构化
+        prompt_embeds),只处理纯文本补全(拒 pooling/结构化
         输出),prompt 非空。"""
         if request.prompt_embeds is not None:
             raise ValueError(
@@ -372,9 +372,19 @@ class LwdEdgeScheduler(AsyncScheduler):
                 f"prompt_embeds (request {request.request_id}); the edge "
                 "is the embedding owner"
             )
+        if not request.prompt_token_ids:
+            raise ValueError(
+                f"[LWD] prefill-only mode requires a non-empty prompt "
+                f"(request {request.request_id})"
+            )
         if request.pooling_params is not None:
             raise ValueError(
                 "[LWD] prefill-only mode does not support pooling requests "
+                f"(request {request.request_id})"
+            )
+        if request.mm_features:
+            raise ValueError(
+                "[LWD] prefill-only mode does not support multimodal inputs "
                 f"(request {request.request_id})"
             )
         if request.use_structured_output:
