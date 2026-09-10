@@ -41,8 +41,7 @@
              lwd_control_communicator(纯收发句柄,无线程)
              + lwd_control_publisher(OUTBOUND)/ lwd_control_subscriber(INBOUND)
   control_scheduler/(分组入口,仅包说明)
-  control_edge_scheduler/(边侧):lwd_step_core(LwdStepSettings/LwdLog
-             共享支撑);lwd_edge_scheduler;lwd_edge_assemble(LwdConfig +
+  control_edge_scheduler/(边侧):lwd_edge_scheduler;lwd_edge_assemble(LwdConfig +
              模式判定唯一实现,纯配置支撑);lwd_edge_engine(类选择点
              注入的边 EngineCore 子类:通信面装配 + 调度器注入 + 引擎
              接口覆写)为 L3
@@ -58,7 +57,7 @@ import 白名单与交互预算(唯一事实源为设计文档 §7/§8.4/§9/§1
     vllm.v1.executor / vllm.tracing / torch.distributed(零数据面);
     内核 getattr = 0
   - os.environ/os.getenv 仅 lwd_edge_assemble(LwdConfig 定义处是唯一
-    env 入口,§7.3-C3;内核收 LwdStepSettings plain 值)
+    env 入口,内核不读 env)
   - 例外(台账登记):两个调度器文件可 import vllm.v1.request 的
     RequestStatus——AsyncScheduler 继承面的既有传递依赖,不新增依赖边;
     云引擎文件 import Request/SamplingParams(请求构建唯一交互点)
