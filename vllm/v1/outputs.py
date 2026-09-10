@@ -252,6 +252,12 @@ class LwdC2eMeta:
     # Request ids in hidden row order (rows are grouped by request).
     req_ids: list[str]
 
+    # The DOWN channel seqno of this step's hidden packet (channel-global
+    # monotonic, assigned by the cloud worker at send time).  The edge
+    # posts its matching irecv with this exact value — required for
+    # pairing on the tag-less HCCL wire.
+    down_seqno: int = -1
+
 
 # ModelRunnerOutput is serialized and sent to the scheduler process.
 # This is expensive for torch.Tensor so prefer to use list instead.
