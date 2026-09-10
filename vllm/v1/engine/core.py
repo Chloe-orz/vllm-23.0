@@ -465,12 +465,13 @@ class EngineCore:
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
-        # Lwd model-output seam: EngineCore subclasses override the handler
-        # to consume or replace the output before native update_from_output.
-        model_output = self.lwd_process_model_output(model_output)
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        # Lwd model-output seam: after native update_from_output so the
+        # handler sees engine_core_outputs (per-request finish_reason) and
+        # can derive per-request finish flags for the edge.
+        model_output = self.lwd_process_model_output(model_output, engine_core_outputs)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
@@ -569,12 +570,10 @@ class EngineCore:
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
-        # Lwd model-output seam: EngineCore subclasses override the handler
-        # to consume or replace the output before native update_from_output.
-        model_output = self.lwd_process_model_output(model_output)
-        engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output
-        )
+        # Lwd model-output seam: after native update_from_output so the
+        # handler sees engine_core_outputs (per-request finish_reason) and
+        # can derive per-request finish flags for the edge.
+        model_output = self.lwd_process_model_output(model_output, engine_core_outputs)
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
@@ -603,17 +602,23 @@ class EngineCore:
         return engine_core_outputs, model_executed
 
     def lwd_process_model_output(
-        self, model_output: ModelRunnerOutput
+        self,
+        model_output: ModelRunnerOutput,
+        engine_core_outputs: dict[int, EngineCoreOutputs],
     ) -> ModelRunnerOutput:
-        """Lwd model-output 扩展接口(步内输出接缝):接收步内 model_output,
-        调用子类覆写的处理方法;接口自身承载固定编排。"""
-        return self.lwd_handle_model_output(model_output)
+        """Lwd model-output 扩展接口(步内输出接缝):接收步内 model_output 与
+        update_from_output 产物 engine_core_outputs,调用子类覆写的处理方法;
+        接口自身承载固定编排。"""
+        return self.lwd_handle_model_output(model_output, engine_core_outputs)
 
     def lwd_handle_model_output(
-        self, model_output: ModelRunnerOutput
+        self,
+        model_output: ModelRunnerOutput,
+        engine_core_outputs: dict[int, EngineCoreOutputs],
     ) -> ModelRunnerOutput:
-        """子类继承 EngineCore 后覆写本方法以消费/替换输出;父类默认
-        原样透传,未覆写时原生行为不变。"""
+        """子类继承 EngineCore 后覆写本方法以消费步内输出;engine_core_outputs
+        携带本步逐请求 finish_reason(原生停止条件判定),父类默认原样透传,
+        未覆写时原生行为不变。"""
         return model_output
 
     def _process_aborts_queue(self):

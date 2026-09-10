@@ -30,6 +30,7 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import LwdConf
 from vllm.v1.request import Request
 
 if TYPE_CHECKING:
+    from vllm.v1.engine import EngineCoreOutputs
     from vllm.v1.outputs import LwdC2eMeta, ModelRunnerOutput
 
 logger = init_logger(__name__)
@@ -195,21 +196,43 @@ class LwdCloudEngineCore(EngineCoreProc):
         )
     
     def lwd_handle_model_output(
-        self, model_output: ModelRunnerOutput
+        self,
+        model_output: ModelRunnerOutput,
+        engine_core_outputs: dict[int, EngineCoreOutputs],
     ) -> ModelRunnerOutput:
-        """步元数据 lwd_c2e_meta 经 POST_OUT 先于隐藏张量发边,其余原样透传。"""
+        """步元数据 lwd_c2e_meta 经 POST_OUT 先于隐藏张量发边;逐请求
+        finished 标志取自本步 engine_core_outputs 的 finish_reason(原生
+        停止条件即云侧 decode 终结的事实源),其余原样透传。"""
         meta = model_output.lwd_c2e_meta
         if meta is not None:
-            self._lwd_publish_c2e(meta)
+            self._lwd_publish_c2e(meta, self._lwd_c2e_finished(meta, engine_core_outputs))
         return model_output
 
-    def _lwd_publish_c2e(self, meta: LwdC2eMeta) -> None:
-        """步元数据发边:队满小睡重试(元数据不可丢),关停(closed)退出。"""
+    @staticmethod
+    def _lwd_c2e_finished(
+        meta: LwdC2eMeta,
+        engine_core_outputs: dict[int, EngineCoreOutputs],
+    ) -> list[bool]:
+        """req_ids 对齐的逐请求完成标志:本步任一 EngineCoreOutputs 里
+        finish_reason 非空或进入 finished_requests 即完成;缺位按未完成
+        (边侧保持 awaiting,由后续步通告或僵尸兜底收口)。"""
+        finished_ids: set[str] = set()
+        for outputs in engine_core_outputs.values():
+            finished_ids.update(outputs.finished_requests or ())
+            for out in outputs.outputs:
+                if out.finish_reason is not None:
+                    finished_ids.add(out.request_id)
+        return [request_id in finished_ids for request_id in meta.req_ids]
+
+    def _lwd_publish_c2e(self, meta: LwdC2eMeta, finished: list[bool]) -> None:
+        """步元数据(含逐请求 finished 标志)发边:队满小睡重试(元数据
+        不可丢),关停(closed)退出。"""
         notify = LwdC2eNotify(
             hidden_num_elements=meta.hidden_num_elements,
             top_id_ths=meta.top_id_ths,
             num_accepted_tokens=meta.num_accepted_tokens,
             req_ids=meta.req_ids,
+            finished=finished,
         )
         while not self._lwd_post_out.closed:
             if self._lwd_post_out.publish(notify):
