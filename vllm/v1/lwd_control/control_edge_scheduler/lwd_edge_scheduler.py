@@ -29,11 +29,15 @@ from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
-from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.output import (
+    LwdBatch,
+    LwdBatchType,
+    LwdEmbedBatch,
+    LwdUnembedBatch,
+    SchedulerOutput,
+)
 from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
-    LWD_BATCH_TYPE_EMBED,
-    LWD_BATCH_TYPE_UNEMBED,
     LwdAbortNotify,
     LwdRangeNotify,
     LwdRequestNotify,
@@ -84,10 +88,12 @@ class LwdEdgeScheduler(AsyncScheduler):
         self._lwd_awaiting: dict[str, float] = {}
 
     def schedule(self) -> SchedulerOutput:
-        """单请求组批 + 原生分块决策 + EMBED 批型打标;记录本步调度量
-        供进度对账(§2.4)。"""
+        """单请求组批 + 原生分块决策;记录本步调度量供进度对账(§2.4)。
+
+        EMBED 批的 LwdBatch(seqno/embed token 片段)在 lwd_edge_notify
+        发布成功后组装挂批——seqno 与 publish 成功绑定(peek-then-advance
+        防空洞),发布失败整步回退时批随 SO 一并废弃。"""
         scheduler_output = self._lwd_schedule_single()
-        scheduler_output.batch_type = LWD_BATCH_TYPE_EMBED
         self._lwd_last_scheduled = dict(scheduler_output.num_scheduled_tokens)
         return scheduler_output
 
@@ -184,21 +190,34 @@ class LwdEdgeScheduler(AsyncScheduler):
             if request is None:
                 continue
             # _update_after_schedule 已乐观推进 num_computed,起点需回退本步量
+            offset = request.num_computed_tokens - num_tokens
             seqno = self._lwd_seqno
             if not publisher.publish(
                 LwdRangeNotify(
                     request_id=request_id,
-                    offset=request.num_computed_tokens - num_tokens,
+                    offset=offset,
                     num_tokens=num_tokens,
                     seqno=seqno,
                 )
             ):
                 return False
             self._lwd_seqno = seqno + 1
-            # 数据面配对键随批透传给边 worker(SO 动态属性,无 slots 存活
-            # 至 worker;multi_instance comm_seqno 同款机制):worker 发云
-            # 张量以此作 tag,与云侧 RangeNotify 登记对上
-            scheduler_output.lwd_chunk_seqnos = {request_id: seqno}
+            # 发布成功即组 EMBED 批挂 SO(f8182fd5 LwdBatch 定义):seqno
+            # 即配对键(数据面发云张量 tag,与云侧 RangeNotify 登记对上),
+            # embed 载荷 = 本 chunk 的 token 片段;发布失败整步回退时
+            # 本批随 SO 废弃,号未消耗,无空洞。
+            scheduler_output.lwd_batch = LwdBatch(
+                batch_type=LwdBatchType.LWD_EMBED,
+                seqno=seqno,
+                batch_meta=LwdEmbedBatch(
+                    req_ids=[request_id],
+                    token_ids=[
+                        list(
+                            request.prompt_token_ids[offset : offset + num_tokens]
+                        )
+                    ],
+                ),
+            )
         return True
 
     def lwd_edge_notify_request(
@@ -393,21 +412,39 @@ class LwdEdgeScheduler(AsyncScheduler):
         return current
 
 
-def lwd_build_unembed_batch(notifies: list) -> SchedulerOutput:
-    """组 UNEMBED 批(云载荷派发,引擎步内调用;数据面按 batch_type 分流)。
+def lwd_build_unembed_batch(notifies: list, seqno: int) -> SchedulerOutput:
+    """组 UNEMBED 批(云载荷派发,引擎步内调用;数据面按 lwd_batch 分流)。
 
     云结果不经过原生 schedule,无原生 SO 可打标 —— 以 make_empty 为骨架:
-    - 批载荷(请求集合)由 num_scheduled_tokens 表达(值 1 = 单 token 位,
-      数据面按 unembed 语义解释,不视为 token 预算);
-    - 触发本批的 LwdC2eNotify 全量挂 lwd_c2e_notifies 动态属性(无 slots
-      存活至 worker):数据面据 hidden_num_elements 等待/对齐 DOWN 张量
-      (元数据先于张量到达的预挂契约),req_ids 即隐藏行序。
+    - LwdBatch(f8182fd5 定义)挂 lwd_batch:seqno 由引擎按派发递增分配
+      (DOWN 通道按步序配对,seqno 供诊断/数据面对账);
+    - batch_meta = LwdUnembedBatch:req_ids(隐藏行序)/num_accept_tokens/
+      top_id_ths 逐请求透传自 c2e;recv_num_elements(= 32 + R*(H+2))与
+      out_token_idxs(生成序号)控制面不可知,留空由数据面按 DOWN 张量
+      实收推导(定义侧 TODO 同款问题);
+    - 请求集合同步镜像到 num_scheduled_tokens(值 1 = 单 token 位,不视
+      为 token 预算,原生管道兼容);
+    - 触发本批的 LwdC2eNotify 全量挂 lwd_c2e_notifies 动态属性:数据面
+      据 hidden_num_elements 等待/对齐 DOWN 张量(元数据先于张量的预挂
+      契约)与 finished 完结标志。
     sched 模块 import 归属本文件(台账:调度器文件)。
     """
     scheduler_output = SchedulerOutput.make_empty()
-    scheduler_output.batch_type = LWD_BATCH_TYPE_UNEMBED
     req_ids = [rid for notify in notifies for rid in notify.req_ids]
     scheduler_output.num_scheduled_tokens = {rid: 1 for rid in req_ids}
     scheduler_output.total_num_scheduled_tokens = len(req_ids)
+    scheduler_output.lwd_batch = LwdBatch(
+        batch_type=LwdBatchType.LWD_UNEMBED,
+        seqno=seqno,
+        batch_meta=LwdUnembedBatch(
+            req_ids=req_ids,
+            num_accept_tokens=[
+                n for notify in notifies for n in notify.num_accepted_tokens
+            ],
+            recv_num_elements=[],
+            out_token_idxs=[],
+            top_id_ths=[t for notify in notifies for t in notify.top_id_ths],
+        ),
+    )
     scheduler_output.lwd_c2e_notifies = list(notifies)
     return scheduler_output
