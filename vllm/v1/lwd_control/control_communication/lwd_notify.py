@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 import msgspec
 
@@ -24,12 +24,27 @@ class LwdRangeNotify(msgspec.Struct, gc=False, tag=True):
 
 class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):
     """边->云请求预告(PRE_OUT),线上只带调度决策所需字段;block_hashes 为
-    边侧算好的 prompt 满块链,供云侧前缀缓存命中,缺省空回退本地哈希。"""
+    边侧算好的 prompt 满块链,供云侧前缀缓存命中,缺省空回退本地哈希。
+
+    采样参数透传(additive,缺省 = SamplingParams 原生缺省):只带影响
+    云侧 token 选择的字段(采样核/惩罚/EOS 策略/min_tokens);stop 字符串
+    等 detokenizer 层参数留在边侧前端原生处理,不上 wire。"""
 
     request_id: str
     num_prompt_tokens: int
     max_tokens: int = 16
     block_hashes: list[bytes] = []
+    temperature: float = 1.0
+    top_p: float = 1.0
+    top_k: int = 0
+    min_p: float = 0.0
+    seed: Optional[int] = None
+    repetition_penalty: float = 1.0
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
+    ignore_eos: bool = False
+    stop_token_ids: list[int] = []
+    min_tokens: int = 0
 
 
 class LwdAbortNotify(msgspec.Struct, gc=False, tag=True):
@@ -46,6 +61,10 @@ class LwdHelloNotify(msgspec.Struct, gc=False, tag=True):
     pre_out_port: int
 
 
+# 完成码哨兵:finish_reasons 中的"本步未终结"值
+LWD_NOT_FINISHED = -1
+
+
 class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):
     """云->边步元数据通告(POST_OUT),先于隐藏张量到达,边侧据此预挂精确
     尺寸 recv;hidden_num_elements=0 为纯终结通告,边侧本地终结不派发 unembed。"""
@@ -54,7 +73,11 @@ class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):
     top_id_ths: list[list[int]]
     num_accepted_tokens: list[int]
     req_ids: list[str]
-    finished: list[bool] = []
+    finish_reasons: list[int] = []
+    """逐请求完成码,与 req_ids 按位对齐:LWD_NOT_FINISHED(-1) = 本步未
+    终结;否则为 FinishReason IntEnum 值(STOP=0/LENGTH=1/ABORT=2/ERROR=3/
+    REPETITION=4),边侧原样透传 finish_reason(LENGTH 不再伪装成 STOP)。
+    空列表 = 云侧未携带,错配即 IndexError fail-fast。"""
 
 
 # typing.Union 而非 PEP 604 `|`:msgspec 解码器的全版本支持路径

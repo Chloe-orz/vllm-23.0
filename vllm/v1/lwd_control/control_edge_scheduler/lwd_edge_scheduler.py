@@ -44,6 +44,7 @@ from vllm.v1.lwd_control.control_communication.lwd_notify import (
 from vllm.v1.request import RequestStatus
 
 if TYPE_CHECKING:
+    from vllm.sampling_params import SamplingParams
     from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
         LwdControlPublisher,
     )
@@ -144,13 +145,10 @@ class LwdEdgeScheduler(AsyncScheduler):
         计算(没有 chunk 预告就不会开算)。abort_immediately 请求走
         finish + abort 出口,与原生语义一致。"""
         self._lwd_validate_request(request)
-        sampling_params = request.sampling_params
         self.lwd_edge_notify_request(
             request_id=request.request_id,
             num_prompt_tokens=len(request.prompt_token_ids),
-            max_tokens=(
-                sampling_params.max_tokens if sampling_params is not None else 16
-            ),
+            sampling_params=request.sampling_params,
             block_hashes=list(request.block_hashes),
         )
         super().add_request(request)
@@ -214,7 +212,7 @@ class LwdEdgeScheduler(AsyncScheduler):
         self,
         request_id: str,
         num_prompt_tokens: int,
-        max_tokens: int = 16,
+        sampling_params: SamplingParams | None = None,
         block_hashes: list[bytes] | None = None,
     ) -> None:
         """发 LwdRequestNotify(请求元数据预告)。
@@ -222,6 +220,10 @@ class LwdEdgeScheduler(AsyncScheduler):
         block_hashes = prompt 全量满块哈希链(自位置 0 起)。云侧
         prompt token 是占位零值,本地算不出真实内容哈希,前缀缓存
         命中只能靠这条链;缺省空链 = 不提供,云侧回退占位链。
+
+        sampling_params 只透传影响云侧 token 选择的字段(采样核/惩罚/
+        EOS 策略/min_tokens);stop 字符串等 detokenizer 层参数留在
+        边侧前端原生处理,不上 wire。
 
         失败语义 fail-fast:发布队满时短退避重试(瞬态背压几乎必在
         秒级窗口内腾出),耗尽即抛 RuntimeError——异常沿 add_request
@@ -232,11 +234,27 @@ class LwdEdgeScheduler(AsyncScheduler):
         publisher = self.lwd_edge_publisher
         if publisher is None:
             return
+        sp = sampling_params
         message = LwdRequestNotify(
             request_id=request_id,
             num_prompt_tokens=num_prompt_tokens,
-            max_tokens=max_tokens,
+            max_tokens=(
+                sp.max_tokens if sp is not None and sp.max_tokens is not None else 16
+            ),
             block_hashes=block_hashes if block_hashes is not None else [],
+            temperature=sp.temperature if sp is not None else 1.0,
+            top_p=sp.top_p if sp is not None else 1.0,
+            top_k=sp.top_k if sp is not None else 0,
+            min_p=sp.min_p if sp is not None else 0.0,
+            seed=sp.seed if sp is not None else None,
+            repetition_penalty=sp.repetition_penalty if sp is not None else 1.0,
+            presence_penalty=sp.presence_penalty if sp is not None else 0.0,
+            frequency_penalty=sp.frequency_penalty if sp is not None else 0.0,
+            ignore_eos=sp.ignore_eos if sp is not None else False,
+            stop_token_ids=(
+                list(sp.stop_token_ids) if sp is not None and sp.stop_token_ids else []
+            ),
+            min_tokens=sp.min_tokens if sp is not None else 0,
         )
         for attempt in range(_LWD_ADD_RETRY_STEPS):
             if publisher.publish(message):

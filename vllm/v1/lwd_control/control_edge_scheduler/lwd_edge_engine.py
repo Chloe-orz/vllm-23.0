@@ -39,6 +39,7 @@ from vllm.v1.lwd_control.control_communication.lwd_control_subscriber import (
     LwdControlSubscriber,
 )
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
+    LWD_NOT_FINISHED,
     LwdC2eNotify,
     LwdHelloNotify,
     lwd_decode_cloud_notify,
@@ -229,10 +230,10 @@ class LwdEdgeEngineCore(EngineCoreProc):
           hidden_num_elements 对齐 DOWN 张量,元数据先于张量到达);
         - 纯终结通告(无行):本地终结请求,不派发 worker。
 
-        token 逐条交付(finish_reason=None),仅在 finished 标记的请求
-        上置 finish——流式/非流式由原生前端透明处理,引擎层恒为增量;
-        finished 与 req_ids 构造上严格对齐(云侧逐位推导),错配即
-        IndexError fail-fast,无缺省兜底。
+        token 逐条交付(finish_reason=None),终结步透传云侧完成码
+        (STOP/LENGTH 等),流式/非流式由原生前端透明处理,引擎层恒为
+        增量;finish_reasons 与 req_ids 构造上严格对齐(云侧逐位推导),
+        错配即 IndexError fail-fast,无缺省兜底。
 
         应答契约:worker 经原生 future 返回 ModelRunnerResult 形态,
         token ids 取 lwd_token_ids(request_id -> list[int]);缺失/为空
@@ -253,10 +254,11 @@ class LwdEdgeEngineCore(EngineCoreProc):
         outputs: list = []
         finished_reqs: set = set()
 
-        def _lwd_finish_flag(notify: LwdC2eNotify, index: int) -> bool:
-            """finished 由云侧按 req_ids 逐位推导,构造上严格对齐;
+        def _lwd_finish_reason(notify: LwdC2eNotify, index: int) -> FinishReason | None:
+            """finish_reasons 由云侧按 req_ids 逐位推导,构造上严格对齐;
             错配即 IndexError fail-fast,不做静默兜底。"""
-            return bool(notify.finished[index])
+            code = notify.finish_reasons[index]
+            return None if code == LWD_NOT_FINISHED else FinishReason(code)
 
         for notify in notifies:
             # 逐条通告逐批执行:一条 c2e = 云一个 decode 步 = 一个 DOWN
@@ -275,14 +277,16 @@ class LwdEdgeEngineCore(EngineCoreProc):
                         type(result),
                     )
             for index, request_id in enumerate(notify.req_ids):
-                finished = _lwd_finish_flag(notify, index)
+                finish_reason = _lwd_finish_reason(notify, index)
+                finished = finish_reason is not None
                 token_ids: list[int] = []
                 if has_rows:
                     token_ids = (
                         list(token_map.get(request_id, [])) if token_map else []
                     )
                     if not token_ids:
-                        # 行在批里但无 token = unembed 失败
+                        # 行在批里但无 token = unembed 失败,ERROR 优先于云侧码
+                        finish_reason = FinishReason.ERROR
                         finished = True
                 if not self.scheduler.lwd_edge_deliver_tokens(
                     request_id, token_ids, finished=finished
@@ -295,15 +299,8 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 if not token_ids and not finished:
                     # 无内容且未完结:不出空输出
                     continue
-                if token_ids:
-                    finish_reason = (
-                        FinishReason.STOP if finished else None
-                    )
-                else:
-                    # 纯终结通告(无行)发 STOP;带行失败发 ERROR
-                    finish_reason = (
-                        FinishReason.ERROR if has_rows else FinishReason.STOP
-                    )
+                if token_ids and not finished:
+                    finish_reason = None  # 增量步:云侧码为未完成哨兵
                 outputs.append(
                     EngineCoreOutput(
                         request_id,
