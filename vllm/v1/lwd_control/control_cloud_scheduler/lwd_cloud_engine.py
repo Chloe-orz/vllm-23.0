@@ -1,30 +1,5 @@
-"""云侧 L3 引擎子类:类选择点注入的云 EngineCore(§10.14,替代已删的
-lwd_cloud_assemble 装配层)。
-
-接入点只有一个:覆写原生 socket IO 线程入口 process_input_sockets ——
-父线程照跑父类原版(前端消息零复制零改动),PRE_OUT 循环独立成
-lwd-pre-out 专属线程,通道与门状态在该线程内先建后用(无线程竞态)。
-云侧双面(§9.1):PRE_OUT bind 收边;POST_OUT 经 master_addr connect
-边,承载首拍 HELLO 通告(边阻塞等待,决策 B 的唯一事实源)与步内
-元数据 lwd_c2e_meta(经 lwd_handle_model_output 接缝先于隐藏张量
-发边,§9.12)。
-两类消息都汇入 input_queue(多生产者-单消费者):
-父类线程产前端消息,PRE_OUT 线程产 (ADD, (Request, 0)) / (ABORT, [rid]) ——
-主循环 _handle_client_request 原生分发,零改动。
-空闲唤醒由原生机制自然解决:PRE_OUT 线程阻塞在 zmq 上,消息转成 ADD 塞进
-input_queue,主循环的 input_queue.get() 随即被唤醒 —— 无轮询、无
-空闲切换、core.py 零改动。
-
-PRE_OUT 三类消息:request 预告进门池,元数据到达即构建放行(数据到齐
-前是否开算由数据面 gate 负责,§9.12);range 预告当前无消费点;abort
-终结。数据面接缝(hint 转发,§9.12)随数据面落位时再接。
-
-本类仅在 mode=prefill_only 且云角色时经类选择点构造;部署需
-max_concurrent_batches > 1(异步流水线,同步步路径兼容但慢)。
-空批契约垫片已按裁定移除(原防相位调度器刻意空步触发 fork runner
-0-token 批回 None,复现表现 = core.py:576 RuntimeError;防护挂
-runner 侧契约修复)。
-"""
+"""云侧 EngineCore 子类:覆写 socket IO 线程入口,PRE_OUT 循环独立成线程,
+边侧预告与步内元数据经 input_queue 走原生分发;仅 prefill_only 云角色启用。"""
 
 from __future__ import annotations
 
@@ -70,12 +45,8 @@ class LwdCloudEngineCore(EngineCoreProc):
     """云 PO 引擎:覆写 socket IO 线程入口,其余全走原生。"""
 
     def _lwd_setup_zmq(self) -> None:
-        """介入 ZMQ 双面(§9.1):PRE_OUT bind 收边 + POST_OUT connect 通告边。
-
-        POST_OUT 经 master_addr 连边(边 bind),承载首拍 HELLO——
-        云端点(pre_out_*)的唯一事实源;该面当前仅发现用途,数据
-        传输保留给后续云->边扩展。建站失败仍走 EXECUTOR_FAILED 升级。
-        """
+        """介入 ZMQ 双面:PRE_OUT bind 收边;POST_OUT connect 边,承载首拍
+        HELLO 通告与步内元数据。建站失败走 EXECUTOR_FAILED 升级。"""
         config = LwdConfig.from_env_and_config(self.vllm_config)
         self._lwd_config = config
         self._lwd_subscriber = LwdControlSubscriber(
@@ -90,11 +61,9 @@ class LwdCloudEngineCore(EngineCoreProc):
         self._lwd_hello = LwdHelloNotify(
             pre_out_host=config.pre_out_host, pre_out_port=config.pre_out_port
         )
-        # 首拍即通告(边可能已 bind 等待);发送走步内接缝,无常驻发送线程
+        # 首拍即通告(边侧可能已 bind 等待)
         self._lwd_announce()
-        # 门池:request 元数据查重与暂存,元数据到达即构建放行——数据
-        # 到齐前是否开算由数据面 gate 负责(§9.12),引擎层不设卡。
-        # 门状态归 socket IO 线程独占;调度器只经 input_queue 被主循环碰。
+        # 门池:元数据查重与暂存,到达即构建放行;仅本 IO 线程独占
         self._lwd_gate_pending: dict[str, LwdRequestNotify] = {}
         logger.info(
             "[Lwd] cloud engine assembled: PRE_OUT bind %s, POST_OUT announce -> "
@@ -112,8 +81,7 @@ class LwdCloudEngineCore(EngineCoreProc):
         identity: bytes,
         ready_event: threading.Event,
     ) -> None:
-        """原生 IO 线程入口的云侧版:父线程照跑父类原版,PRE_OUT 循环
-        独立成线程 —— 两个生产者共用 input_queue。"""
+        """父线程照跑父类原版,PRE_OUT 循环独立成线程,两生产者共用 input_queue。"""
         threading.Thread(
             target=self._lwd_pre_out_loop, daemon=True, name="lwd-pre-out"
         ).start()
@@ -122,11 +90,8 @@ class LwdCloudEngineCore(EngineCoreProc):
         )
 
     def _lwd_pre_out_loop(self) -> None:
-        """边侧 PRE_OUT 接收循环:subscriber 与门状态在本线程内先建后用,
-        无构造期竞态,socket 建用同线程(zmq 单线程亲和);建站失败经
-        EXECUTOR_FAILED 通道升级为引擎致命错误,不静默降级。
-
-        recv 挂超时拍:仅作关停响应上限,关停(closed)退出。"""
+        """PRE_OUT 接收循环:socket 与门状态在本线程内先建后用(zmq 单线程
+        亲和);recv 挂超时拍仅作关停响应上限,关停(closed)退出。"""
         try:
             self._lwd_setup_zmq()
         except Exception:
@@ -142,8 +107,7 @@ class LwdCloudEngineCore(EngineCoreProc):
             self._lwd_dispatch(msg)
 
     def _lwd_announce(self) -> None:
-        """HELLO 通告(首拍一次,无周期重发):队满失败不重试——边侧
-    30s 等待超时 fail-fast 兜底(整组重拉恢复)。"""
+        """首拍 HELLO 通告一次;队满不重试,由边侧等待超时 fail-fast 兜底。"""
         self._lwd_post_out.publish(self._lwd_hello)
 
     def shutdown(self) -> None:
@@ -159,8 +123,7 @@ class LwdCloudEngineCore(EngineCoreProc):
     def _lwd_dispatch(self, msg) -> None:
         """PRE_OUT 三类分派(本 IO 线程):元数据转 Request / abort 终结。"""
         if isinstance(msg, LwdRangeNotify):
-            # 范围预告当前无消费点(§9.12):元数据到达即已构建放行,seqno/
-            # offset 登记与开算 gate 随数据面落位再接
+            # range 预告当前无消费点:元数据到达即已构建放行
             return
         if isinstance(msg, LwdAbortNotify):
             self._lwd_gate_pending.pop(msg.request_id, None)
@@ -168,7 +131,6 @@ class LwdCloudEngineCore(EngineCoreProc):
             self.aborts_queue.put_nowait([msg.request_id])
             self.input_queue.put_nowait((EngineCoreRequestType.ABORT, [msg.request_id]))
             return
-        # LwdRequestNotify:查重后入门池,元数据到达即构建放行
         rid = msg.request_id
         if rid in self._lwd_gate_pending:
             logger.warning("[Lwd] duplicate request metadata %s ignored", rid)
@@ -191,7 +153,7 @@ class LwdCloudEngineCore(EngineCoreProc):
             # prefix caching 未启用:请求不挂 hasher,整链机制不激活
             return Request(
                 request_id=wire.request_id,
-                # 占位 token:云侧调度只看长度,真值由边侧 embeds 提供(§9.5)
+                # 占位 token:云侧调度只看长度,真值由边侧提供
                 prompt_token_ids=[0] * wire.num_prompt_tokens,
                 sampling_params=SamplingParams(max_tokens=wire.max_tokens),
                 pooling_params=None,
@@ -201,8 +163,7 @@ class LwdCloudEngineCore(EngineCoreProc):
         )[1]
 
         def block_hasher(request: Request) -> list[bytes]:
-            # wire 链优先(§10.13):prompt 首建用边侧预告链,decode 续算
-            # 回本地 hasher;缺链/长度不符回退本地(fail-open)
+            # prompt 首建用边侧预告链,续算/缺链/长度不符回退本地(fail-open)
             if len(request.block_hashes) == 0 and request.num_output_tokens == 0:
                 expected = request.num_prompt_tokens // hash_block_size
                 if len(wire.block_hashes) == expected:
@@ -220,16 +181,14 @@ class LwdCloudEngineCore(EngineCoreProc):
     def lwd_handle_model_output(
         self, model_output: ModelRunnerOutput
     ) -> ModelRunnerOutput:
-        """步内输出接缝(§9.12):取步元数据 lwd_c2e_meta 经 POST_OUT
-        先于隐藏张量发边;model_output 本身原样透传走原生。"""
+        """步元数据 lwd_c2e_meta 经 POST_OUT 先于隐藏张量发边,其余原样透传。"""
         meta = model_output.lwd_c2e_meta
         if meta is not None:
             self._lwd_publish_c2e(meta)
         return model_output
 
     def _lwd_publish_c2e(self, meta: LwdC2eMeta) -> None:
-        """步元数据发边:队满小睡重试(元数据不可丢,边侧据此预挂
-        精确尺寸 recv),关停(closed)退出。"""
+        """步元数据发边:队满小睡重试(元数据不可丢),关停(closed)退出。"""
         notify = LwdC2eNotify(
             hidden_num_elements=meta.hidden_num_elements,
             top_id_ths=meta.top_id_ths,

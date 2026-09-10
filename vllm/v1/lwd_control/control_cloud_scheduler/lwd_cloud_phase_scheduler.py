@@ -1,21 +1,5 @@
-"""云侧相位调度器:工作纯相位批次(源 pure_phase_scheduler.py 基础上的裁定修订)。
-
-相对源实现的差异(台账 §10.8/§10.15):
-  1. 工作纯相位取代"按人口分伙":prefill 步算一切 prompt 工作(WAITING 首块
-     + RUNNING 中的 prefill 尾巴),decode 步只算 prompt 已完结请求的 1-token
-     采样 —— 长序列被 chunked prefill 截断的尾巴不再混进 decode 批;
-     单请求组批约束(§9.9 修订):prefill 批最多含一个请求(容器交换,
-     尾巴优先/队首放行),数据面 chunk 流按请求连续;
-  2. 子类合并:LwdCloudPrefillFirst/DecodeFirst 收敛为本类,相位在构造期经
-     LwdConfig 自解析(scheduler_cls 注入只带类身份,相位改走 vllm_config,
-     §10.15);注册表/工厂删除,未知相位名告警回退 prefill_first;
-  3. 准入固定 immediate 直进,separate_phases 准入族已按裁定删除(§10.14);
-  4. 类名映射:PurePhaseSchedulerBase -> LwdCloudPhaseScheduler。
-
-容器交换手法与源同款:改写 self.running/self.waiting 的可见集跑一次
-super().schedule(),finally 复原。前置约束:云侧不启用 spec decode
-(eagle 会 shift num_computed,工作纯度判据失真)。
-"""
+"""云侧相位调度器:工作纯相位批次。prefill 步只算 prompt 工作(prefill 首块 +
+尾巴),decode 步只算已完结请求的 1-token 采样;prefill 批最多一个请求。"""
 
 from __future__ import annotations
 
@@ -31,29 +15,23 @@ _LWD_PHASE_DECODE_FIRST = "decode_first"
 
 
 class LwdCloudPhaseScheduler(AsyncScheduler):
-    """工作纯相位批次策略;相位(prefill_first/decode_first)构造期自解析。"""
+    """工作纯相位批次策略;相位(prefill_first/decode_first)构造期自解析。
+    前置约束:不兼容 spec decode(eagle 会 shift num_computed_tokens,纯度判据失真)。"""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._lwd_prefill_first = self._lwd_resolve_phase()
-        # One-shot nudges: a phase produced an empty step while the other
-        # population has work — force THAT phase next step. Direction is
-        # explicit per flag(源实现同款):"other" 相对空步相位而非当前偏好,
-        # 单标志按偏好取反会把空 decode 后的翻回 prefill 错翻成 decode,
-        # 造成空 decode 步死循环(prefill 饿死)。
+        # One-shot 翻转:某相位空步而另一相位有活时,强制下一步走后者;
+        # 双标志显式定向,按偏好取反会错翻,造成空步死循环。
         self._force_prefill_once: bool = False
         self._force_decode_once: bool = False
-        # True iff the last EXECUTED (non-empty) step was a prefill batch
-        # — drives the no-consecutive-prefill invariant in schedule().
+        # 上一个非空步是否为 prefill,驱动 schedule() 的禁连续 prefill 不变量
         self._last_step_was_prefill: bool = False
         logger.info(
             "[Lwd] cloud phase scheduler: single-request prefill batches "
             "enforced (edge/cloud chunk stream stays per-request contiguous)"
         )
 
-    # ------------------------------------------------------------------ #
-    # Phase resolution(§10.15:scheduler_cls 单类,相位经 LwdConfig)      #
-    # ------------------------------------------------------------------ #
     def _lwd_resolve_phase(self) -> bool:
         """返回 True=prefill_first;缺省/未知相位告警回退 prefill_first。"""
         from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import (
@@ -73,9 +51,6 @@ class LwdCloudPhaseScheduler(AsyncScheduler):
             )
         return True
 
-    # ------------------------------------------------------------------ #
-    # Work-purity predicates(工作纯度唯一判据:prompt 是否算完)           #
-    # ------------------------------------------------------------------ #
     @staticmethod
     def _lwd_is_prefill_tail(request) -> bool:
         """RUNNING 且 prompt 未算完 = prefill 尾巴(尾巴只允许进 prefill 步)。"""
@@ -97,17 +72,9 @@ class LwdCloudPhaseScheduler(AsyncScheduler):
     def _lwd_has_decode_ready(self) -> bool:
         return any(not self._lwd_is_prefill_tail(r) for r in self.running)
 
-    # ------------------------------------------------------------------ #
-    # Phase primitives(容器交换;原生 schedule() 零改动)                  #
-    # ------------------------------------------------------------------ #
     def _schedule_pure_prefill(self) -> SchedulerOutput:
-        """一个纯 prefill 步,批内最多一个请求(§9.9 单请求组批约束)。
-
-        visible 集只放一个 prefill 工作单元:running 尾巴优先(藏其余
-        尾巴与全部 waiting),否则只放行 waiting 队首;decode-ready 照旧
-        藏起(其 1-token 采样不得混入 prefill 批)。单请求内 chunked
-        决策(预算截断/KV 抢占)照旧;藏起的 waiting 走队首回插,藏起
-        的尾巴接回 running 尾部,均保 FIFO。"""
+        """纯 prefill 步,批内最多一个请求:尾巴优先,否则放行 waiting 队首;
+        其余全部藏起,跑原生 schedule() 后 finally 复原,均保 FIFO。"""
         decode_ready, tails = self._lwd_split_running()
         hidden_waiting = self.waiting
         self.waiting = create_request_queue(self.policy)
@@ -116,15 +83,14 @@ class LwdCloudPhaseScheduler(AsyncScheduler):
             hidden_tails = tails[1:]
             self.running = tails[:1]
         else:
-            # decode-ready 藏起(与原版同语义);无尾巴时 running 清空
+            # 无尾巴时 running 清空,decode-ready 不混入 prefill 批
             self.running = []
             if hidden_waiting:
                 self.waiting.add_request(hidden_waiting.peek_request())
         try:
             out = super().schedule()
         finally:
-            # schedule 期间该列表 = 幸存尾巴(被抢占的已弹出)
-            # + 本步 waiting->running 的新请求,接在 decode-ready 之后。
+            # schedule 期间该列表 = 幸存尾巴 + 本步 waiting->running 的新请求
             leftover = self.waiting
             self.waiting = hidden_waiting
             while leftover:
@@ -133,8 +99,7 @@ class LwdCloudPhaseScheduler(AsyncScheduler):
         return out
 
     def _schedule_pure_decode(self) -> SchedulerOutput:
-        """一个纯 decode 步:WAITING 与 prefill 尾巴都藏起,
-        批内只剩 prompt 已完结请求的采样。"""
+        """纯 decode 步:waiting 与 prefill 尾巴都藏起,批内只剩已完结请求的采样。"""
         hidden_waiting = self.waiting
         self.waiting = create_request_queue(self.policy)
         decode_ready, tails = self._lwd_split_running()
@@ -144,12 +109,10 @@ class LwdCloudPhaseScheduler(AsyncScheduler):
         finally:
             newly_waiting = self.waiting
             self.waiting = hidden_waiting
-            # The temp queue should be empty or hold nothing scheduled;
-            # drain defensively back in front (FIFO order preserved).
+            # 临时队列防御性清空并回插队首(保 FIFO)
             while newly_waiting:
                 self.waiting.append(newly_waiting.popleft())
-            # 解抢占的请求经 _preempt_request 进了临时 waiting,已随上两行
-            # 回插队首;这里复原被藏的尾巴(保持其 FIFO 序)。
+            # 被抢占请求已随上两行回插队首;复原被藏的尾巴(保 FIFO)
             self.running = tails + self.running
         return out
 
@@ -157,9 +120,6 @@ class LwdCloudPhaseScheduler(AsyncScheduler):
     def _is_empty(out: SchedulerOutput) -> bool:
         return out.total_num_scheduled_tokens == 0
 
-    # ------------------------------------------------------------------ #
-    # Phase choice                                                        #
-    # ------------------------------------------------------------------ #
     def _prefer_prefill(self) -> bool:
         """相位选择:prefill_first 有等待/尾巴即 prefill;
         decode_first 只要存在纯 decode 活就优先 decode。"""
@@ -167,9 +127,6 @@ class LwdCloudPhaseScheduler(AsyncScheduler):
             return bool(self.waiting) or self._lwd_has_prefill_tails()
         return not self._lwd_has_decode_ready()
 
-    # ------------------------------------------------------------------ #
-    # Entry point                                                         #
-    # ------------------------------------------------------------------ #
     def schedule(self) -> SchedulerOutput:
         prefer_prefill = self._prefer_prefill()
         if self._force_prefill_once:
@@ -178,12 +135,8 @@ class LwdCloudPhaseScheduler(AsyncScheduler):
         elif self._force_decode_once:
             self._force_decode_once = False
             prefer_prefill = False
-        # [invariant] Prefill never executes two steps in a row: after an
-        # EXECUTED prefill batch, decode always gets the next step while
-        # any request is running.  Consecutive prefill is allowed only
-        # when the decode step in between came back EMPTY (nothing
-        # schedulable) — the empty decode flips back via _force_prefill_once.
-        # (源实现 pure_phase_scheduler.py 同款不变量,迁移补回。)
+        # 不变量:prefill 不连续执行两步;仅当中间的 decode 步为空时才允许
+        # 连续,空 decode 步经 _force_prefill_once 翻回。
         if prefer_prefill and self._last_step_was_prefill and self.running:
             prefer_prefill = False
         self._last_step_was_prefill = False
@@ -191,15 +144,13 @@ class LwdCloudPhaseScheduler(AsyncScheduler):
         if prefer_prefill:
             out = self._schedule_pure_prefill()
             if self._is_empty(out) and self.running:
-                # Prefill blocked (KV pressure). Yield the empty cleanup step
-                # and let the next step run decode so KV pressure can drain.
+                # prefill 受 KV 压力阻塞:放行空步,下一步转 decode 泄压
                 self._force_decode_once = True
             else:
                 self._last_step_was_prefill = True
             return out
         out = self._schedule_pure_decode()
         if self._is_empty(out) and (self.waiting or self._lwd_has_prefill_tails()):
-            # Decode 无活但有 waiting/尾巴:翻回 prefill 让尾巴推进。
-            # 这正是不变量的"除非没有 D"出口:中间的 D 步空转,P 才连续。
+            # decode 无活但有 waiting/尾巴:翻回 prefill(不变量的空步出口)
             self._force_prefill_once = True
         return out

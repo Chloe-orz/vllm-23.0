@@ -1,11 +1,5 @@
-"""传输层方向原语:INBOUND 订阅端(side-agnostic)。
-
-边/云身份与 bind/connect 是装配期 wiring(control_scheduler 侧
-assemble 文件决定);本类无线程,阻塞 recv 由调用方线程驱动,收到即
-解码返回(坏包丢弃取下一条);关停(ETERM)返回 None。decoder 经
-构造注入:PRE_OUT 面传边->云通知解码器,POST_OUT 面传云->边解码器
-(§10.7 协议分面)。
-"""
+"""传输层方向原语:INBOUND 订阅端(side-agnostic);无线程,阻塞 recv 由调用方
+线程驱动,收到即解码(坏包丢弃),关停返回 None;decoder 经构造注入。"""
 
 from __future__ import annotations
 
@@ -27,11 +21,8 @@ logger = init_logger(__name__)
 
 
 class LwdControlSubscriber:
-    """控制面订阅端;阻塞 recv 一条解码一条,等待节奏由调用方定。
-
-    recv(timeout_ms) 超时与关停都返回 None,以 closed 属性区分——
-    周期超时给调用方做心跳位(云侧空闲拍即挂在此返回值上)。
-    """
+    """控制面订阅端;recv 超时与关停都返回 None,以 closed 属性区分,
+    供调用方做心跳位。"""
 
     def __init__(
         self,
