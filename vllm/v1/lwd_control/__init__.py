@@ -37,9 +37,8 @@ def lwd_resolve_engine_cls(vllm_config):
 
 
 def lwd_serve_guard(vllm_config) -> None:
-    """serve 入口守卫:云角色经 _lwd_cloud_deploy_guard 校验后,向
-    scheduler_config.scheduler_cls 注入 LwdCloudPhaseScheduler;云引擎类由
-    子进程内 lwd_resolve_engine_cls 解析,边调度器由 LwdEdgeEngineCore 自注入。"""
+    """serve 入口守卫:云角色经 _lwd_cloud_deploy_guard 校验后注入相位调度器;
+    云引擎类由子进程内 lwd_resolve_engine_cls 解析,边调度器由引擎自注入。"""
     from vllm.logger import init_logger
     from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_phase_scheduler import (
         LwdCloudPhaseScheduler,
