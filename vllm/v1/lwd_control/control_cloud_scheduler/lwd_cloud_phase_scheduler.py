@@ -7,7 +7,12 @@ from collections import deque
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
-from vllm.v1.core.sched.output import LwdBatch, LwdBatchType, SchedulerOutput
+from vllm.v1.core.sched.output import (
+    LwdBatch,
+    LwdBatchType,
+    LwdEmbedBatch,
+    SchedulerOutput,
+)
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
 from vllm.v1.lwd_control.control_communication.lwd_notify import LwdRangeNotify
 from vllm.v1.request import Request
@@ -141,11 +146,18 @@ class LwdCloudPhaseScheduler(AsyncScheduler):
             return out
         # UP 链 seqno 随批下发云 worker(§9.12 数据面接缝):批配对号直接
         # 取点名预告自带的 seqno(与边侧 EMBED 批派发号同源同值),worker
-        # 的 UP recv 以此配对边侧发来的 embeds 张量。
+        # 的 UP recv 以此配对边侧发来的 embeds 张量。batch_meta 承载
+        # worker 的 recv 尺寸与注入切行信息:req_ids 取预告请求(单请求
+        # 批),token_ids 为占位列表——长度必须等于边侧实际发送的 chunk
+        # token 数(= RangeNotify.num_tokens),recv numel 才能与边侧
+        # isend 严格相等(HCCL P2P 要求两端 numel 匹配)。
         out.lwd_batch = LwdBatch(
             batch_type=LwdBatchType.LWD_EMBED,
             seqno=notify.seqno,
-            batch_meta=None,
+            batch_meta=LwdEmbedBatch(
+                req_ids=[notify.request_id],
+                token_ids=[[0] * notify.num_tokens],
+            ),
         )
         return out
 
