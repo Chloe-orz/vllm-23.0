@@ -79,7 +79,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
     """边 PO 引擎:通信面装配 + 调度器注入 + step/add/abort/shutdown 覆写。"""
 
     def __init__(self, *args, **kwargs) -> None:
-        vllm_config = args[0]
+        vllm_config = kwargs["vllm_config"]
         # 调度器注入须赶在 super() 之前:super 内构建 self.scheduler 时
         # 一次性消费 scheduler_cls,后设无效(注入失效,首请求即崩)
         vllm_config.scheduler_config.scheduler_cls = LwdEdgeScheduler
@@ -356,39 +356,49 @@ class LwdEdgeEngineCore(EngineCoreProc):
     def _lwd_deliver_unembed(
         self, notify: LwdC2eNotify, future, outputs: list, finished_reqs: set,
     ) -> None:
-        """UNEMBED 批收割侧:等 worker 应答取 token_map,逐请求交付
-        token。不感知提交时机,只消费 (notify, future)。应答契约:
+        """UNEMBED 批收割侧:等 worker 应答取采样 token 表,逐请求交付。
+        不感知提交时机,只消费 (notify, future)。应答契约:
         token ids 按 ModelRunnerOutput 的 req_ids x sampled_token_ids
         按位对齐还原(批的 req_ids 原样下发,worker 逐位回填);请求
         缺席或行无 token = unembed 失败,ERROR 优先于云侧完成码;
         迟到载荷幂等丢弃。"""
         result = future.result()
-        token_map: dict[str, list[int]] = (
+        # req_ids x sampled_token_ids 按位对齐:worker lm_head 恢复的采样
+        # token,即该请求本步的生成内容;后续仅两处流向——
+        # lwd_edge_deliver_tokens(调度器只对账 awaiting 生命周期,
+        # 不消费内容)与 EngineCoreOutput 的 new_token_ids(outputs ->
+        # EngineCoreOutputs -> 主循环按 frontend 消费 -> 前端解流交付
+        # 客户端,即最终输出的生成 token)。
+        sampled_token_map: dict[str, list[int]] = (
             {} if result is None
             else dict(zip(result.req_ids, result.sampled_token_ids))
         )
         for index, request_id in enumerate(notify.req_ids):
             finish_reason = self._lwd_finish_code(notify, index)
             finished = finish_reason is not None
-            token_ids = list(token_map.get(request_id, [])) if token_map else []
-            if not token_ids:
+            sampled_token_ids = (
+                list(sampled_token_map.get(request_id, []))
+                if sampled_token_map else []
+            )
+            if not sampled_token_ids:
                 # 行在批里但无 token = unembed 失败,ERROR 优先于云侧码
                 finish_reason = FinishReason.ERROR
                 finished = True
             if not self.scheduler.lwd_edge_deliver_tokens(
-                request_id, token_ids, finished=finished
+                request_id, sampled_token_ids, finished=finished
             ):
                 logger.warning(
                     "[Lwd] drop stale cloud payload for %s (not awaiting)",
                     request_id,
                 )
                 continue
-            if not token_ids and not finished:
+            if not sampled_token_ids and not finished:
                 # 无内容且未完结:不出空输出
                 continue
             outputs.append(
                 EngineCoreOutput(
-                    request_id, token_ids, finish_reason=finish_reason
+                    request_id, sampled_token_ids,
+                    finish_reason=finish_reason,
                 )
             )
             if finished:
