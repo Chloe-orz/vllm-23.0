@@ -214,18 +214,26 @@ class MultiprocExecutor(Executor):
 
             self.response_mqs = []
             # Only leader node have remote response mqs
-            if self.parallel_config.node_rank_within_dp == 0:
+            if self.parallel_config.node_rank_within_dp == 0 and (
+                not self.parallel_config.lwd_config.enable_lwd
+                or self.parallel_config.lwd_config.is_edge_node
+            ):
                 for rank in range(self.world_size):
-                    if rank < self.local_world_size:
-                        local_message_queue = self.workers[rank].worker_response_mq
+                    local_idx = rank - global_start_rank
+                    if 0 <= local_idx < self.local_world_size:
+                        local_message_queue = self.workers[
+                            local_idx
+                        ].worker_response_mq
                         assert local_message_queue is not None
                         self.response_mqs.append(local_message_queue)
-                    else:
+                    elif not self.parallel_config.lwd_config.enable_lwd:
                         remote_message_queue = self.workers[0].peer_worker_response_mqs[
                             rank
                         ]
                         assert remote_message_queue is not None
                         self.response_mqs.append(remote_message_queue)
+                    # LWD: remote (cloud) ranks have no response mq; their
+                    # outputs return via the lwd duplex channels instead.
 
             # Ensure message queues are ready. Will deadlock if re-ordered
             # Must be kept consistent with the WorkerProc.
@@ -511,6 +519,12 @@ class MultiprocExecutor(Executor):
         # 16-23, PP rank 2
         # 24-31, PP rank 3
         # so world_size - tp_size = 32 - 8 = 24 should be PP rank = -1 (i.e. 3)
+        if self.parallel_config.lwd_config.enable_lwd:
+            # LWD edge-cloud: only the edge head rank (global rank 0)
+            # produces ModelRunnerOutput over the response mq; cloud-side
+            # results come back via the lwd duplex channels.
+            return 0
+
         return (
             self.world_size
             - self.parallel_config.tensor_parallel_size
