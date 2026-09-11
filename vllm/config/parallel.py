@@ -233,7 +233,7 @@ class ParallelConfig:
     enable_elastic_ep: bool = False
     """Enable elastic expert parallelism with stateless NCCL groups for DP/EP."""
 
-    lwd_config: "LwdParallelConfig" = Field(default_factory=LwdParallelConfig)
+    lwd_config: LwdParallelConfig = Field(default_factory=LwdParallelConfig)
     """LWD (layerwise disaggregated) parallel-topology config. Aggregates
     the master switch, edge/cloud role mirror and NPU counts into one
     object (see :class:`LwdParallelConfig`); filled in
