@@ -133,7 +133,13 @@ class MultiprocExecutor(Executor):
         scheduler_output_handle: Handle | None = None
         # Initialize worker and set up message queues for SchedulerOutputs
         # and ModelRunnerOutputs
-        if self.parallel_config.node_rank_within_dp == 0:
+        # LWD edge-cloud: both sides run their own engine and broadcast only
+        # to their LOCAL workers, so the cloud executor needs a broadcast
+        # queue too, and on both sides the reader count is the local worker
+        # count — a world-sized count would wait forever in the readiness
+        # handshake for cross-side subscribers that never join.
+        lwd_enable = self.parallel_config.lwd_config.enable_lwd
+        if self.parallel_config.node_rank_within_dp == 0 or lwd_enable:
             # For leader node within each dp rank,
             # each dp will have its own leader multiproc executor.
             max_chunk_bytes = envs.VLLM_MQ_MAX_CHUNK_BYTES_MB * 1024 * 1024
@@ -150,7 +156,7 @@ class MultiprocExecutor(Executor):
                 self.local_world_size,
             )
             self.rpc_broadcast_mq = MessageQueue(
-                self.world_size,
+                self.local_world_size if lwd_enable else self.world_size,
                 self.local_world_size,
                 max_chunk_bytes=max_chunk_bytes,
                 connect_ip=mq_connect_ip,
@@ -280,6 +286,13 @@ class MultiprocExecutor(Executor):
         pass
 
     def _is_driver_worker(self, rank: int) -> bool:
+        if self.parallel_config.lwd_config.enable_lwd:
+            # Each side's first rank is its own engine's driver worker
+            # (edge rank 0, cloud rank edge_npu_count); the native
+            # ``rank % tp_size`` picks the wrong worker under the
+            # edge-first asymmetric layout.
+            lwd = self.parallel_config.lwd_config
+            return rank == (0 if lwd.is_edge_node else lwd.edge_npu_count)
         return rank % self.parallel_config.tensor_parallel_size == 0
 
     def start_worker_monitor(self, inline=False) -> None:
@@ -544,6 +557,10 @@ class UnreadyWorkerProcHandle:
     rank: int
     ready_pipe: Connection
     death_writer: Connection | None = None
+    # Node-local index. Under LWD edge-cloud, cloud workers' global ranks
+    # are offset by edge_npu_count, so READY-slot placement by
+    # ``rank % len`` swaps workers there — place by this index instead.
+    local_rank: int | None = None
 
 
 @dataclass
@@ -584,10 +601,20 @@ class WorkerProc:
     def _init_message_queues(
         self, input_shm_handle: Handle, vllm_config: VllmConfig
     ) -> None:
-        if vllm_config.parallel_config.nnodes_within_dp == 1:
-            # Initialize MessageQueue for receiving SchedulerOutput
+        # LWD edge-cloud uses the single-node topology as well: each engine
+        # talks only to its local workers, and cross-side traffic rides the
+        # lwd channels / ZMQ, never these queues. The native cross-node
+        # branch would funnel every worker's output into a single-reader
+        # queue whose reader lives on the edge — unreachable for the cloud
+        # engine — and its same-node test misclassifies workers under the
+        # asymmetric edge/cloud layout.
+        if (vllm_config.parallel_config.nnodes_within_dp == 1
+                or vllm_config.parallel_config.lwd_config.enable_lwd):
+            # Initialize MessageQueue for receiving SchedulerOutput.
+            # ``local_rank`` is the reader slot in the engine's queue
+            # (cloud global ranks are offset by edge_npu_count).
             self.rpc_broadcast_mq = MessageQueue.create_from_handle(
-                input_shm_handle, self.worker.rank
+                input_shm_handle, self.local_rank
             )
 
             # Initializes a message queue for sending the model output
@@ -625,6 +652,13 @@ class WorkerProc:
         is_driver_worker: bool,
     ):
         self.rank = rank
+        # Node-local index: MQ reader slots and RPC reply ownership are
+        # per-instance coordinates (cloud global ranks are offset by the
+        # edge NPU count, so global rank is the wrong key there).
+        self.local_rank = local_rank
+        self._reply_by_local_rank = (
+            vllm_config.parallel_config.lwd_config.enable_lwd
+        )
         wrapper = WorkerWrapperBase(rpc_rank=local_rank, global_rank=rank)
         # TODO: move `init_worker` to executor level as a collective rpc call
         # 每个进程只按 rpc_rank(= 本节点 local_rank)取自己那份,长度须覆盖
@@ -732,7 +766,9 @@ class WorkerProc:
         death_reader.close()
         # Keep death_writer open in parent - when parent exits,
         # death_reader in child will get EOFError
-        return UnreadyWorkerProcHandle(proc, rank, ready_reader, death_writer)
+        return UnreadyWorkerProcHandle(
+            proc, rank, ready_reader, death_writer, local_rank=local_rank
+        )
 
     @staticmethod
     def wait_for_response_handle_ready(
@@ -779,7 +815,16 @@ class WorkerProc:
                     if response["status"] != "READY":
                         raise e
 
-                    idx = unready_proc_handle.rank % len(ready_proc_handles)
+                    # Cloud workers' global ranks are offset by
+                    # edge_npu_count: ``rank % len`` swaps their slots and
+                    # the executor then reads the WRONG worker's response
+                    # queue — place each handle by its node-local index.
+                    _local_rank = unready_proc_handle.local_rank
+                    idx = (
+                        _local_rank
+                        if _local_rank is not None
+                        else unready_proc_handle.rank
+                    ) % len(ready_proc_handles)
                     ready_proc_handles[idx] = WorkerProc.wait_for_response_handle_ready(
                         response, unready_proc_handle
                     )
@@ -992,6 +1037,16 @@ class WorkerProc:
             output = self.async_output_queue.get()
             self.enqueue_output(output)
 
+    def _owns_rpc_reply(self, output_rank: int | None) -> bool:
+        # output_rank is an INSTANCE-LOCAL driver index (_get_output_rank
+        # returns 0 for LWD), while cloud workers' global ranks are offset
+        # by edge_npu_count — without the local-rank fallback no cloud
+        # worker would ever claim the reply and the engine would block on
+        # future.result() until the RPC timeout.
+        if output_rank is None or self.rank == output_rank:
+            return True
+        return self._reply_by_local_rank and self.local_rank == output_rank
+
     def worker_busy_loop(self):
         """Main busy loop for Multiprocessing Workers"""
         assert self.rpc_broadcast_mq is not None
@@ -1013,11 +1068,11 @@ class WorkerProc:
                 logger.exception("WorkerProc hit an exception.")
                 # exception might not be serializable, so we convert it to
                 # string, only for logging purpose.
-                if output_rank is None or self.rank == output_rank:
+                if self._owns_rpc_reply(output_rank):
                     self.handle_output(e)
                 continue
 
-            if output_rank is None or self.rank == output_rank:
+            if self._owns_rpc_reply(output_rank):
                 self.handle_output(output)
 
     @staticmethod
