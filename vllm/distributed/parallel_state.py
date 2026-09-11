@@ -1743,6 +1743,124 @@ def initialize_model_parallel(
     enable_elastic_ep = config.parallel_config.enable_elastic_ep
     parallel_config = config.parallel_config
     coord_store: Store | None = None
+
+    # Lwd 边云模式:边云 rank 数不对称(edge_npu_count + cloud_npu_count),
+    # 排不进原生的均匀 rank 网格,按 Lwd 布局直接构建各并行组后返回。
+    # 布局(以边 1 + 云 4、dp=1、world=5 为例):
+    #   TP: [[0], [1,2,3,4]]        边单例;云 4 卡合切一份权重
+    #   PP: [[0,1], [2], [3], [4]]  边 rank0 与云 rank1 组成两段流水线,
+    #                               其余云 rank 单例
+    #   DCP/PCP/DP: 全单例
+    #   EP(仅 MoE): [[0], [1,2,3,4]]
+    # 所有分组都必须全 rank 集体创建,因此每个 rank 都带完整分组列表。
+    if parallel_config.lwd_config.enable_lwd:
+        global _TP, _PP, _DCP, _PCP, _DP, _EP
+        assert not enable_elastic_ep, (
+            "elastic EP is not supported in Lwd edge-cloud mode")
+        lwd = parallel_config.lwd_config
+        world_size = torch.distributed.get_world_size()
+        rank = torch.distributed.get_rank()
+        backend = backend or torch.distributed.get_backend(
+            get_world_group().device_group
+        )
+        edge_count = lwd.edge_npu_count
+        cloud_count = lwd.cloud_npu_count
+        world_per_dp = edge_count + cloud_count
+        assert world_size == data_parallel_size * world_per_dp, (
+            f"Lwd world size mismatch: got {world_size}, expected "
+            f"{data_parallel_size} * ({edge_count} + {cloud_count})")
+        is_edge = rank % world_per_dp < edge_count
+
+        # TP:每个 dp 实例内,边 rank 一组、云 rank 一组
+        assert _TP is None, "tensor model parallel group is already initialized"
+        tp_groups: list[list[int]] = []
+        for dp_idx in range(data_parallel_size):
+            base = dp_idx * world_per_dp
+            tp_groups.append([base + r for r in range(edge_count)])
+            tp_groups.append([base + edge_count + r for r in range(cloud_count)])
+        _TP = init_model_parallel_group(
+            tp_groups,
+            get_world_group().local_rank,
+            backend,
+            use_message_queue_broadcaster=True,
+            group_name="tp",
+        )
+
+        # PP:每实例边 rank0 与云 rank0 成两段 pp 对,其余 rank 单例
+        assert _PP is None, "pipeline model parallel group is already initialized"
+        pp_groups: list[list[int]] = []
+        for dp_idx in range(data_parallel_size):
+            base = dp_idx * world_per_dp
+            pp_groups.append([base + 0, base + edge_count])
+            for r in range(1, world_per_dp):
+                if r != edge_count:
+                    pp_groups.append([base + r])
+        _PP = init_model_parallel_group(
+            pp_groups,
+            get_world_group().local_rank,
+            backend,
+            group_name="pp",
+        )
+
+        # DCP/PCP:全单例(pcp_size = dcp_size = 1)
+        singleton_groups = [[r] for r in range(world_size)]
+        assert _DCP is None, "decode context model parallel group is already initialized"
+        _DCP = init_model_parallel_group(
+            singleton_groups,
+            get_world_group().local_rank,
+            backend,
+            use_message_queue_broadcaster=True,
+            group_name="dcp",
+        )
+        assert _PCP is None, "prefill context parallel group is already initialized"
+        _PCP = init_model_parallel_group(
+            singleton_groups,
+            get_world_group().local_rank,
+            backend,
+            group_name="pcp",
+        )
+
+        # DP:各 dp 实例同位置的 rank 一组
+        assert _DP is None, "data parallel group is already initialized"
+        dp_groups = [
+            [pos + dp_idx * world_per_dp for dp_idx in range(data_parallel_size)]
+            for pos in range(world_per_dp)
+        ]
+        _DP = init_model_parallel_group(
+            dp_groups, get_world_group().local_rank, backend, group_name="dp"
+        )
+
+        # EP(仅 MoE):边 rank 一组、云 rank 一组
+        if config.model_config is not None and config.model_config.is_moe:
+            assert _EP is None, "expert parallel group is already initialized"
+            ep_edge_ranks: list[int] = []
+            ep_cloud_ranks: list[int] = []
+            for dp_idx in range(data_parallel_size):
+                base = dp_idx * world_per_dp
+                ep_edge_ranks.extend(range(base, base + edge_count))
+                ep_cloud_ranks.extend(range(base + edge_count, base + world_per_dp))
+            _EP = init_model_parallel_group(
+                [ep_edge_ranks, ep_cloud_ranks],
+                get_world_group().local_rank,
+                backend,
+                group_name="ep",
+            )
+
+        logger.info(
+            "Lwd edge-cloud mode initialized: rank %s, is_edge=%s, "
+            "edge_npu_count=%s, cloud_npu_count=%s, world_size=%s, "
+            "TP groups=%s, PP groups=%s, DP groups=%s",
+            rank,
+            is_edge,
+            edge_count,
+            cloud_count,
+            world_size,
+            tp_groups,
+            pp_groups,
+            dp_groups,
+        )
+        return
+
     if enable_elastic_ep:
         coord_store = get_cached_tcp_store_client(
             parallel_config.data_parallel_master_ip,
@@ -1787,7 +1905,6 @@ def initialize_model_parallel(
     )  # noqa
 
     # Build the tensor model-parallel groups.
-    global _TP
     assert _TP is None, "tensor model parallel group is already initialized"
     group_ranks = all_ranks.view(-1, tensor_model_parallel_size).unbind(0)
     group_ranks = [x.tolist() for x in group_ranks]
@@ -1804,7 +1921,6 @@ def initialize_model_parallel(
     )
 
     # Build the DCP model-parallel groups.
-    global _DCP
     assert _DCP is None, "decode context model parallel group is already initialized"
     # Note(hc): In the current implementation of decode context parallel,
     # dcp_size must not exceed tp_size, because the world size does not
@@ -1825,7 +1941,6 @@ def initialize_model_parallel(
         group_name="dcp",
     )
 
-    global _PCP
     assert _PCP is None, "prefill context parallel group is already initialized"
     group_ranks = (
         all_ranks.transpose(3, 4)
@@ -1845,7 +1960,6 @@ def initialize_model_parallel(
     )
 
     # Build the pipeline model-parallel groups.
-    global _PP
     assert _PP is None, "pipeline model parallel group is already initialized"
     group_ranks = (
         all_ranks.transpose(2, 4).reshape(-1, pipeline_model_parallel_size).unbind(0)
@@ -1862,7 +1976,6 @@ def initialize_model_parallel(
         group_ranks, get_world_group().local_rank, backend, group_name="pp"
     )
 
-    global _DP
     assert _DP is None, "data parallel group is already initialized"
     group_ranks = all_ranks.transpose(1, 4).reshape(-1, data_parallel_size).unbind(0)
     group_ranks = [x.tolist() for x in group_ranks]
@@ -1879,7 +1992,6 @@ def initialize_model_parallel(
             group_ranks, get_world_group().local_rank, backend, group_name="dp"
         )
 
-    global _EP
     assert _EP is None, "expert parallel group is already initialized"
     # Don't create EP group for dense models.
     if config.model_config is None or config.model_config.is_moe:

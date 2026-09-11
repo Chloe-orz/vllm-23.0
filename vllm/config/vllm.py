@@ -867,6 +867,27 @@ class VllmConfig:
             parallel_lwd.is_edge_node = self.lwd_config.is_edge
             if self.lwd_config.is_edge and parallel_lwd.edge_npu_count <= 0:
                 raise ValueError("--edge-npu-count must be positive on the LWD edge process")
+            # 边云模式并行度由拓扑推导,不接受 CLI 指定(对齐参考实现
+            # v0.23.0_lwd_prefill_only 70151bf):world = 边 + 云;PP 恒为
+            # 2(边 rank0 与云 rank0 成两段流水线,其余云 rank 单例);
+            # TP 边取 edge_npu_count、云取 cloud_npu_count(云侧按此切权重)。
+            if (self.parallel_config.tensor_parallel_size != 1
+                    or self.parallel_config.pipeline_parallel_size != 1):
+                logger.warning(
+                    "Lwd edge-cloud mode derives parallel sizes from the "
+                    "topology; ignoring CLI tp=%s pp=%s.",
+                    self.parallel_config.tensor_parallel_size,
+                    self.parallel_config.pipeline_parallel_size,
+                )
+            self.parallel_config.world_size = (
+                parallel_lwd.edge_npu_count + parallel_lwd.cloud_npu_count
+            )
+            self.parallel_config.pipeline_parallel_size = 2
+            self.parallel_config.tensor_parallel_size = (
+                parallel_lwd.edge_npu_count
+                if parallel_lwd.is_edge_node
+                else parallel_lwd.cloud_npu_count
+            )
 
         if self.performance_mode != "balanced":
             logger.info_once("Performance mode set to '%s'.", self.performance_mode)
