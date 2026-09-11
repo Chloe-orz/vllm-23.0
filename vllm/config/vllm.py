@@ -362,7 +362,7 @@ class VllmConfig:
     """Additional config for specified platform. Different platforms may
     support different configs. Make sure the configs are valid for the platform
     you are using. Contents must be hashable."""
-    lwd_config: "LwdConfig | None" = None
+    lwd_config: LwdConfig | None = None
     """LWD (layerwise disaggregated) config, parsed from
     ``additional_config["lwd_config"]`` in ``__post_init__``. Holds the
     LWD behavior settings; the parallel-topology knobs live in the
