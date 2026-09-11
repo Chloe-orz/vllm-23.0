@@ -45,6 +45,10 @@ class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):
     ignore_eos: bool = False
     stop_token_ids: list[int] = []
     min_tokens: int = 0
+    eos_token_id: Optional[int] = None
+    """结束符 id:边侧前端自 tokenizer 解析,云侧占位 prompt 无从
+    得知,必须随预告透传;缺省 None = 云侧 EOS 判定落空,仅
+    max_tokens 兜底(旧版边侧,additive 兼容)。"""
 
 
 class LwdAbortNotify(msgspec.Struct, gc=False, tag=True):

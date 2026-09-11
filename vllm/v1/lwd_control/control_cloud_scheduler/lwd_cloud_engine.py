@@ -183,6 +183,10 @@ class LwdCloudEngineCore(EngineCoreProc):
             stop_token_ids=list(wire.stop_token_ids),
             min_tokens=wire.min_tokens,
         )
+        # eos_token_id 非构造入参,走原生回填入口(同边侧前端
+        # input_processor):设 _eos_token_id 并计入 _all_stop_token_ids
+        # 供 min_tokens 判定;云侧无客户端 generation_config,传空。
+        sampling_params.update_from_generation_config({}, wire.eos_token_id)
         local_hasher = self.request_block_hasher
         if local_hasher is None:
             # prefix caching 未启用:请求不挂 hasher,整链机制不激活

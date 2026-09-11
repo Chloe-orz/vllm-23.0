@@ -252,6 +252,7 @@ class LwdEdgeScheduler(AsyncScheduler):
                 list(sp.stop_token_ids) if sp is not None and sp.stop_token_ids else []
             ),
             min_tokens=sp.min_tokens if sp is not None else 0,
+            eos_token_id=sp.eos_token_id if sp is not None else None,
         )
         for attempt in range(_LWD_ADD_RETRY_STEPS):
             if publisher.publish(message):
@@ -331,7 +332,8 @@ class LwdEdgeScheduler(AsyncScheduler):
 
         边界 = 边侧能力面:边是 embedding 属主(拒绝客户端自带
         prompt_embeds),只处理纯文本补全(拒 pooling/结构化
-        输出),prompt 非空。"""
+        输出),prompt 非空;不上 wire 的采样参数(logit_bias/
+        allowed_token_ids/logprobs)缺省即拒,不静默丢约束。"""
         if request.prompt_embeds is not None:
             raise ValueError(
                 f"[LWD] prefill-only mode does not accept client-provided "
@@ -347,6 +349,23 @@ class LwdEdgeScheduler(AsyncScheduler):
             raise ValueError(
                 "[LWD] prefill-only mode does not support structured output "
                 f"(request {request.request_id})"
+            )
+        sp = request.sampling_params
+        unsupported = [
+            name
+            for name, value in (
+                ("logit_bias", sp.logit_bias),
+                ("allowed_token_ids", sp.allowed_token_ids),
+                ("logprobs", sp.logprobs),
+            )
+            if value is not None
+        ]
+        if unsupported:
+            raise ValueError(
+                "[LWD] prefill-only mode does not support sampling "
+                f"param(s) {', '.join(unsupported)} "
+                f"(request {request.request_id}): not carried on the "
+                "edge->cloud wire, cloud would silently sample without them"
             )
 
 def lwd_build_unembed_batch(notify: LwdC2eNotify) -> SchedulerOutput:
@@ -380,10 +399,10 @@ def lwd_build_unembed_batch(notify: LwdC2eNotify) -> SchedulerOutput:
         batch_meta=LwdUnembedBatch(
             req_ids=list(notify.req_ids),
             num_accept_tokens=list(notify.num_accepted_tokens),
-            recv_num_elements=notify.recv_num_elements,
+            recv_num_elements=notify.hidden_num_elements,
             out_token_idxs=[],
             top_id_ths=list(notify.top_id_ths),
         ),
     )
-
+    scheduler_output.lwd_c2e_notify = [notify]
     return scheduler_output
