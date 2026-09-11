@@ -5,14 +5,18 @@
 全部状态收进子类字段,不外挂引擎属性。
 
 构造约束:
-  ① 通信面先于引擎主体构建:bind POST_OUT、建云载荷队列与接收线程,
+  ① 引擎主体先行(super() 最先调):接收线程 WAKEUP 敲门的
+     self.input_queue 由 super 创建,后启动线程即无构造期竞态;代价是
+     云缺失时引擎主体启动白费,超时路径只清理通信面,主体随进程退出
+     兜底回收。通信面随后构建:bind POST_OUT、建云载荷队列与接收线程,
      阻塞等云首拍 HELLO——HELLO 在云引擎全量初始化(权重/KV/图编译)
      完成后才发出,等到了它才允许边侧对外就绪;超时(hello_timeout_s,
-     默认 600s,须覆盖云全量启动时长)自清理两面后 fail-fast。
+     默认 600s,须覆盖云全量启动时长)fail-fast。
      HELLO 首拍一次、无周期重发,不考虑任一侧重启自愈:重启即整组重拉,
      构造期等待是边侧唯一的发现窗口。
-  ② 调度器经 scheduler_cls 注入裸类,引擎构造完成后回填 publisher
-     (早于任何请求,等价构造注入)。
+  ② 调度器经 scheduler_cls 注入裸类,须在 super() 之前设值——super 内
+     构建调度器时一次性消费该配置,后设无效;引擎构造完成后回填
+     publisher(早于任何请求,等价构造注入)。
 
 步进编排:步首消费云载荷(c2e -> UNEMBED 批 -> token 交付/请求终结)
 + prefill 编排(单请求组批 -> 范围预告 -> 原生 executor 同步执行 ->
@@ -76,6 +80,10 @@ class LwdEdgeEngineCore(EngineCoreProc):
 
     def __init__(self, *args, **kwargs) -> None:
         vllm_config = args[0]
+        # 调度器注入须赶在 super() 之前:super 内构建 self.scheduler 时
+        # 一次性消费 scheduler_cls,后设无效(注入失效,首请求即崩)
+        vllm_config.scheduler_config.scheduler_cls = LwdEdgeScheduler
+        super().__init__(*args, **kwargs)
         config = LwdConfig.from_env_and_config(vllm_config)
         self._lwd_log = LwdLog(config.debug)
         # 通信面:bind POST_OUT 订阅面 + 延迟连接的 PRE_OUT 发布面;
@@ -105,8 +113,6 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 f"master_addr connectivity and POST_OUT port)"
             )
 
-        vllm_config.scheduler_config.scheduler_cls = LwdEdgeScheduler
-        super().__init__(*args, **kwargs)
         self.scheduler.lwd_edge_publisher = self._edge_sender
         logger.info(
             "[Lwd] edge engine assembled: POST_OUT bind %s, PRE_OUT discovered",
@@ -202,7 +208,8 @@ class LwdEdgeEngineCore(EngineCoreProc):
 
     def _lwd_edge_step(self) -> tuple[dict[int, object] | None, bool]:
         """单步编排:云载荷消费 -> prefill 编排 -> 步末完结登记;
-        返回 (云侧结果输出 | None, prefill 是否有工作)。"""
+        返回 ({0: 云侧结果输出} | None, prefill 是否有工作)——主循环
+        按 frontend 字典消费(outputs.items()),单前端恒为键 0。"""
         outputs, finished_reqs = self._lwd_edge_consume_c2e()
         executed: dict[str, int] = {}
         if self.scheduler.has_requests():
@@ -211,13 +218,11 @@ class LwdEdgeEngineCore(EngineCoreProc):
             self._lwd_log.phase("edge step: %d reqs executed", len(executed))
         self.scheduler.lwd_edge_update_progress(executed)
         if outputs:
-            return (
-                EngineCoreOutputs(
-                    outputs=outputs,
-                    finished_requests=finished_reqs or None,
-                ),
-                bool(executed),
+            step_outputs = EngineCoreOutputs(
+                outputs=outputs,
+                finished_requests=finished_reqs or None,
             )
+            return {0: step_outputs}, bool(executed)
         return None, bool(executed)
 
     def _lwd_edge_consume_c2e(self) -> tuple[list, set]:
@@ -388,7 +393,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
         丢失,由发布通道不丢消息保证)。"""
         if not self.scheduler.lwd_edge_notify(scheduler_output):
             return {}
-        self.model_executor.execute_model(scheduler_output).result()
+        self.model_executor.execute_model(scheduler_output)
         # 同步执行:调度量即执行量;数据面异步化后由此改报实际量
         return dict(scheduler_output.num_scheduled_tokens)
 
