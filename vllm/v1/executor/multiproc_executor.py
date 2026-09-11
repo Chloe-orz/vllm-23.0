@@ -640,8 +640,11 @@ class WorkerProc:
         self.rank = rank
         wrapper = WorkerWrapperBase(rpc_rank=local_rank, global_rank=rank)
         # TODO: move `init_worker` to executor level as a collective rpc call
+        # 每个进程只按 rpc_rank(= 本节点 local_rank)取自己那份,长度须覆盖
+        # 本实例的 local_rank 范围;用全局 world_size 在 Lwd 非对称拓扑下会
+        # 与 local_rank 脱钩(world_size=1 而 local_rank 到 3 时 3/4 越界)。
         all_kwargs: list[dict] = [
-            {} for _ in range(vllm_config.parallel_config.world_size)
+            {} for _ in range(vllm_config.parallel_config.local_world_size)
         ]
         all_kwargs[local_rank] = {
             "vllm_config": vllm_config,
