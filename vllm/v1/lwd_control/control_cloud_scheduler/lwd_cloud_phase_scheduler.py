@@ -7,8 +7,9 @@ from collections import deque
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
-from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.output import LwdBatch, LwdBatchType, SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
+from vllm.v1.lwd_control.control_communication.lwd_notify import LwdRangeNotify
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -30,8 +31,9 @@ class LwdCloudPhaseScheduler(AsyncScheduler):
         self._force_decode_once: bool = False
         # 上一个非空步是否为 prefill,驱动 schedule() 的禁连续 prefill 不变量
         self._last_step_was_prefill: bool = False
-        # prefill 通知队列:边侧预告解锁的待调度 req_id,每步取队首点名
-        self.prefill_notify_queue: deque[str] = deque()
+        # prefill 通知队列:边侧范围预告(RangeNotify)逐条入队,每步取
+        # 队首点名其 request_id;预告自带 seqno 即本步 UP 链配对号
+        self.prefill_notify_queue: deque[LwdRangeNotify] = deque()
         logger.info(
             "[Lwd] cloud phase scheduler: single-request prefill batches "
             "enforced (edge/cloud chunk stream stays per-request contiguous)"
@@ -121,21 +123,30 @@ class LwdCloudPhaseScheduler(AsyncScheduler):
         return out
 
     def _schedule_pure_prefill(self) -> SchedulerOutput:
-        """纯 prefill 步:prefill_notify_queue 有请求则取队首 req_id 单独
-        调度(按原队列归位,waiting/skipped 来源走原生准入);没有则空集
-        进窗口,等价空步,三队列原样保留。"""
-        req_ids = [q.popleft()] if (q := self.prefill_notify_queue) else []
+        """纯 prefill 步:prefill_notify_queue 有预告则取队首 msg,单独
+        调度其请求(按原队列归位,waiting/skipped 来源走原生准入);没有则
+        空集进窗口,等价空步,三队列原样保留。"""
+        notify = q.popleft() if (q := self.prefill_notify_queue) else None
+        if notify is not None and notify.request_id not in self.requests:
+            # 请求已被 abort 释放:丢弃陈旧预告,本步按空集走
+            notify = None
+        req_ids = [notify.request_id] if notify is not None else []
         out = self._lwd_schedule_for_visible_reqs(req_ids)
-        # UP 链 seqno 随批下发云 worker(§9.12 数据面接缝):取登记表
-        # 快照挂 SO 动态属性(无 slots 存活至 worker),worker 的 UP recv
-        # 以此配对边侧发来的 embeds 张量(与边侧 SO.lwd_batch.seqno 同源)。
-        # registry 由云引擎 IO 线程交付(缺省 = 未启用,挂空不扰原生)。
-        if hasattr(self, "lwd_seqno_registry"):
-            registry = self.lwd_seqno_registry
-            out.lwd_up_seqnos = {
-                request_id: list(registry.get(request_id, []))
-                for request_id in out.num_scheduled_tokens
-            }
+        if notify is None:
+            return out
+        if not out.num_scheduled_tokens:
+            # 未实际准入(典型 KV 压力空步):预告塞回队首原位,decode
+            # 泄压后重新点名;本步不挂 lwd_batch,不向 worker 预告配对号
+            self.prefill_notify_queue.appendleft(notify)
+            return out
+        # UP 链 seqno 随批下发云 worker(§9.12 数据面接缝):批配对号直接
+        # 取点名预告自带的 seqno(与边侧 EMBED 批派发号同源同值),worker
+        # 的 UP recv 以此配对边侧发来的 embeds 张量。
+        out.lwd_batch = LwdBatch(
+            batch_type=LwdBatchType.LWD_EMBED,
+            seqno=notify.seqno,
+            batch_meta=None,
+        )
         return out
 
     def _schedule_pure_decode(self) -> SchedulerOutput:

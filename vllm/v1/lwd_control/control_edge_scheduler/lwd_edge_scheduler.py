@@ -8,8 +8,7 @@
        -> 嵌入完结:走原生 finish_requests 清出调度器(释放边侧 KV
           簿记、通知 worker 释放缓存),登记 awaiting
        -> AWAITING(等待云结果;前端未收到输出继续等待)
-       -> 云结果终结(lwd_edge_deliver_tokens);迟到结果幂等丢弃;
-          awaiting 超时僵尸兜底(lwd_edge_zombie_check)。
+       -> 云结果终结(lwd_edge_deliver_tokens);迟到结果幂等丢弃。
 
 纯 prefill 的实现依据:schedule() 全量复用原生——边侧请求从不产生
 输出 token(num_tokens_with_spec 恒等于 num_prompt_tokens),且嵌入
@@ -38,12 +37,14 @@ from vllm.v1.core.sched.output import (
 from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LwdAbortNotify,
+    LwdC2eNotify,
     LwdRangeNotify,
     LwdRequestNotify,
 )
 from vllm.v1.request import RequestStatus
 
 if TYPE_CHECKING:
+    from vllm.sampling_params import SamplingParams
     from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
         LwdControlPublisher,
     )
@@ -54,8 +55,6 @@ logger = init_logger(__name__)
 # add 预告发布重试:次数 x 递增间隔(共约 3s),耗尽即请求级报错
 _LWD_ADD_RETRY_STEPS = 5
 _LWD_ADD_RETRY_INTERVAL_S = 0.2
-# awaiting 僵尸上限:超时本地 abort + 通知云停止(云崩溃/结果丢失兜底)
-_LWD_AWAITING_TIMEOUT_S = 300.0
 
 
 class LwdEdgeScheduler(AsyncScheduler):
@@ -71,7 +70,6 @@ class LwdEdgeScheduler(AsyncScheduler):
         super().__init__(*args, **kwargs)
         self.lwd_edge_publisher = publisher
         self._lwd_seqno = 0
-        self._lwd_last_scheduled: dict[str, int] = {}
         # 前缀缓存:manager 级关命中,配置级保留使能。两级拆分的原因:
         # - 必须关命中:命中会跳过 token 排程,首条 RangeNotify 的
         #   offset != 0,云侧按 offset==0 识别首块的约定失效;且被
@@ -88,54 +86,55 @@ class LwdEdgeScheduler(AsyncScheduler):
         self._lwd_awaiting: dict[str, float] = {}
 
     def schedule(self) -> SchedulerOutput:
-        """单请求组批 + 原生分块决策;记录本步调度量供步末对账。
+        """单请求组批 + 原生分块决策。
 
         EMBED 批的 LwdBatch(seqno/token 片段)由 lwd_edge_notify 在
-        发布成功后挂批——seqno 必须与发布成功绑定,发布失败整步
-        回退时批随 SchedulerOutput 一并废弃。"""
-        scheduler_output = self._lwd_schedule_single()
-        self._lwd_last_scheduled = dict(scheduler_output.num_scheduled_tokens)
-        return scheduler_output
+        发布成功后挂批——seqno 必须与发布成功绑定。"""
+        return self._lwd_schedule_single()
 
     def _lwd_schedule_single(self) -> SchedulerOutput:
         """单请求组批:容器交换让原生 schedule() 只见到一个工作单元。
 
-        可见集只放一个 prefill 工作单元——running 尾巴优先(藏其余
-        尾巴与全部 waiting),否则只放行 waiting 队首;原生 schedule()
-        结构上见不到第二个请求,批无法跨请求,单请求内的 chunked
-        决策(预算截断/KV 抢占)照旧。藏起的 waiting 走队首回插
-        (含被抢占回插者),藏起的尾巴接回 running 尾部,均保 FIFO。
+        可见集只放一个 prefill 工作单元——running 中第一个 prefill
+        优先(first_running_prefill,暂离其余进行中 prefill 与全部
+        waiting),否则只放行 waiting 队首;原生 schedule() 结构上
+        见不到第二个请求,批无法跨请求,单请求内的 chunked 决策
+        (预算截断/KV 抢占)照旧。暂离的 waiting 走队首回插
+        (含被抢占回插者),暂离的 prefill 接回 running 尾部,均保 FIFO。
         """
-        tail = next(
+        first_running_prefill = next(
             (r for r in self.running if r.num_computed_tokens < r.num_prompt_tokens),
             None,
         )
-        hidden_waiting = self.waiting
+        parked_waiting = self.waiting
         self.waiting = create_request_queue(self.policy)
-        hidden_tails: list = []
-        if tail is not None:
-            hidden_tails = [
+        parked_prefills: list = []
+        if first_running_prefill is not None:
+            parked_prefills = [
                 r
                 for r in self.running
-                if r is not tail and r.num_computed_tokens < r.num_prompt_tokens
+                if r is not first_running_prefill
+                and r.num_computed_tokens < r.num_prompt_tokens
             ]
-            if hidden_tails:
+            if parked_prefills:
                 self.running = [
                     r
                     for r in self.running
-                    if r is tail or r.num_computed_tokens >= r.num_prompt_tokens
+                    if r is first_running_prefill
+                    or r.num_computed_tokens >= r.num_prompt_tokens
                 ]
-        elif hidden_waiting:
-            self.waiting.add_request(hidden_waiting.peek_request())
+        elif parked_waiting:
+            self.waiting.add_request(parked_waiting.peek_request())
+
         try:
             return super().schedule()
         finally:
             leftover = self.waiting
-            self.waiting = hidden_waiting
+            self.waiting = parked_waiting
             while leftover:
                 self.waiting.prepend_request(leftover.pop_request())
-            if hidden_tails:
-                self.running = self.running + hidden_tails
+            if parked_prefills:
+                self.running = self.running + parked_prefills
 
     def lwd_edge_add_request(self, request: Request) -> None:
         """请求入口:边界校验 -> 云预告 -> 本地入队。
@@ -144,13 +143,10 @@ class LwdEdgeScheduler(AsyncScheduler):
         计算(没有 chunk 预告就不会开算)。abort_immediately 请求走
         finish + abort 出口,与原生语义一致。"""
         self._lwd_validate_request(request)
-        sampling_params = request.sampling_params
         self.lwd_edge_notify_request(
             request_id=request.request_id,
             num_prompt_tokens=len(request.prompt_token_ids),
-            max_tokens=(
-                sampling_params.max_tokens if sampling_params is not None else 16
-            ),
+            sampling_params=request.sampling_params,
             block_hashes=list(request.block_hashes),
         )
         super().add_request(request)
@@ -164,24 +160,18 @@ class LwdEdgeScheduler(AsyncScheduler):
         seqno 无空洞契约:UP 数据通道按连续号序配对(通道层对超前号
         扣留等待,一个空洞即永久挂死整条链),因此号只能分配给真正
         上 wire 的块:
-        - peek-then-advance:发布成功才进位计数器,队满回退时号未
-          消耗,重试复用同一号;
+        - peek-then-advance:发布成功才进位计数器;
         - 单 notify 前提:本方法每步至多发一条,依赖单请求组批
           约束。若放开多请求组批,部分成功的 notify 已上 wire 而
-          整步回退不发张量,会同时产生号空洞与张量失配,届时必须
-          改为按已成功子集执行。
+          整步不派发,会同时产生号空洞与张量失配,届时必须改为按
+          已成功子集执行。
 
-        发布队满返回 False:调用方本步不派发,下一步原生调度自然
-        复现同一范围重试;重复预告在云侧按 (request_id, offset)
-        幂等登记。"""
+        前提:控制面发布通道不丢消息,publish 恒成功——步末回退
+        对账已按此前提移除。若前提被破坏返回 False,调用方本步不
+        派发但进度不回退,该 chunk 永久丢失;重复预告在云侧按
+        (request_id, offset) 幂等登记。"""
         publisher = self.lwd_edge_publisher
-        if publisher is None:
-            logger.error("[Lwd] edge scheduler assembled without publisher")
-            return False
         scheduled = scheduler_output.num_scheduled_tokens
-        assert len(scheduled) <= 1, (
-            "[Lwd] single-request batch invariant violated: seqno hole risk"
-        )
         for request_id, num_tokens in scheduled.items():
             request = self.requests.get(request_id)
             if request is None:
@@ -220,7 +210,7 @@ class LwdEdgeScheduler(AsyncScheduler):
         self,
         request_id: str,
         num_prompt_tokens: int,
-        max_tokens: int = 16,
+        sampling_params: SamplingParams | None = None,
         block_hashes: list[bytes] | None = None,
     ) -> None:
         """发 LwdRequestNotify(请求元数据预告)。
@@ -229,20 +219,40 @@ class LwdEdgeScheduler(AsyncScheduler):
         prompt token 是占位零值,本地算不出真实内容哈希,前缀缓存
         命中只能靠这条链;缺省空链 = 不提供,云侧回退占位链。
 
+        sampling_params 只透传影响云侧 token 选择的字段(采样核/惩罚/
+        EOS 策略/min_tokens);stop 字符串等 detokenizer 层参数留在
+        边侧前端原生处理,不上 wire。
+
         失败语义 fail-fast:发布队满时短退避重试(瞬态背压几乎必在
         秒级窗口内腾出),耗尽即抛 RuntimeError——异常沿 add_request
         调用链回前端 error 通道,用户立即得到失败;不做无限阻塞
         重试(发布点在引擎主线程,云宕机会把整个引擎卡死在 add)。
-        此时请求未入队、云侧零残留,无需补发 abort;已入队请求的
-        云宕机由 awaiting 僵尸超时兜底。"""
+        此时请求未入队、云侧零残留,无需补发 abort。"""
         publisher = self.lwd_edge_publisher
         if publisher is None:
             return
+        sp = sampling_params
         message = LwdRequestNotify(
             request_id=request_id,
             num_prompt_tokens=num_prompt_tokens,
-            max_tokens=max_tokens,
+            max_tokens=(
+                sp.max_tokens if sp is not None and sp.max_tokens is not None else 16
+            ),
             block_hashes=block_hashes if block_hashes is not None else [],
+            temperature=sp.temperature if sp is not None else 1.0,
+            top_p=sp.top_p if sp is not None else 1.0,
+            top_k=sp.top_k if sp is not None else 0,
+            min_p=sp.min_p if sp is not None else 0.0,
+            seed=sp.seed if sp is not None else None,
+            repetition_penalty=sp.repetition_penalty if sp is not None else 1.0,
+            presence_penalty=sp.presence_penalty if sp is not None else 0.0,
+            frequency_penalty=sp.frequency_penalty if sp is not None else 0.0,
+            ignore_eos=sp.ignore_eos if sp is not None else False,
+            stop_token_ids=(
+                list(sp.stop_token_ids) if sp is not None and sp.stop_token_ids else []
+            ),
+            min_tokens=sp.min_tokens if sp is not None else 0,
+            eos_token_id=sp.eos_token_id if sp is not None else None,
         )
         for attempt in range(_LWD_ADD_RETRY_STEPS):
             if publisher.publish(message):
@@ -258,7 +268,7 @@ class LwdEdgeScheduler(AsyncScheduler):
         """发 LwdAbortNotify + 摘除 awaiting;调度器内清理走原生路径。
 
         awaiting 请求已不在调度器视野(嵌入完结时清出),原生
-        finish_requests 触不到它,须在此显式摘除,否则僵尸检查误报。"""
+        finish_requests 触不到它,须在此显式摘除,防迟到云结果被误认领。"""
         publisher = self.lwd_edge_publisher
         for request_id in request_ids:
             self._lwd_awaiting.pop(request_id, None)
@@ -270,13 +280,12 @@ class LwdEdgeScheduler(AsyncScheduler):
                 )
 
     def lwd_edge_update_progress(self, executed: dict[str, int]) -> None:
-        """步末对账实际执行量;嵌入完结即转入 awaiting。
+        """步末登记执行量;嵌入完结即转入 awaiting。
 
-        对账基准是本步排程登记而非 executed:原生 _update_after_schedule
-        在调度时已乐观推进 num_computed,步末必须回退未派发的部分——
-        预告失败时 executed 缺项即全量回退,步末后 num_computed == 本步
-        实际派发水位,下一步原生调度自然复现同一范围。executed 必须是
-        本步排程集的子集(同步执行保证)。
+        notify 恒成功前提:排程即派发即执行(同步执行),executed 与
+        本步排程集恒等,原生 _update_after_schedule 的乐观推进即真实
+        水位,无需回退对账。前提被破坏(发布队满未派发)时进度将
+        静默虚高、该 chunk 永久丢失,由发布通道不丢消息保证不发生。
 
         嵌入完结 = 边侧工作结束而非请求结束:走原生 finish_requests
         做全套簿记(移出 running/requests、释放边侧 KV、进
@@ -284,13 +293,11 @@ class LwdEdgeScheduler(AsyncScheduler):
         下发,引擎纯睡眠期滞后),同时登记 awaiting;前端未收到任何
         输出会继续等待,终结由云结果驱动(lwd_edge_deliver_tokens)。"""
         finished_ids: list[str] = []
-        for request_id in self._lwd_last_scheduled:
+        for request_id in executed:
             request = self.requests.get(request_id)
             if request is None:
-                # 本步内已终结(abort/更早完成):迟到的对账无对象
+                # 本步内已终结(abort/更早完成):迟到的登记无对象
                 continue
-            num_executed = executed.get(request_id, 0)
-            self._lwd_reconcile_progress(request, request_id, num_executed)
             if request.num_computed_tokens >= request.num_prompt_tokens:
                 finished_ids.append(request_id)
         if finished_ids:
@@ -298,7 +305,6 @@ class LwdEdgeScheduler(AsyncScheduler):
             now = time.monotonic()
             for request_id in finished_ids:
                 self._lwd_awaiting[request_id] = now
-        self._lwd_last_scheduled = {}
 
     def lwd_edge_deliver_tokens(
         self, request_id: str, token_ids: list[int], finished: bool
@@ -319,45 +325,6 @@ class LwdEdgeScheduler(AsyncScheduler):
             del self._lwd_awaiting[request_id]
         return True
 
-    def lwd_edge_zombie_check(self) -> list[str]:
-        """awaiting 僵尸检查(引擎步末调用),返回超时请求列表。
-
-        云崩溃/结果丢失导致结果永不到达时,awaiting 登记会泄漏且
-        前端永久等待。超时请求由引擎层生成 ABORT 输出终结前端;
-        出口复用 lwd_edge_abort:向云发 LwdAbortNotify(云停止该请求
-        后续 c2e 与 decode,不白算)+ 摘除 awaiting(幂等)。"""
-        now = time.monotonic()
-        zombie_ids = [
-            request_id
-            for request_id, since in self._lwd_awaiting.items()
-            if now - since > _LWD_AWAITING_TIMEOUT_S
-        ]
-        if zombie_ids:
-            self.lwd_edge_abort(zombie_ids)
-            for request_id in zombie_ids:
-                logger.warning(
-                    "[Lwd] awaiting request %s timed out after %.0fs, "
-                    "abort locally + notify cloud",
-                    request_id,
-                    _LWD_AWAITING_TIMEOUT_S,
-                )
-        return zombie_ids
-
-    def _lwd_reconcile_progress(
-        self, request, request_id: str, num_executed: int
-    ) -> None:
-        """回退本步未执行量;未派发重试(num_executed=0)即全量回退。"""
-        num_undone = self._lwd_last_scheduled.get(request_id, 0) - num_executed
-        if num_undone > 0:
-            request.num_computed_tokens -= num_undone
-            request.is_prefill_chunk = True
-            # 原生调度最后一段排程时会为"预期采样输出帧"+1 占位符;
-            # 边侧无采样,回退未完成态时须一并归零,否则重试排程再次
-            # +1,原生 running 循环按 num_tokens_with_spec - num_computed
-            # 会算出超出 prompt 的幻影 token。边侧从无输出帧在途,
-            # 归零即陈述事实。
-            request.num_output_placeholders = 0
-
     @staticmethod
     def _lwd_validate_request(request: Request) -> None:
         """模式边界校验;违规抛 ValueError,在入队之前拒绝,错误经
@@ -365,7 +332,8 @@ class LwdEdgeScheduler(AsyncScheduler):
 
         边界 = 边侧能力面:边是 embedding 属主(拒绝客户端自带
         prompt_embeds),只处理纯文本补全(拒 pooling/结构化
-        输出),prompt 非空。"""
+        输出),prompt 非空;不上 wire 的采样参数(logit_bias/
+        allowed_token_ids/logprobs)缺省即拒,不静默丢约束。"""
         if request.prompt_embeds is not None:
             raise ValueError(
                 f"[LWD] prefill-only mode does not accept client-provided "
@@ -382,8 +350,25 @@ class LwdEdgeScheduler(AsyncScheduler):
                 "[LWD] prefill-only mode does not support structured output "
                 f"(request {request.request_id})"
             )
+        sp = request.sampling_params
+        unsupported = [
+            name
+            for name, value in (
+                ("logit_bias", sp.logit_bias),
+                ("allowed_token_ids", sp.allowed_token_ids),
+                ("logprobs", sp.logprobs),
+            )
+            if value is not None
+        ]
+        if unsupported:
+            raise ValueError(
+                "[LWD] prefill-only mode does not support sampling "
+                f"param(s) {', '.join(unsupported)} "
+                f"(request {request.request_id}): not carried on the "
+                "edge->cloud wire, cloud would silently sample without them"
+            )
 
-def lwd_build_unembed_batch(notifies: list) -> SchedulerOutput:
+def lwd_build_unembed_batch(notify: LwdC2eNotify) -> SchedulerOutput:
     """组 UNEMBED 批(引擎步内调用,云载荷派发给边 worker 做 lm_head)。
 
     云结果不经过原生 schedule,无原生排程产物可用——以 make_empty
@@ -393,28 +378,31 @@ def lwd_build_unembed_batch(notifies: list) -> SchedulerOutput:
       通告携带(规划),当前占位 0;recv_num_elements
       (DOWN 通道每请求接收元素数)与 out_token_idxs(生成序号)控制面
       不可知,留空由数据面按 DOWN 张量实收推导;
-    - 请求集合同步镜像到 num_scheduled_tokens(值 1 = 单 token 位,
-      不作 token 预算解释,保持原生管道字段完整性);
-    - 触发本批的 LwdC2eNotify 全量挂 lwd_c2e_notifies 动态属性:
-      数据面据 hidden_num_elements 对齐 DOWN 张量(元数据先于张量
-      到达的预挂契约)并读 finished 完结标志。
+    - 请求集合同步镜像到 num_scheduled_tokens:值 = 该请求本步
+      hidden 行数(num_accepted_tokens 对位,spec 步可 >1),保持
+      原生管道字段语义一致,不作 token 预算解释。
     """
     scheduler_output = SchedulerOutput.make_empty()
-    req_ids = [rid for notify in notifies for rid in notify.req_ids]
-    scheduler_output.num_scheduled_tokens = {rid: 1 for rid in req_ids}
-    scheduler_output.total_num_scheduled_tokens = len(req_ids)
+    # 每请求本步还原的 token 数 = hidden 行数 = num_accepted_tokens
+    # (spec 步一请求可多行,非 spec 恒 1);与 req_ids 按位对齐,错配
+    # fail-fast
+    assert len(notify.num_accepted_tokens) == len(notify.req_ids)
+    scheduler_output.num_scheduled_tokens = dict(
+        zip(notify.req_ids, notify.num_accepted_tokens)
+    )
+    scheduler_output.total_num_scheduled_tokens = sum(
+        notify.num_accepted_tokens
+    )
     scheduler_output.lwd_batch = LwdBatch(
         batch_type=LwdBatchType.LWD_UNEMBED,
-        seqno=-1, # 需要从 c2e 通告
+        seqno=notify.down_seqno,
         batch_meta=LwdUnembedBatch(
-            req_ids=req_ids,
-            num_accept_tokens=[
-                n for notify in notifies for n in notify.num_accepted_tokens
-            ],
-            recv_num_elements=[],
+            req_ids=list(notify.req_ids),
+            num_accept_tokens=list(notify.num_accepted_tokens),
+            recv_num_elements=notify.hidden_num_elements,
             out_token_idxs=[],
-            top_id_ths=[t for notify in notifies for t in notify.top_id_ths],
+            top_id_ths=list(notify.top_id_ths),
         ),
     )
-    scheduler_output.lwd_c2e_notifies = list(notifies)
+    scheduler_output.lwd_c2e_notify = [notify]
     return scheduler_output

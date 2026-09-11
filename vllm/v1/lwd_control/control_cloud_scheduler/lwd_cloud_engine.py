@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
-from vllm.v1.engine import EngineCoreRequestType
+from vllm.v1.engine import EngineCoreRequestType, FinishReason
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
     LwdControlPublisher,
@@ -19,6 +19,7 @@ from vllm.v1.lwd_control.control_communication.lwd_control_subscriber import (
     LwdControlSubscriber,
 )
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
+    LWD_NOT_FINISHED,
     LwdAbortNotify,
     LwdC2eNotify,
     LwdHelloNotify,
@@ -137,10 +138,10 @@ class LwdCloudEngineCore(EngineCoreProc):
             seqnos = self._lwd_seqno_registry.setdefault(msg.request_id, [])
             if not seqnos or msg.seqno > seqnos[-1]:
                 seqnos.append(msg.seqno)
-            # 每条预告都点名入队(重复预告即重复点名,剔除-调度-拼回幂等,
+            # 每条预告都整条入队(重复预告即重复点名,剔除-调度-拼回幂等,
             # 无副作用;PRE_OUT 只 append,调度主线程单独 popleft,deque
-            # 单操作原子)
-            self.scheduler.prefill_notify_queue.append(msg.request_id)
+            # 单操作原子;预告自带 seqno,出批时作 UP 链配对号)
+            self.scheduler.prefill_notify_queue.append(msg)
             return
         if isinstance(msg, LwdAbortNotify):
             self._lwd_gate_pending.pop(msg.request_id, None)
@@ -164,7 +165,28 @@ class LwdCloudEngineCore(EngineCoreProc):
             logger.info("[Lwd] cloud request %s admitted via gate", request_id)
 
     def _lwd_build_request(self, wire: LwdRequestNotify) -> Request:
-        """请求构建(唯一建请求点,Request/SamplingParams 留 L3)。"""
+        """请求构建(唯一建请求点,Request/SamplingParams 留 L3)。
+
+        采样参数自边侧 LwdRequestNotify 透传(采样核/惩罚/EOS 策略/
+        min_tokens),云侧按客户端真实参数采样,不再落默认值。"""
+        sampling_params = SamplingParams(
+            max_tokens=wire.max_tokens,
+            temperature=wire.temperature,
+            top_p=wire.top_p,
+            top_k=wire.top_k,
+            min_p=wire.min_p,
+            seed=wire.seed,
+            repetition_penalty=wire.repetition_penalty,
+            presence_penalty=wire.presence_penalty,
+            frequency_penalty=wire.frequency_penalty,
+            ignore_eos=wire.ignore_eos,
+            stop_token_ids=list(wire.stop_token_ids),
+            min_tokens=wire.min_tokens,
+        )
+        # eos_token_id 非构造入参,走原生回填入口(同边侧前端
+        # input_processor):设 _eos_token_id 并计入 _all_stop_token_ids
+        # 供 min_tokens 判定;云侧无客户端 generation_config,传空。
+        sampling_params.update_from_generation_config({}, wire.eos_token_id)
         local_hasher = self.request_block_hasher
         if local_hasher is None:
             # prefix caching 未启用:请求不挂 hasher,整链机制不激活
@@ -172,7 +194,7 @@ class LwdCloudEngineCore(EngineCoreProc):
                 request_id=wire.request_id,
                 # 占位 token:云侧调度只看长度,真值由边侧提供
                 prompt_token_ids=[0] * wire.num_prompt_tokens,
-                sampling_params=SamplingParams(max_tokens=wire.max_tokens),
+                sampling_params=sampling_params,
                 pooling_params=None,
             )
         hash_block_size = resolve_kv_cache_block_sizes(
@@ -190,7 +212,7 @@ class LwdCloudEngineCore(EngineCoreProc):
         return Request(
             request_id=wire.request_id,
             prompt_token_ids=[0] * wire.num_prompt_tokens,
-            sampling_params=SamplingParams(max_tokens=wire.max_tokens),
+            sampling_params=sampling_params,
             pooling_params=None,
             block_hasher=block_hasher,
         )
@@ -201,38 +223,43 @@ class LwdCloudEngineCore(EngineCoreProc):
         engine_core_outputs: dict[int, EngineCoreOutputs],
     ) -> ModelRunnerOutput:
         """步元数据 lwd_c2e_meta 经 POST_OUT 先于隐藏张量发边;逐请求
-        finished 标志取自本步 engine_core_outputs 的 finish_reason(原生
-        停止条件即云侧 decode 终结的事实源),其余原样透传。"""
+        finish_reasons 完成码取自本步 engine_core_outputs 的 finish_reason
+        (原生停止条件即云侧 decode 终结的事实源),其余原样透传。"""
         meta = model_output.lwd_c2e_meta
         if meta is not None:
-            self._lwd_publish_c2e(meta, self._lwd_c2e_finished(meta, engine_core_outputs))
+            self._lwd_publish_c2e(
+                meta, self._lwd_c2e_finish_reasons(meta, engine_core_outputs)
+            )
         return model_output
 
     @staticmethod
-    def _lwd_c2e_finished(
+    def _lwd_c2e_finish_reasons(
         meta: LwdC2eMeta,
         engine_core_outputs: dict[int, EngineCoreOutputs],
-    ) -> list[bool]:
-        """req_ids 对齐的逐请求完成标志:本步任一 EngineCoreOutputs 里
-        finish_reason 非空或进入 finished_requests 即完成;缺位按未完成
-        (边侧保持 awaiting,由后续步通告或僵尸兜底收口)。"""
-        finished_ids: set[str] = set()
+    ) -> list[int]:
+        """req_ids 对齐的逐请求完成码:本步任一 EngineCoreOutputs 里带
+        finish_reason 的输出取其码;仅进 finished_requests 的缺口按 ABORT
+        兜底;其余 LWD_NOT_FINISHED(边侧保持 awaiting,由后续步通告收口)。"""
+        reasons: dict[str, int] = {}
         for outputs in engine_core_outputs.values():
-            finished_ids.update(outputs.finished_requests or ())
             for out in outputs.outputs:
                 if out.finish_reason is not None:
-                    finished_ids.add(out.request_id)
-        return [request_id in finished_ids for request_id in meta.req_ids]
+                    reasons.setdefault(out.request_id, int(out.finish_reason))
+            for request_id in outputs.finished_requests or ():
+                reasons.setdefault(request_id, int(FinishReason.ABORT))
+        return [reasons.get(request_id, LWD_NOT_FINISHED)
+                for request_id in meta.req_ids]
 
-    def _lwd_publish_c2e(self, meta: LwdC2eMeta, finished: list[bool]) -> None:
-        """步元数据(含逐请求 finished 标志)发边:队满小睡重试(元数据
-        不可丢),关停(closed)退出。"""
+    def _lwd_publish_c2e(self, meta: LwdC2eMeta, finish_reasons: list[int]) -> None:
+        """步元数据(含逐请求 finish_reasons 完成码)发边:队满小睡重试
+        (元数据不可丢),关停(closed)退出。"""
         notify = LwdC2eNotify(
             hidden_num_elements=meta.hidden_num_elements,
             top_id_ths=meta.top_id_ths,
             num_accepted_tokens=meta.num_accepted_tokens,
             req_ids=meta.req_ids,
-            finished=finished,
+            finish_reasons=finish_reasons,
+            down_seqno=meta.down_seqno,
         )
         while not self._lwd_post_out.closed:
             if self._lwd_post_out.publish(notify):
