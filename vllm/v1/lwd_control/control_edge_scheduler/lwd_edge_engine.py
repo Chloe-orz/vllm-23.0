@@ -16,7 +16,7 @@
 
 步进编排:步首消费云载荷(c2e -> UNEMBED 批 -> token 交付/请求终结)
 + prefill 编排(单请求组批 -> 范围预告 -> 原生 executor 同步执行 ->
-步末对账)。
+步末完结登记)。
 """
 
 from __future__ import annotations
@@ -194,7 +194,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
         return self._lwd_edge_step()
 
     def _lwd_edge_step(self) -> tuple[dict[int, object] | None, bool]:
-        """单步编排:云载荷消费 -> prefill 编排 -> 步末对账;
+        """单步编排:云载荷消费 -> prefill 编排 -> 步末完结登记;
         返回 (云侧结果输出 | None, prefill 是否有工作)。"""
         outputs, finished_reqs = self._lwd_edge_consume_c2e()
         executed: dict[str, int] = {}
@@ -368,8 +368,9 @@ class LwdEdgeEngineCore(EngineCoreProc):
     def _lwd_edge_dispatch(self, scheduler_output) -> dict[str, int]:
         """范围预告 + 原生 executor 同步提交,返回每请求执行 token 数。
 
-        预告失败(发布队列满)本步不派发,返回空执行量,调度器步末
-        回退乐观推进量,下一步重试同一范围。"""
+        预告失败(发布队列满)本步不派发,返回空执行量;调度器按
+        预告恒成功前提工作,不再回退乐观推进量(进度虚高即数据
+        丢失,由发布通道不丢消息保证)。"""
         if not self.scheduler.lwd_edge_notify(scheduler_output):
             return {}
         self.model_executor.execute_model(scheduler_output).result()

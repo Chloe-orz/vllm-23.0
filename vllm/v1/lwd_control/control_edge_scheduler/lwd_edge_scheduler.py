@@ -70,7 +70,6 @@ class LwdEdgeScheduler(AsyncScheduler):
         super().__init__(*args, **kwargs)
         self.lwd_edge_publisher = publisher
         self._lwd_seqno = 0
-        self._lwd_last_scheduled: dict[str, int] = {}
         # 前缀缓存:manager 级关命中,配置级保留使能。两级拆分的原因:
         # - 必须关命中:命中会跳过 token 排程,首条 RangeNotify 的
         #   offset != 0,云侧按 offset==0 识别首块的约定失效;且被
@@ -87,14 +86,11 @@ class LwdEdgeScheduler(AsyncScheduler):
         self._lwd_awaiting: dict[str, float] = {}
 
     def schedule(self) -> SchedulerOutput:
-        """单请求组批 + 原生分块决策;记录本步调度量供步末对账。
+        """单请求组批 + 原生分块决策。
 
         EMBED 批的 LwdBatch(seqno/token 片段)由 lwd_edge_notify 在
-        发布成功后挂批——seqno 必须与发布成功绑定,发布失败整步
-        回退时批随 SchedulerOutput 一并废弃。"""
-        scheduler_output = self._lwd_schedule_single()
-        self._lwd_last_scheduled = dict(scheduler_output.num_scheduled_tokens)
-        return scheduler_output
+        发布成功后挂批——seqno 必须与发布成功绑定。"""
+        return self._lwd_schedule_single()
 
     def _lwd_schedule_single(self) -> SchedulerOutput:
         """单请求组批:容器交换让原生 schedule() 只见到一个工作单元。
@@ -160,16 +156,16 @@ class LwdEdgeScheduler(AsyncScheduler):
         seqno 无空洞契约:UP 数据通道按连续号序配对(通道层对超前号
         扣留等待,一个空洞即永久挂死整条链),因此号只能分配给真正
         上 wire 的块:
-        - peek-then-advance:发布成功才进位计数器,队满回退时号未
-          消耗,重试复用同一号;
+        - peek-then-advance:发布成功才进位计数器;
         - 单 notify 前提:本方法每步至多发一条,依赖单请求组批
           约束。若放开多请求组批,部分成功的 notify 已上 wire 而
-          整步回退不发张量,会同时产生号空洞与张量失配,届时必须
-          改为按已成功子集执行。
+          整步不派发,会同时产生号空洞与张量失配,届时必须改为按
+          已成功子集执行。
 
-        发布队满返回 False:调用方本步不派发,下一步原生调度自然
-        复现同一范围重试;重复预告在云侧按 (request_id, offset)
-        幂等登记。"""
+        前提:控制面发布通道不丢消息,publish 恒成功——步末回退
+        对账已按此前提移除。若前提被破坏返回 False,调用方本步不
+        派发但进度不回退,该 chunk 永久丢失;重复预告在云侧按
+        (request_id, offset) 幂等登记。"""
         publisher = self.lwd_edge_publisher
         scheduled = scheduler_output.num_scheduled_tokens
         for request_id, num_tokens in scheduled.items():
@@ -279,13 +275,12 @@ class LwdEdgeScheduler(AsyncScheduler):
                 )
 
     def lwd_edge_update_progress(self, executed: dict[str, int]) -> None:
-        """步末对账实际执行量;嵌入完结即转入 awaiting。
+        """步末登记执行量;嵌入完结即转入 awaiting。
 
-        对账基准是本步排程登记而非 executed:原生 _update_after_schedule
-        在调度时已乐观推进 num_computed,步末必须回退未派发的部分——
-        预告失败时 executed 缺项即全量回退,步末后 num_computed == 本步
-        实际派发水位,下一步原生调度自然复现同一范围。executed 必须是
-        本步排程集的子集(同步执行保证)。
+        notify 恒成功前提:排程即派发即执行(同步执行),executed 与
+        本步排程集恒等,原生 _update_after_schedule 的乐观推进即真实
+        水位,无需回退对账。前提被破坏(发布队满未派发)时进度将
+        静默虚高、该 chunk 永久丢失,由发布通道不丢消息保证不发生。
 
         嵌入完结 = 边侧工作结束而非请求结束:走原生 finish_requests
         做全套簿记(移出 running/requests、释放边侧 KV、进
@@ -293,13 +288,11 @@ class LwdEdgeScheduler(AsyncScheduler):
         下发,引擎纯睡眠期滞后),同时登记 awaiting;前端未收到任何
         输出会继续等待,终结由云结果驱动(lwd_edge_deliver_tokens)。"""
         finished_ids: list[str] = []
-        for request_id in self._lwd_last_scheduled:
+        for request_id in executed:
             request = self.requests.get(request_id)
             if request is None:
-                # 本步内已终结(abort/更早完成):迟到的对账无对象
+                # 本步内已终结(abort/更早完成):迟到的登记无对象
                 continue
-            num_executed = executed.get(request_id, 0)
-            self._lwd_reconcile_progress(request, request_id, num_executed)
             if request.num_computed_tokens >= request.num_prompt_tokens:
                 finished_ids.append(request_id)
         if finished_ids:
@@ -307,7 +300,6 @@ class LwdEdgeScheduler(AsyncScheduler):
             now = time.monotonic()
             for request_id in finished_ids:
                 self._lwd_awaiting[request_id] = now
-        self._lwd_last_scheduled = {}
 
     def lwd_edge_deliver_tokens(
         self, request_id: str, token_ids: list[int], finished: bool
@@ -327,21 +319,6 @@ class LwdEdgeScheduler(AsyncScheduler):
         if finished:
             del self._lwd_awaiting[request_id]
         return True
-
-    def _lwd_reconcile_progress(
-        self, request, request_id: str, num_executed: int
-    ) -> None:
-        """回退本步未执行量;未派发重试(num_executed=0)即全量回退。"""
-        num_undone = self._lwd_last_scheduled.get(request_id, 0) - num_executed
-        if num_undone > 0:
-            request.num_computed_tokens -= num_undone
-            request.is_prefill_chunk = True
-            # 原生调度最后一段排程时会为"预期采样输出帧"+1 占位符;
-            # 边侧无采样,回退未完成态时须一并归零,否则重试排程再次
-            # +1,原生 running 循环按 num_tokens_with_spec - num_computed
-            # 会算出超出 prompt 的幻影 token。边侧从无输出帧在途,
-            # 归零即陈述事实。
-            request.num_output_placeholders = 0
 
     @staticmethod
     def _lwd_validate_request(request: Request) -> None:
