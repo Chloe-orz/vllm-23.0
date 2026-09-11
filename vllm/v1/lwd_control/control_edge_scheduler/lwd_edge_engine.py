@@ -250,6 +250,35 @@ class LwdEdgeEngineCore(EngineCoreProc):
             self._lwd_deliver_notify(notify, outputs, finished_reqs)
         return outputs, finished_reqs
 
+    def _lwd_deliver_finish(
+        self, notify: LwdC2eNotify, outputs: list, finished_reqs: set,
+    ) -> None:
+        """完结通告的本地终结流程:不下发 worker,逐请求以云侧完成码
+        空输出终结(原样透传);迟到载荷幂等丢弃;违约携带 hidden 行
+        丢弃并告警。同步/异步提交阶段共用。"""
+        if notify.hidden_num_elements > 0:
+            logger.warning(
+                "[Lwd] finish-marked notify carries hidden rows, "
+                "rows dropped (cloud protocol violation)"
+            )
+        for index, request_id in enumerate(notify.req_ids):
+            if not self.scheduler.lwd_edge_deliver_tokens(
+                request_id, [], finished=True
+            ):
+                logger.warning(
+                    "[Lwd] drop stale cloud payload for %s (not awaiting)",
+                    request_id,
+                )
+                continue
+            outputs.append(
+                EngineCoreOutput(
+                    request_id,
+                    [],
+                    finish_reason=self._lwd_finish_code(notify, index),
+                )
+            )
+            finished_reqs.add(request_id)
+
     def _lwd_deliver_notify(
         self, notify: LwdC2eNotify, outputs: list, finished_reqs: set,
     ) -> None:
@@ -273,28 +302,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
         if notify.req_ids and all(
             code != LWD_NOT_FINISHED for code in notify.finish_reasons
         ):
-            if notify.hidden_num_elements > 0:
-                logger.warning(
-                    "[Lwd] finish-marked notify carries hidden rows, "
-                    "rows dropped (cloud protocol violation)"
-                )
-            for index, request_id in enumerate(notify.req_ids):
-                if not self.scheduler.lwd_edge_deliver_tokens(
-                    request_id, [], finished=True
-                ):
-                    logger.warning(
-                        "[Lwd] drop stale cloud payload for %s (not awaiting)",
-                        request_id,
-                    )
-                    continue
-                outputs.append(
-                    EngineCoreOutput(
-                        request_id,
-                        [],
-                        finish_reason=self._lwd_finish_code(notify, index),
-                    )
-                )
-                finished_reqs.add(request_id)
+            self._lwd_deliver_finish(notify, outputs, finished_reqs)
             return
 
         # ---- 未完结:下发 worker 处理 ----
