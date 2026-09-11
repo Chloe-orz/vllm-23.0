@@ -26,7 +26,6 @@ import time
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
-from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import (
     LwdBatch,
     LwdBatchType,
@@ -34,12 +33,14 @@ from vllm.v1.core.sched.output import (
     LwdUnembedBatch,
     SchedulerOutput,
 )
-from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LwdAbortNotify,
     LwdC2eNotify,
     LwdRangeNotify,
     LwdRequestNotify,
+)
+from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
+    LwdBaseScheduler,
 )
 from vllm.v1.request import RequestStatus
 
@@ -57,7 +58,7 @@ _LWD_ADD_RETRY_STEPS = 5
 _LWD_ADD_RETRY_INTERVAL_S = 0.2
 
 
-class LwdEdgeScheduler(AsyncScheduler):
+class LwdEdgeScheduler(LwdBaseScheduler):
     """纯 prefill 调度语义 + 控制面出口(notify/abort/seqno)。"""
 
     def __init__(
@@ -92,54 +93,28 @@ class LwdEdgeScheduler(AsyncScheduler):
         发布成功后挂批——seqno 必须与发布成功绑定。"""
         return self._lwd_schedule_single()
 
-    def _lwd_schedule_single(self) -> SchedulerOutput:
-        """单请求组批:容器交换让原生 schedule() 只见到一个工作单元。
-
-        可见集只放一个 prefill 工作单元——running 中第一个 prefill
-        优先(first_running_prefill,暂离其余进行中 prefill 与全部
-        waiting),否则只放行 waiting 队首;原生 schedule() 结构上
-        见不到第二个请求,批无法跨请求,单请求内的 chunked 决策
-        (预算截断/KV 抢占)照旧。暂离的 waiting 走队首回插
-        (含被抢占回插者),暂离的 prefill 接回 running 尾部,均保 FIFO。
-        """
-        first_running_prefill = next(
+    def _lwd_pick_prefill_req_id(self) -> str | None:
+        """选下一步 embed 工作单元:running 中第一个未发完的 prefill
+        优先(断点续传,先收尾再开新),否则 waiting 队首(FCFS 到达序);
+        两处皆无返回 None。"""
+        running_prefill = next(
             (r for r in self.running if r.num_computed_tokens < r.num_prompt_tokens),
             None,
         )
-        parked_waiting = self.waiting
-        self.waiting = create_request_queue(self.policy)
-        parked_prefills: list = []
-        if first_running_prefill is not None:
-            parked_prefills = [
-                r
-                for r in self.running
-                if r is not first_running_prefill
-                and r.num_computed_tokens < r.num_prompt_tokens
-            ]
-            if parked_prefills:
-                self.running = [
-                    r
-                    for r in self.running
-                    if r is first_running_prefill
-                    or r.num_computed_tokens >= r.num_prompt_tokens
-                ]
-        elif parked_waiting:
-            # 必须用 pop(移动语义):peek 会在 parked_waiting 里留一份
-            # 副本,原生 schedule 消费掉可见集那份后,副本仍留在原队列;
-            # 请求嵌入完结被 finish 后,这份陈旧副本会在下一次调度时把
-            # FINISHED 请求重新带回可见集(差值 0 撞 num_new_tokens 断言)。
-            # 未被消费的请求由 finally 的 leftover 回插兜底,不丢。
-            self.waiting.add_request(parked_waiting.pop_request())
+        if running_prefill is not None:
+            return running_prefill.request_id
+        return self.waiting.peek_request().request_id if self.waiting else None
 
-        try:
-            return super().schedule()
-        finally:
-            leftover = self.waiting
-            self.waiting = parked_waiting
-            while leftover:
-                self.waiting.prepend_request(leftover.pop_request())
-            if parked_prefills:
-                self.running = self.running + parked_prefills
+    def _lwd_schedule_single(self) -> SchedulerOutput:
+        """单请求组批:picker 选一个工作单元,经基类可见集机制单独调度。
+
+        选择规则见 _lwd_pick_prefill_req_id;队列剔除/隔离/拼回复用基类
+        _lwd_schedule_for_visible_reqs(waiting/skipped 来源走原生准入
+        窗口,running 来源走续跑)。语义注记:与旧手写容器交换不同,
+        本步被抢占的请求回 waiting 尾部、被跳过的回 skipped 队首,均取
+        基类统一语义,不再做队首回插。"""
+        req_id = self._lwd_pick_prefill_req_id()
+        return self._lwd_schedule_for_visible_reqs([req_id] if req_id else [])
 
     def lwd_edge_add_request(self, request: Request) -> None:
         """请求入口:边界校验 -> 云预告 -> 本地入队。
