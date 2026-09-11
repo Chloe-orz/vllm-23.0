@@ -1836,7 +1836,7 @@ class EngineArgs:
             "nnodes > 1 is only supported with data_parallel_backend=mp"
         )
         inferred_data_parallel_rank = 0
-        if self.nnodes > 1:
+        if self.nnodes > 1 and False: # pp rank后续删除
             world_size = (
                 self.data_parallel_size
                 * self.pipeline_parallel_size
