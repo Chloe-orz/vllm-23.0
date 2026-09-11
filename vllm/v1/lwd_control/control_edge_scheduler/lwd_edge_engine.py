@@ -245,8 +245,8 @@ class LwdEdgeEngineCore(EngineCoreProc):
         req_ids 构造上严格对齐(云侧逐位推导),错配即 IndexError
         fail-fast,无缺省兜底。
 
-        应答契约:worker 经原生 future 返回 ModelRunnerResult 形态,
-        token ids 取 lwd_token_ids(request_id -> list[int]);缺失/为空
+        应答契约:worker 经原生 future 返回 ModelRunnerOutput 形态,
+        token ids 按 req_ids x sampled_token_ids 按位对齐还原;缺席/为空
         即该请求 unembed 失败,以 FinishReason.ERROR 终结(原生 ERROR
         通道转 5xx),不静默降级为空 STOP 输出。迟到载荷(请求不在
         awaiting)丢弃告警,幂等不复活;UNEMBED 批与 prefill 排程在
@@ -315,9 +315,10 @@ class LwdEdgeEngineCore(EngineCoreProc):
 
         finish_reasons 与 req_ids 逐位严格对齐(云侧逐位推导),错配
         IndexError fail-fast,无缺省兜底;迟到载荷(请求不在 awaiting)
-        幂等丢弃。应答契约:token ids 取 ModelRunnerOutput.lwd_token_ids,
-        缺失/为空 = unembed 失败,ERROR 优先于云侧完成码,不静默降级
-        为空输出。"""
+        幂等丢弃。应答契约:token ids 按 ModelRunnerOutput 的 req_ids x
+        sampled_token_ids 按位对齐还原(批的 req_ids 原样下发、worker
+        逐位回填),缺席/为空 = unembed 失败,ERROR 优先于云侧完成码,
+        不静默降级为空输出。"""
 
         # ---- 无 hidden 行:纯终结通告,不下发 worker,本地终结 ----
         if not notify.req_ids or notify.hidden_num_elements <= 0:
@@ -357,16 +358,15 @@ class LwdEdgeEngineCore(EngineCoreProc):
     ) -> None:
         """UNEMBED 批收割侧:等 worker 应答取 token_map,逐请求交付
         token。不感知提交时机,只消费 (notify, future)。应答契约:
-        token ids 取 lwd_token_ids,缺失/为空 = unembed 失败,ERROR
-        优先于云侧完成码;迟到载荷幂等丢弃。"""
+        token ids 按 ModelRunnerOutput 的 req_ids x sampled_token_ids
+        按位对齐还原(批的 req_ids 原样下发,worker 逐位回填);请求
+        缺席或行无 token = unembed 失败,ERROR 优先于云侧完成码;
+        迟到载荷幂等丢弃。"""
         result = future.result()
-        token_map = getattr(result, "lwd_token_ids", None)
-        if token_map is None:
-            logger.warning(
-                "[Lwd] unembed batch answer missing lwd_token_ids (%r), "
-                "finishing requests with ERROR",
-                type(result),
-            )
+        token_map: dict[str, list[int]] = (
+            {} if result is None
+            else dict(zip(result.req_ids, result.sampled_token_ids))
+        )
         for index, request_id in enumerate(notify.req_ids):
             finish_reason = self._lwd_finish_code(notify, index)
             finished = finish_reason is not None
