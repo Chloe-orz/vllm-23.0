@@ -28,6 +28,9 @@ from vllm.v1.lwd_control.control_communication.lwd_notify import (
     lwd_encode_cloud_notify,
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import LwdConfig
+from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_phase_scheduler import (
+    LwdCloudPhaseScheduler,
+)
 from vllm.v1.request import Request
 
 if TYPE_CHECKING:
@@ -45,6 +48,16 @@ _LWD_C2E_SEND_RETRY_SLEEP_S = 0.05
 
 class LwdCloudEngineCore(EngineCoreProc):
     """云 PO 引擎:覆写 socket IO 线程入口,其余全走原生。"""
+
+    def __init__(self, *args, **kwargs) -> None:
+        # 调度器自注入须赶在 super() 之前(与边侧 LwdEdgeEngineCore 同款):
+        # super 构建 self.scheduler 时一次性消费 scheduler_cls,后设无效。
+        # 依赖 lwd_serve_guard 注入不可靠——guard 只在 headless serve 入口
+        # 执行,完整 serve 路径的 EngineCore 子进程不经 guard,缺注入会让
+        # IO 线程把 RangeNotify 写进裸 AsyncScheduler 而崩溃。
+        vllm_config = kwargs["vllm_config"]
+        vllm_config.scheduler_config.scheduler_cls = LwdCloudPhaseScheduler
+        super().__init__(*args, **kwargs)
 
     def _lwd_setup_zmq(self) -> None:
         """介入 ZMQ 双面:PRE_OUT bind 收边;POST_OUT connect 边,承载首拍
