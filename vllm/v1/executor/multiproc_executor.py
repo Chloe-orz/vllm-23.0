@@ -115,12 +115,13 @@ class MultiprocExecutor(Executor):
         self.failure_callback: FailureCallback | None = None
 
         tp_size, pp_size, pcp_size = self._get_parallel_sizes()
-        assert self.world_size == tp_size * pp_size * pcp_size, (
-            f"world_size ({self.world_size}) must be equal to the "
-            f"tensor_parallel_size ({tp_size}) x pipeline"
-            f"_parallel_size ({pp_size}) x prefill_context"
-            f"_parallel_size ({pcp_size}). "
-        )
+        if not self.parallel_config.lwd_config.enable_lwd:
+            assert self.world_size == tp_size * pp_size * pcp_size, (
+                f"world_size ({self.world_size}) must be equal to the "
+                f"tensor_parallel_size ({tp_size}) x pipeline"
+                f"_parallel_size ({pp_size}) x prefill_context"
+                f"_parallel_size ({pcp_size}). "
+            )
 
         set_multiprocessing_worker_envs()
 
@@ -161,9 +162,16 @@ class MultiprocExecutor(Executor):
         unready_workers: list[UnreadyWorkerProcHandle] = []
         success = False
         try:
-            global_start_rank = (
-                self.local_world_size * self.parallel_config.node_rank_within_dp
-            )
+            if self.parallel_config.lwd_config.enable_lwd:
+                global_start_rank = (
+                    0
+                    if self.parallel_config.lwd_config.is_edge_node
+                    else self.parallel_config.lwd_config.edge_npu_count
+                )
+            else:
+                global_start_rank = (
+                    self.local_world_size * self.parallel_config.node_rank_within_dp
+                )
             # When using fork, keep track of socket file descriptors that are
             # inherited by the worker, so that we can close them in subsequent
             # workers
@@ -248,11 +256,12 @@ class MultiprocExecutor(Executor):
 
     def _get_parallel_sizes(self) -> tuple[int, int, int]:
         self.world_size = self.parallel_config.world_size
-        assert self.world_size % self.parallel_config.nnodes_within_dp == 0, (
-            f"global world_size ({self.parallel_config.world_size}) must be "
-            f"divisible by nnodes_within_dp "
-            f"({self.parallel_config.nnodes_within_dp}). "
-        )
+        if not self.parallel_config.lwd_config.enable_lwd:
+            assert self.world_size % self.parallel_config.nnodes_within_dp == 0, (
+                f"global world_size ({self.parallel_config.world_size}) must be "
+                f"divisible by nnodes_within_dp "
+                f"({self.parallel_config.nnodes_within_dp}). "
+            )
         self.local_world_size = self.parallel_config.local_world_size
         tp_size = self.parallel_config.tensor_parallel_size
         pp_size = self.parallel_config.pipeline_parallel_size

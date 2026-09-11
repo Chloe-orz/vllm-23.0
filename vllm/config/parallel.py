@@ -708,6 +708,15 @@ class ParallelConfig:
 
     @property
     def local_world_size(self) -> int:
+        if self.lwd_config.enable_lwd:
+            # LWD edge-cloud: each side spawns its own NPU count; the
+            # world_size // nnodes_within_dp division does not apply to the
+            # asymmetric edge/cloud topology.
+            return (
+                self.lwd_config.edge_npu_count
+                if self.lwd_config.is_edge_node
+                else self.lwd_config.cloud_npu_count
+            )
         return self.world_size // self.nnodes_within_dp
 
     @staticmethod
