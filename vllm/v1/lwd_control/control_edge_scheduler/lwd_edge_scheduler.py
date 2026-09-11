@@ -124,7 +124,12 @@ class LwdEdgeScheduler(AsyncScheduler):
                     or r.num_computed_tokens >= r.num_prompt_tokens
                 ]
         elif parked_waiting:
-            self.waiting.add_request(parked_waiting.peek_request())
+            # 必须用 pop(移动语义):peek 会在 parked_waiting 里留一份
+            # 副本,原生 schedule 消费掉可见集那份后,副本仍留在原队列;
+            # 请求嵌入完结被 finish 后,这份陈旧副本会在下一次调度时把
+            # FINISHED 请求重新带回可见集(差值 0 撞 num_new_tokens 断言)。
+            # 未被消费的请求由 finally 的 leftover 回插兜底,不丢。
+            self.waiting.add_request(parked_waiting.pop_request())
 
         try:
             return super().schedule()
