@@ -348,6 +348,24 @@ direct_register_custom_op(
 )
 
 
+def _is_lwd_full_head_tail() -> bool:
+    """Whether LWD (layerwise disaggregated) mode is enabled.
+
+    In prefill_only LWD both the edge and cloud sides build the full head
+    (``embed_tokens``) and tail (``norm`` / ``lm_head``), so the PP
+    first/last-rank split must be neutralized: both sides act as first AND
+    last rank on the PP group.
+    """
+    try:
+        from vllm.config import get_current_vllm_config_or_none
+
+        cfg = get_current_vllm_config_or_none()
+        lwd = getattr(cfg, "lwd_config", None) if cfg is not None else None
+        return bool(lwd is not None and lwd.enabled)
+    except Exception:
+        return False
+
+
 class GroupCoordinator:
     """
     PyTorch ProcessGroup wrapper for a group of processes.
@@ -538,12 +556,26 @@ class GroupCoordinator:
 
     @property
     def is_first_rank(self):
-        """Return whether the caller is the first process in the group"""
+        """Return whether the caller is the first process in the group.
+
+        LWD prefill_only neutralizes the PP split on the PP group only:
+        both sides act as first rank so each builds the full
+        ``embed_tokens`` head.
+        """
+        if _is_lwd_full_head_tail() and self is _PP:
+            return True
         return self.rank == self.first_rank
 
     @property
     def is_last_rank(self):
-        """Return whether the caller is the last process in the group"""
+        """Return whether the caller is the last process in the group.
+
+        LWD prefill_only neutralizes the PP split on the PP group only:
+        both sides act as last rank so each builds the full ``norm`` /
+        ``lm_head`` tail.
+        """
+        if _is_lwd_full_head_tail() and self is _PP:
+            return True
         return self.rank == self.last_rank
 
     @property

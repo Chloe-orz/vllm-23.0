@@ -47,10 +47,9 @@ class LwdUnembedBatch:
 
     req_ids: list[str] = field(default_factory=list)
     num_accept_tokens: list[int] = field(default_factory=list)  # per request: accepted count (<= K)
-    recv_num_elements: list[int] = field(default_factory=list)  # per request: total DOWN receive size = 32 + R*(H+2) elements (R speculative rows)
+    recv_num_elements: int = 0  # total DOWN hidden elements for the whole batch = rows_total * hidden_size
     out_token_idxs: list[list[int]] = field(default_factory=list)  # per request: generation ordinal of each token (order-preserving emit)
     top_id_ths: list[list[int]] = field(default_factory=list)  # per request: received Nth most probable token index (position in descending logits)
-    #TODO:  recv_num_elements is a list or int
 
 
 @dataclass
