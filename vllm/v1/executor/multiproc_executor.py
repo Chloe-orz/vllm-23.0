@@ -213,10 +213,12 @@ class MultiprocExecutor(Executor):
                 self.start_worker_monitor()
 
             self.response_mqs = []
-            # Only leader node have remote response mqs
-            if self.parallel_config.node_rank_within_dp == 0 and (
-                not self.parallel_config.lwd_config.enable_lwd
-                or self.parallel_config.lwd_config.is_edge_node
+            # Only leader node have remote response mqs. LWD: both sides run
+            # their own engine and collect their LOCAL workers' replies;
+            # remote (cross-side) ranks are skipped — their outputs return
+            # via the lwd duplex channels instead.
+            if self.parallel_config.node_rank_within_dp == 0 or (
+                self.parallel_config.lwd_config.enable_lwd
             ):
                 for rank in range(self.world_size):
                     local_idx = rank - global_start_rank
@@ -232,8 +234,6 @@ class MultiprocExecutor(Executor):
                         ]
                         assert remote_message_queue is not None
                         self.response_mqs.append(remote_message_queue)
-                    # LWD: remote (cloud) ranks have no response mq; their
-                    # outputs return via the lwd duplex channels instead.
 
             # Ensure message queues are ready. Will deadlock if re-ordered
             # Must be kept consistent with the WorkerProc.
