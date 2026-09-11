@@ -207,7 +207,12 @@ class LwdEdgeEngineCore(EngineCoreProc):
         executed: dict[str, int] = {}
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
-            executed = self._lwd_edge_dispatch(scheduler_output)
+            future = self._lwd_dispatch_embed(scheduler_output)
+            if future is not None:
+                # 同步路径 = 提交后立即收割;调度量即执行量,
+                # 数据面异步化后由此改报实际量
+                future.result()
+                executed = dict(scheduler_output.num_scheduled_tokens)
             self._lwd_log.phase("edge step: %d reqs executed", len(executed))
         self.scheduler.lwd_edge_update_progress(executed)
         if outputs:
@@ -319,6 +324,20 @@ class LwdEdgeEngineCore(EngineCoreProc):
         future = self._lwd_dispatch_unembed(notify)
         self._lwd_deliver_unembed(notify, future, outputs, finished_reqs)
 
+    def _lwd_dispatch_embed(self, scheduler_output):
+        """EMBED 批提交侧(唯一提交点,同步/异步共用):范围预告(发布
+        成功才组批挂 lwd_batch)后以 non_block 提交,返回 future;
+        发布失败返回 None,本轮不再提交。
+
+        正确性前提:发布通道不丢消息。失败分支无回退可施——进度
+        已按排程乐观推进,该 chunk 随 SO 废弃即永久丢失(进度虚高),
+        正确性由通道不丢保证;同步/异步失败语义镜像(均为弃批)。"""
+        if not self.scheduler.lwd_edge_notify(scheduler_output):
+            return None
+        return self.model_executor.execute_model(
+            scheduler_output, non_block=True
+        )
+
     def _lwd_dispatch_unembed(self, notify: LwdC2eNotify):
         """UNEMBED 批提交侧:组批并以 non_block 提交 worker,立即返回
         future(不等执行)。同步路径提交后立即收割;异步路径
@@ -379,18 +398,6 @@ class LwdEdgeEngineCore(EngineCoreProc):
         与 req_ids 按位严格对齐,错配 IndexError fail-fast。"""
         code = notify.finish_reasons[index]
         return None if code == LWD_NOT_FINISHED else FinishReason(code)
-
-    def _lwd_edge_dispatch(self, scheduler_output) -> dict[str, int]:
-        """范围预告 + 原生 executor 同步提交,返回每请求执行 token 数。
-
-        预告失败(发布队列满)本步不派发,返回空执行量;调度器按
-        预告恒成功前提工作,不再回退乐观推进量(进度虚高即数据
-        丢失,由发布通道不丢消息保证)。"""
-        if not self.scheduler.lwd_edge_notify(scheduler_output):
-            return {}
-        self.model_executor.execute_model(scheduler_output).result()
-        # 同步执行:调度量即执行量;数据面异步化后由此改报实际量
-        return dict(scheduler_output.num_scheduled_tokens)
 
     def shutdown(self) -> None:
         """两面关停后走原生;初始化失败路径两面可能未建,容忍缺省。"""
