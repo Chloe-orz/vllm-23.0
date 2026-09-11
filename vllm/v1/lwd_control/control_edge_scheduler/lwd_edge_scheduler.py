@@ -95,42 +95,46 @@ class LwdEdgeScheduler(AsyncScheduler):
     def _lwd_schedule_single(self) -> SchedulerOutput:
         """单请求组批:容器交换让原生 schedule() 只见到一个工作单元。
 
-        可见集只放一个 prefill 工作单元——running 尾巴优先(藏其余
-        尾巴与全部 waiting),否则只放行 waiting 队首;原生 schedule()
-        结构上见不到第二个请求,批无法跨请求,单请求内的 chunked
-        决策(预算截断/KV 抢占)照旧。藏起的 waiting 走队首回插
-        (含被抢占回插者),藏起的尾巴接回 running 尾部,均保 FIFO。
+        可见集只放一个 prefill 工作单元——running 中第一个 prefill
+        优先(first_running_prefill,暂离其余进行中 prefill 与全部
+        waiting),否则只放行 waiting 队首;原生 schedule() 结构上
+        见不到第二个请求,批无法跨请求,单请求内的 chunked 决策
+        (预算截断/KV 抢占)照旧。暂离的 waiting 走队首回插
+        (含被抢占回插者),暂离的 prefill 接回 running 尾部,均保 FIFO。
         """
-        tail = next(
+        first_running_prefill = next(
             (r for r in self.running if r.num_computed_tokens < r.num_prompt_tokens),
             None,
         )
-        hidden_waiting = self.waiting
+        parked_waiting = self.waiting
         self.waiting = create_request_queue(self.policy)
-        hidden_tails: list = []
-        if tail is not None:
-            hidden_tails = [
+        parked_prefills: list = []
+        if first_running_prefill is not None:
+            parked_prefills = [
                 r
                 for r in self.running
-                if r is not tail and r.num_computed_tokens < r.num_prompt_tokens
+                if r is not first_running_prefill
+                and r.num_computed_tokens < r.num_prompt_tokens
             ]
-            if hidden_tails:
+            if parked_prefills:
                 self.running = [
                     r
                     for r in self.running
-                    if r is tail or r.num_computed_tokens >= r.num_prompt_tokens
+                    if r is first_running_prefill
+                    or r.num_computed_tokens >= r.num_prompt_tokens
                 ]
-        elif hidden_waiting:
-            self.waiting.add_request(hidden_waiting.peek_request())
+        elif parked_waiting:
+            self.waiting.add_request(parked_waiting.peek_request())
+
         try:
             return super().schedule()
         finally:
             leftover = self.waiting
-            self.waiting = hidden_waiting
+            self.waiting = parked_waiting
             while leftover:
                 self.waiting.prepend_request(leftover.pop_request())
-            if hidden_tails:
-                self.running = self.running + hidden_tails
+            if parked_prefills:
+                self.running = self.running + parked_prefills
 
     def lwd_edge_add_request(self, request: Request) -> None:
         """请求入口:边界校验 -> 云预告 -> 本地入队。
