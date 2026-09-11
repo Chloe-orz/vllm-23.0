@@ -380,7 +380,7 @@ def lwd_build_unembed_batch(notify: LwdC2eNotify) -> SchedulerOutput:
         batch_meta=LwdUnembedBatch(
             req_ids=list(notify.req_ids),
             num_accept_tokens=list(notify.num_accepted_tokens),
-            recv_num_elements=[],
+            recv_num_elements=notify.recv_num_elements,
             out_token_idxs=[],
             top_id_ths=list(notify.top_id_ths),
         ),
