@@ -699,10 +699,7 @@ class ParallelConfig:
 
     @property
     def nnodes_within_dp(self) -> int:
-        # LWD edge-cloud: each side runs as an independent single-node
-        # engine; the upstream multi-node-DP mq/subgroup machinery keyed on
-        # nnodes_within_dp must stay out of the way.
-        if self.nnodes == 1 or self.lwd_config.enable_lwd:
+        if self.nnodes == 1:
             return 1
         data_parallel_node_size = (
             self.data_parallel_size // self.data_parallel_size_local
