@@ -79,7 +79,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
     """边 PO 引擎:通信面装配 + 调度器注入 + step/add/abort/shutdown 覆写。"""
 
     def __init__(self, *args, **kwargs) -> None:
-        vllm_config = args[0]
+        vllm_config = args[0] if args else kwargs["vllm_config"]
         # 调度器注入须赶在 super() 之前:super 内构建 self.scheduler 时
         # 一次性消费 scheduler_cls,后设无效(注入失效,首请求即崩)
         vllm_config.scheduler_config.scheduler_cls = LwdEdgeScheduler
