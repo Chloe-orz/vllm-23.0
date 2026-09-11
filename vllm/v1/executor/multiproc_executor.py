@@ -150,14 +150,7 @@ class MultiprocExecutor(Executor):
                 self.local_world_size,
             )
             self.rpc_broadcast_mq = MessageQueue(
-                (
-                    self.local_world_size
-                    # LWD: this mq serves only local workers; cross-side
-                    # traffic goes over the lwd duplex channels, so there
-                    # are no remote readers to wait for.
-                    if self.parallel_config.lwd_config.enable_lwd
-                    else self.world_size
-                ),
+                self.world_size,
                 self.local_world_size,
                 max_chunk_bytes=max_chunk_bytes,
                 connect_ip=mq_connect_ip,
@@ -593,14 +586,8 @@ class WorkerProc:
     ) -> None:
         if vllm_config.parallel_config.nnodes_within_dp == 1:
             # Initialize MessageQueue for receiving SchedulerOutput
-            reader_rank = self.worker.rank
-            if vllm_config.parallel_config.lwd_config.enable_lwd:
-                # LWD: the executor-side mq only has local readers
-                # (0..local_world_size-1); the global rank of a cloud
-                # worker (>= edge_npu_count) is not a valid reader index.
-                reader_rank = self.worker.rpc_rank
             self.rpc_broadcast_mq = MessageQueue.create_from_handle(
-                input_shm_handle, reader_rank
+                input_shm_handle, self.worker.rank
             )
 
             # Initializes a message queue for sending the model output
