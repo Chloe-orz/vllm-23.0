@@ -7,7 +7,7 @@ from collections import deque
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
-from vllm.v1.core.sched.output import LwdBatch, SchedulerOutput
+from vllm.v1.core.sched.output import LwdBatch, LwdBatchType, SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
 from vllm.v1.lwd_control.control_communication.lwd_notify import LwdRangeNotify
 from vllm.v1.request import Request
@@ -143,6 +143,7 @@ class LwdCloudPhaseScheduler(AsyncScheduler):
         # 取点名预告自带的 seqno(与边侧 EMBED 批派发号同源同值),worker
         # 的 UP recv 以此配对边侧发来的 embeds 张量。
         out.lwd_batch = LwdBatch(
+            batch_type=LwdBatchType.LWD_EMBED,
             seqno=notify.seqno,
             batch_meta=None,
         )

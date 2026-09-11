@@ -193,6 +193,13 @@ class LwdEdgeEngineCore(EngineCoreProc):
     def step_with_batch_queue(self):
         return self._lwd_edge_step()
 
+    def has_work(self) -> bool:
+        """c2e 载荷队列也计入工作:WAKEUP 只能打断阻塞的 get,轮询
+        循环是否退出由本判据决定(core.py while not has_work)——不含
+        载荷队列时,WAKEUP 被消费后循环重新阻塞,载荷成死信、token
+        永不投递。"""
+        return super().has_work() or not self.lwd_c2e_meta_queue.empty()
+
     def _lwd_edge_step(self) -> tuple[dict[int, object] | None, bool]:
         """单步编排:云载荷消费 -> prefill 编排 -> 步末完结登记;
         返回 (云侧结果输出 | None, prefill 是否有工作)。"""
