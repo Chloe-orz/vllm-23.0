@@ -114,6 +114,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         本步被抢占的请求回 waiting 尾部、被跳过的回 skipped 队首,均取
         基类统一语义,不再做队首回插。"""
         req_id = self._lwd_pick_prefill_req_id()
+        if req_id is not None:
+            logger.info("[Lwd][edge-sched] pick req=%s", req_id)
         return self._lwd_schedule_for_visible_reqs([req_id] if req_id else [])
 
     def lwd_edge_add_request(self, request: Request) -> None:
@@ -169,6 +171,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             ):
                 return False
             self._lwd_seqno = seqno + 1
+            logger.info(
+                "[Lwd][edge-notify] req=%s offset=%d num=%d seqno=%d",
+                request_id, offset, num_tokens, seqno,
+            )
             # 发布成功即组 EMBED 批挂 SO:seqno 是数据面发云张量的
             # 配对键(与云侧 RangeNotify 登记同值),embed 载荷为本
             # chunk 的 token 片段
@@ -236,6 +242,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         )
         for attempt in range(_LWD_ADD_RETRY_STEPS):
             if publisher.publish(message):
+                logger.info(
+                    "[Lwd][edge-notify] request meta announced: req=%s "
+                    "prompt=%d",
+                    request_id, num_prompt_tokens,
+                )
                 return
             time.sleep(_LWD_ADD_RETRY_INTERVAL_S * (attempt + 1))
         raise RuntimeError(
@@ -285,6 +296,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             now = time.monotonic()
             for request_id in finished_ids:
                 self._lwd_awaiting[request_id] = now
+                logger.info(
+                    "[Lwd][edge-progress] req=%s embed done -> awaiting",
+                    request_id,
+                )
 
     def lwd_edge_deliver_tokens(
         self, request_id: str, token_ids: list[int], finished: bool
@@ -300,9 +315,17 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
         token_ids/finished 的输出组包归引擎层(EngineCoreOutputs)。"""
         if request_id not in self._lwd_awaiting:
+            logger.warning(
+                "[Lwd][edge-deliver] stale result for req=%s (not awaiting)",
+                request_id,
+            )
             return False
         if finished:
             del self._lwd_awaiting[request_id]
+        logger.info(
+            "[Lwd][edge-deliver] req=%s tokens=%d finished=%s",
+            request_id, len(token_ids), finished,
+        )
         return True
 
     @staticmethod

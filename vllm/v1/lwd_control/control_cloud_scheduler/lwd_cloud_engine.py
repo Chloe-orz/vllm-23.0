@@ -117,6 +117,10 @@ class LwdCloudEngineCore(EngineCoreProc):
     def _lwd_announce(self) -> None:
         """首拍 HELLO 通告一次;队满不重试,由边侧等待超时 fail-fast 兜底。"""
         self._lwd_post_out.publish(self._lwd_hello)
+        logger.info(
+            "[Lwd][cloud] HELLO announced: pre_out=%s:%s",
+            self._lwd_hello.pre_out_host, self._lwd_hello.pre_out_port,
+        )
 
     def shutdown(self) -> None:
         """两面关停后走原生(幂等;装配失败路径两面可能未建,容忍缺省)。"""
@@ -138,6 +142,10 @@ class LwdCloudEngineCore(EngineCoreProc):
             seqnos = self._lwd_seqno_registry.setdefault(msg.request_id, [])
             if not seqnos or msg.seqno > seqnos[-1]:
                 seqnos.append(msg.seqno)
+            logger.info(
+                "[Lwd][cloud-ctrl] RangeNotify req=%s num=%s seqno=%s",
+                msg.request_id, msg.num_tokens, msg.seqno,
+            )
             # 每条预告都整条入队(重复预告即重复点名,剔除-调度-拼回幂等,
             # 无副作用;PRE_OUT 只 append,调度主线程单独 popleft,deque
             # 单操作原子;预告自带 seqno,出批时作 UP 链配对号)

@@ -97,6 +97,11 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
         if notify is not None and notify.request_id not in self.requests:
             # 请求已被 abort 释放:丢弃陈旧预告,本步按空集走
             notify = None
+        if notify is not None:
+            logger.info(
+                "[Lwd][cloud-sched] prefill notify req=%s seqno=%s num=%s",
+                notify.request_id, notify.seqno, notify.num_tokens,
+            )
         req_ids = [notify.request_id] if notify is not None else []
         out = self._lwd_schedule_for_visible_reqs(req_ids)
         if notify is None:
@@ -125,9 +130,10 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
 
     def _schedule_pure_decode(self) -> SchedulerOutput:
         """纯 decode 步:收集全部 decode 态请求,剔除单独调度后按落点拼回。"""
-        return self._lwd_schedule_for_visible_reqs(
-            self._lwd_collect_decode_requests()
-        )
+        req_ids = self._lwd_collect_decode_requests()
+        if req_ids:
+            logger.info("[Lwd][cloud-sched] decode reqs=%s", req_ids)
+        return self._lwd_schedule_for_visible_reqs(req_ids)
 
     @staticmethod
     def _is_empty(out: SchedulerOutput) -> bool:
