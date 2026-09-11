@@ -570,6 +570,9 @@ class EngineCore:
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
+        engine_core_outputs = self.scheduler.update_from_output(
+            scheduler_output, model_output
+        )
         # Lwd model-output seam: after native update_from_output so the
         # handler sees engine_core_outputs (per-request finish_reason) and
         # can derive per-request finish flags for the edge.
