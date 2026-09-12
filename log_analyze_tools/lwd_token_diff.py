@@ -128,7 +128,8 @@ def compare(
     req_filter: str | None,
     edge_path: str | None = None,
     cloud_path: str | None = None,
-) -> bool:
+) -> int:
+    """返回总体状态: 0=全部完全一致, 1=存在仅尾部长度差, 2=真发散/缺数据。"""
     reqs = sorted(set(edge) | set(cloud))
     if req_filter:
         reqs = [r for r in reqs if req_filter in r]
@@ -141,35 +142,45 @@ def compare(
             diagnose(edge_path, "edge")
         if cloud_path:
             diagnose(cloud_path, "cloud")
-        return False
+        return 2
 
-    all_match = True
+    worst = 0
     for req in reqs:
         e, c = edge.get(req), cloud.get(req)
         print(f"\n== req {req} ==")
         if e is None:
             print("  边侧日志缺此请求")
-            all_match = False
+            worst = 2
             continue
         if c is None:
             print("  云侧日志缺此请求")
-            all_match = False
+            worst = 2
             continue
         print(f"  cloud n={len(c)}: {c}")
         print(f"  edge  n={len(e)}: {e}")
         if c == e:
             print("  MATCH ✅")
             continue
-        all_match = False
         diffs = [
             (i, a, b) for i, (a, b) in enumerate(zip(c, e)) if a != b
         ]
-        first = diffs[0][0] if diffs else min(len(c), len(e))
+        if not diffs:
+            # 公共前缀逐 token 一致,只有尾部长度差:多为终结步提取口径
+            # (云 finish-dbg 终结变体无 out_len/last_tok;spec 步只留
+            # 最后一个 token),不是中间发散。
+            tail = (c[len(e):] if len(c) > len(e) else e[len(c):])
+            print(f"  PREFIX-MATCH ⚠️ 前 {min(len(c), len(e))} 个 token 完全"
+                  f"一致,仅尾部长度差 cloud={len(c)} edge={len(e)};"
+                  f"多出方尾部: {tail}")
+            worst = max(worst, 1)
+            continue
+        worst = 2
+        first = diffs[0][0]
         print(f"  MISMATCH ❌ 首个发散 idx={first} "
               f"长度 cloud={len(c)} edge={len(e)} 错位 {len(diffs)} 处")
         for i, a, b in diffs[:10]:
             print(f"    idx={i}: cloud={a}  edge={b}")
-    return all_match
+    return worst
 
 
 def decode(tokenizer_path: str, seqs: list[list[int]]) -> None:
@@ -209,7 +220,7 @@ def main() -> int:
         print("[i] 云侧使用 finish-dbg last_tok 链"
               "(spec 步仅保留最后一个 token)")
 
-    ok = compare(edge, cloud, args.req, args.edge, args.cloud)
+    status = compare(edge, cloud, args.req, args.edge, args.cloud)
 
     if args.tokenizer:
         print("\n== 文本解码 ==")
@@ -219,8 +230,13 @@ def main() -> int:
                 (f"edge  {req}:", edge[req]),
             ])
 
-    print(f"\n结论: {'边云 token 序列完全一致 ✅' if ok else '存在差异 ❌'}")
-    return 0 if ok else 1
+    verdicts = {
+        0: "边云 token 序列完全一致 ✅",
+        1: "前缀完全一致,仅尾部有长度差(多为终结步提取口径,非发散)⚠️",
+        2: "存在真实发散或数据缺失 ❌",
+    }
+    print(f"\n结论: {verdicts[status]}")
+    return status
 
 
 # ------------------------------------------------------------------ #
@@ -255,14 +271,14 @@ def selftest() -> int:
         cloud, intended = extract_cloud(c)
         assert edge == {"chatcmpl-t": [220, 96181]}, edge
         assert intended == [220, 97900], intended
-        # last_tok 链与边侧不一致(97900 vs 96181) → compare 应报 False
-        assert not compare(edge, cloud_steps_to_map(cloud), None)
-    print("selftest OK: 正则匹配真实日志格式,差异能被检出")
+        # 真发散(97900 vs 96181) → 状态 2
+        assert compare(edge, cloud, None) == 2
+        # 前缀一致仅尾部差 → 状态 1
+        assert compare({"r": [220]}, {"r": [220, 96181]}, None) == 1
+        # 完全一致 → 状态 0
+        assert compare({"r": [220]}, {"r": [220]}, None) == 0
+    print("selftest OK: 三档状态(一致/仅尾部差/真发散)判定正确")
     return 0
-
-
-def cloud_steps_to_map(cloud: dict) -> dict:
-    return cloud
 
 
 if __name__ == "__main__":
