@@ -18,6 +18,7 @@ class LwdDebug:
 
     ENABLED = True
     _tokenizer = None
+    _layers_reported = False
 
     @classmethod
     def _log(cls, msg: str, *args) -> None:
@@ -26,6 +27,41 @@ class LwdDebug:
         from vllm.logger import init_logger
 
         init_logger(__name__).info(msg, *args)
+
+    @classmethod
+    def _report_model_layers_once(cls, runner) -> None:
+        """一次性打云侧实际加载的 decoder 层数与首末层号。
+
+        半模型嫌疑的裁决依据:pp 切层错误时层数减半或首层不从 0 起
+        (如 layers.14-27);正常应为全量且从 0 起。层列表取不到时打
+        顶层模块名,留人工判读。"""
+        if cls._layers_reported:
+            return
+        cls._layers_reported = True
+        try:
+            model = runner.get_model()
+            backbone = getattr(model, "model", model)
+            layers = getattr(backbone, "layers", None) or getattr(
+                backbone, "decoder_layers", None
+            )
+            if layers is not None:
+                names = [
+                    n for n, _ in list(backbone.named_children())
+                    if "layer" in n
+                ]
+                cls._log(
+                    "[lwd-model-dbg] decoder layers=%d (module=%s); "
+                    "expect full depth starting at layer 0 — halved count "
+                    "or nonzero start = PP mis-slice",
+                    len(layers), names[:3],
+                )
+                return
+            cls._log(
+                "[lwd-model-dbg] top-level modules=%s",
+                [n for n, _ in list(model.named_children())][:12],
+            )
+        except Exception:  # noqa: BLE001
+            cls._log("[lwd-model-dbg] layer probe failed")
 
     # ------------------------------------------------------------------ #
     # cloud                                                              #
@@ -53,12 +89,20 @@ class LwdDebug:
         * inputs_embeds[0][:6] 应与 inject 的 row0[:6] 一致(不一致 =
           fill loop 没用注入的 embeds)
         """
+        # num_scheduled_tokens 是逐请求 ndarray,切片前须先求总行数,
+        # 否则 min(6, ndarray) 产出数组、tensor 切片抛异常被吞成 None
+        # (decode 步的 input_ids 因此一直是盲区)。
+        cls._report_model_layers_once(runner)
         try:
-            mask = runner.is_token_ids.cpu[:num_scheduled_tokens].tolist()
+            total = int(num_scheduled_tokens.sum())
+        except Exception:  # noqa: BLE001
+            total = 0
+        try:
+            mask = runner.is_token_ids.cpu[:total].tolist()
         except Exception:  # noqa: BLE001
             mask = None
         try:
-            ids = runner.input_ids.gpu[: min(6, num_scheduled_tokens)].tolist()
+            ids = runner.input_ids.gpu[: min(6, total)].tolist()
         except Exception:  # noqa: BLE001
             ids = None
         try:
