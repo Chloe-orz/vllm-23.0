@@ -260,7 +260,7 @@ class LwdCloudEngineCore(EngineCoreProc):
                 meta, self._lwd_c2e_finish_reasons(meta, engine_core_outputs)
             )
         else:
-            logger.debug(
+            logger.info(
                 "[Lwd][cloud-ctrl] handle_model_output: no c2e_meta this step"
             )
         return model_output
