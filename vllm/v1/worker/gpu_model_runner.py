@@ -3456,6 +3456,13 @@ class GPUModelRunner(
         ec_connector_output = None
 
         if self.supports_mm_inputs and is_first_rank and not is_encoder_decoder:
+            from vllm.v1.lwd_control.lwd_debug import LwdDebug
+            LwdDebug._log(  # [lwd-debug]
+                "[lwd-branch-dbg] preprocess: MM branch (supports_mm_inputs=True), "
+                "n=%d, input_ids[:8]=%s",
+                num_scheduled_tokens,
+                self.input_ids.gpu[: min(8, num_scheduled_tokens)].tolist(),
+            )
             # Run the multimodal encoder if any.
             with self.maybe_get_ec_connector_output(
                 scheduler_output,
@@ -3482,6 +3489,11 @@ class GPUModelRunner(
                 **self._extract_mm_kwargs(scheduler_output),
             }
         elif self.enable_prompt_embeds and is_first_rank:
+            from vllm.v1.lwd_control.lwd_debug import LwdDebug
+            LwdDebug._log(  # [lwd-debug]
+                "[lwd-branch-dbg] preprocess: prompt-embeds branch, n=%d",
+                num_scheduled_tokens,
+            )
             # Get the input embeddings for the tokens that are not input embeds,
             # then put them into the appropriate positions.
             # TODO(qthequartermasterman): Since even when prompt embeds are
@@ -3508,6 +3520,11 @@ class GPUModelRunner(
             model_kwargs = self._init_model_kwargs()
             input_ids = None
         else:
+            from vllm.v1.lwd_control.lwd_debug import LwdDebug
+            LwdDebug._log(  # [lwd-debug]
+                "[lwd-branch-dbg] preprocess: text-only branch, n=%d",
+                num_scheduled_tokens,
+            )
             # For text-only models, we use token ids as input.
             # While it is possible to use embeddings as input just like the
             # multimodal models, it is not desirable for performance since
