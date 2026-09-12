@@ -250,8 +250,18 @@ class LwdCloudEngineCore(EngineCoreProc):
         (原生停止条件即云侧 decode 终结的事实源),其余原样透传。"""
         meta = model_output.lwd_c2e_meta
         if meta is not None:
+            logger.info(
+                "[Lwd][cloud-ctrl] handle_model_output: c2e_meta received "
+                "reqs=%s down_seqno=%s, forwarding to edge",
+                getattr(meta, "req_ids", None),
+                getattr(meta, "down_seqno", None),
+            )
             self._lwd_publish_c2e(
                 meta, self._lwd_c2e_finish_reasons(meta, engine_core_outputs)
+            )
+        else:
+            logger.debug(
+                "[Lwd][cloud-ctrl] handle_model_output: no c2e_meta this step"
             )
         return model_output
 
