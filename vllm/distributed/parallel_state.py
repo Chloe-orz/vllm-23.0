@@ -348,6 +348,9 @@ direct_register_custom_op(
 )
 
 
+_LWD_FULL_HEAD_TAIL = False
+
+
 def _is_lwd_full_head_tail() -> bool:
     """Whether LWD (layerwise disaggregated) mode is enabled.
 
@@ -355,15 +358,14 @@ def _is_lwd_full_head_tail() -> bool:
     (``embed_tokens``) and tail (``norm`` / ``lm_head``), so the PP
     first/last-rank split must be neutralized: both sides act as first AND
     last rank on the PP group.
-    """
-    try:
-        from vllm.config import get_current_vllm_config_or_none
 
-        cfg = get_current_vllm_config_or_none()
-        lwd = getattr(cfg, "lwd_config", None) if cfg is not None else None
-        return bool(lwd is not None and lwd.enabled)
-    except Exception:
-        return False
+    The flag is set at group-creation time in the LWD branch of
+    ``initialize_model_parallel`` (every worker process passes through it),
+    because the runtime config context is unavailable on the worker
+    execute path (``get_current_vllm_config_or_none()`` returns None
+    there).
+    """
+    return _LWD_FULL_HEAD_TAIL
 
 
 class GroupCoordinator:
@@ -1801,6 +1803,10 @@ def initialize_model_parallel(
             backend,
             group_name="pp",
         )
+        # prefill_only 下 PP 切分在运行期中性化(两侧皆 first/last rank);
+        # 建组时直接置位,运行期不依赖 current config 上下文。
+        global _LWD_FULL_HEAD_TAIL
+        _LWD_FULL_HEAD_TAIL = True
 
         # DCP/PCP:全单例(pcp_size = dcp_size = 1)
         singleton_groups = [[r] for r in range(world_size)]
