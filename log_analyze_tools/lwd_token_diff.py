@@ -47,17 +47,53 @@ def parse_ids(text: str) -> list[int]:
     return [int(x) for x in text.split(",") if x.strip()]
 
 
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def read_lines(path: str) -> list[str]:
+    """读日志行:自动识别编码(UTF-16 BOM / UTF-8 BOM / UTF-8 / GB18030),
+    并剥离 ANSI 颜色码(终端重定向的日志常带,会干扰肉眼看不影响正则,
+    但统一剥掉最干净)。"""
+    with open(path, "rb") as f:
+        raw = f.read()
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        text = raw.decode("utf-16")
+    elif raw.startswith(b"\xef\xbb\xbf"):
+        text = raw.decode("utf-8-sig")
+    else:
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            text = raw.decode("gb18030", errors="replace")
+    return [ANSI_RE.sub("", l) for l in text.splitlines()]
+
+
+def diagnose(path: str, side: str) -> None:
+    """无匹配时的现场诊断:这份文件里到底有没有探针行。"""
+    lines = read_lines(path)
+    n_lwd = sum(1 for l in lines if "[Lwd]" in l or "[lwd-" in l)
+    n_tok = sum(1 for l in lines if "token-dbg" in l)
+    n_fin = sum(1 for l in lines if "finish-dbg" in l)
+    n_int = sum(1 for l in lines if "intended sampled ids" in l)
+    print(f"  [{side}] {path}: 共 {len(lines)} 行 | Lwd 探针行 {n_lwd} | "
+          f"token-dbg {n_tok} | finish-dbg {n_fin} | intended {n_int}")
+    if n_lwd == 0 and len(lines) > 0:
+        print(f"    → 文件里没有任何 Lwd 探针输出:确认拿的是 EngineCore "
+              "所在进程的日志(不是别的文件),且运行的代码带 lwd_debug 探针")
+    if n_tok > 0 and side == "cloud":
+        print("    → 这份文件含边侧锚点(token-dbg),可能传反了或是合并粘贴件")
+
+
 def extract_edge(path: str) -> dict[str, list[int]]:
     """边侧: token-dbg 按出现顺序拼接(即交付顺序)。"""
     seqs: dict[str, list[int]] = {}
-    with open(path, encoding="utf-8", errors="replace") as f:
-        for line in f:
-            m = RE_EDGE_TOKEN.search(line)
-            if m:
-                ids = parse_ids(m.group(2))
-                if -1 in ids:  # spec 无效位不计交付
-                    ids = [t for t in ids if t != -1]
-                seqs.setdefault(m.group(1), []).extend(ids)
+    for line in read_lines(path):
+        m = RE_EDGE_TOKEN.search(line)
+        if m:
+            ids = parse_ids(m.group(2))
+            if -1 in ids:  # spec 无效位不计交付
+                ids = [t for t in ids if t != -1]
+            seqs.setdefault(m.group(1), []).extend(ids)
     return seqs
 
 
@@ -65,22 +101,21 @@ def extract_cloud(path: str) -> tuple[dict[str, list[int]], list[int]]:
     """云侧: finish-dbg 的 last_tok 链(按 out_len 排序) + intended 全量。"""
     steps: dict[str, dict[int, int]] = {}
     intended: list[int] = []
-    with open(path, encoding="utf-8", errors="replace") as f:
-        for line in f:
-            m = RE_CLOUD_FINISH.search(line)
-            if m:
-                req, out_len, tok = m.group(1), int(m.group(2)), int(m.group(3))
-                steps.setdefault(req, {})[out_len] = tok
-                continue
-            m = RE_CLOUD_INTENDED.search(line)
-            if m:
-                try:
-                    rows = ast.literal_eval(m.group(1))
-                    intended.extend(
-                        t for row in rows for t in row if t != -1
-                    )
-                except (ValueError, SyntaxError):
-                    pass
+    for line in read_lines(path):
+        m = RE_CLOUD_FINISH.search(line)
+        if m:
+            req, out_len, tok = m.group(1), int(m.group(2)), int(m.group(3))
+            steps.setdefault(req, {})[out_len] = tok
+            continue
+        m = RE_CLOUD_INTENDED.search(line)
+        if m:
+            try:
+                rows = ast.literal_eval(m.group(1))
+                intended.extend(
+                    t for row in rows for t in row if t != -1
+                )
+            except (ValueError, SyntaxError):
+                pass
     seqs = {
         req: [toks[i] for i in sorted(toks)] for req, toks in steps.items()
     }
@@ -91,13 +126,21 @@ def compare(
     edge: dict[str, list[int]],
     cloud: dict[str, list[int]],
     req_filter: str | None,
+    edge_path: str | None = None,
+    cloud_path: str | None = None,
 ) -> bool:
     reqs = sorted(set(edge) | set(cloud))
     if req_filter:
         reqs = [r for r in reqs if req_filter in r]
     if not reqs:
-        print("没有提取到任何请求,检查日志里是否有 [lwd-token-dbg] / "
-              "[lwd-finish-dbg] 行。")
+        print("没有提取到任何请求。现场诊断:")
+        if req_filter:
+            print(f"  [--req {req_filter}] 过滤后为空——先去掉 --req 跑一次,"
+                  "看日志里实际有哪些 req_id。")
+        if edge_path:
+            diagnose(edge_path, "edge")
+        if cloud_path:
+            diagnose(cloud_path, "cloud")
         return False
 
     all_match = True
@@ -166,7 +209,7 @@ def main() -> int:
         print("[i] 云侧使用 finish-dbg last_tok 链"
               "(spec 步仅保留最后一个 token)")
 
-    ok = compare(edge, cloud, args.req)
+    ok = compare(edge, cloud, args.req, args.edge, args.cloud)
 
     if args.tokenizer:
         print("\n== 文本解码 ==")
