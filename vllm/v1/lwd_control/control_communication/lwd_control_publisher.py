@@ -59,6 +59,11 @@ class LwdControlPublisher:
         # 线程最后启动:全部自有状态就绪后才开始消费
         self._thread.start()
 
+    @property
+    def closed(self) -> bool:
+        """已关停为 True(与 LwdControlSubscriber.closed 同语义)。"""
+        return self._closed
+
     def publish(self, msg: Any) -> bool:
         """元数据入队;False = 队满未发(可预期失败,不抛异常不丢已发消息)。"""
         try:
