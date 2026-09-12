@@ -28,6 +28,7 @@ from vllm.v1.lwd_control.control_communication.lwd_notify import (
     lwd_encode_cloud_notify,
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import LwdConfig
+from vllm.v1.lwd_control.lwd_debug import LwdDebug
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_phase_scheduler import (
     LwdCloudPhaseScheduler,
 )
@@ -210,6 +211,7 @@ class LwdCloudEngineCore(EngineCoreProc):
         # input_processor):设 _eos_token_id 并计入 _all_stop_token_ids
         # 供 min_tokens 判定;云侧无客户端 generation_config,传空。
         sampling_params.update_from_generation_config({}, wire.eos_token_id)
+        LwdDebug.cloud_request_admitted(wire, sampling_params)  # [lwd-debug]
         local_hasher = self.request_block_hasher
         if local_hasher is None:
             # prefix caching 未启用:请求不挂 hasher,整链机制不激活
@@ -256,6 +258,7 @@ class LwdCloudEngineCore(EngineCoreProc):
                 getattr(meta, "req_ids", None),
                 getattr(meta, "down_seqno", None),
             )
+            LwdDebug.cloud_step(self.scheduler, meta, engine_core_outputs)  # [lwd-debug]
             self._lwd_publish_c2e(
                 meta, self._lwd_c2e_finish_reasons(meta, engine_core_outputs)
             )

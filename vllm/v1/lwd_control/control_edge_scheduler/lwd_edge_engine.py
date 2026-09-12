@@ -42,6 +42,7 @@ from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
 from vllm.v1.lwd_control.control_communication.lwd_control_subscriber import (
     LwdControlSubscriber,
 )
+from vllm.v1.lwd_control.lwd_debug import LwdDebug
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LWD_NOT_FINISHED,
     LwdC2eNotify,
@@ -384,6 +385,10 @@ class LwdEdgeEngineCore(EngineCoreProc):
             sampled_token_ids = (
                 list(sampled_token_map.get(request_id, []))
                 if sampled_token_map else []
+            )
+            LwdDebug.edge_tokens_delivered(  # [lwd-debug]
+                request_id, sampled_token_ids, finish_reason,
+                self.vllm_config,
             )
             if not sampled_token_ids:
                 # 行在批里但无 token = unembed 失败,ERROR 优先于云侧码
