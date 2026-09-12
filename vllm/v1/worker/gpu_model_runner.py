@@ -1983,6 +1983,13 @@ class GPUModelRunner(
                     self.inputs_embeds.cpu[
                         output_idx : output_idx + actual_num_sched
                     ].copy_(req_embeds[start_pos:actual_end])
+                    from vllm.v1.lwd_control.lwd_debug import LwdDebug
+                    LwdDebug.cloud_fill_window(  # [lwd-debug]
+                        self.input_batch.req_ids[req_idx],
+                        start_pos,
+                        actual_num_sched,
+                        req_embeds[start_pos:actual_end],
+                    )
 
                 output_idx += num_sched
 

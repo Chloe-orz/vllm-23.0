@@ -81,6 +81,25 @@ class LwdDebug:
         )
 
     @classmethod
+    def cloud_fill_window(cls, req_id, start_pos, num_sched, window) -> None:
+        """fill loop 实际拷贝点:逐请求打读自 req_prompt_embeds 的窗口摘要
+        (sum/mean/head6,与 inject/边侧 SEND UP 的 DUMP 对照)。"""
+        try:
+            flat = window.float().reshape(-1)
+            cls._log(
+                "[lwd-input-dbg] fill req=%s start=%s n=%s head6=%s "
+                "sum=%.4f mean=%.6f",
+                req_id,
+                start_pos,
+                num_sched,
+                [round(v, 4) for v in flat[:6].tolist()],
+                float(flat.sum()),
+                float(flat.mean()),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    @classmethod
     def cloud_request_admitted(cls, wire, sampling_params) -> None:
         """请求准入时打停止参数(验证 max_tokens / eos / stop_ids)。"""
         cls._log(
