@@ -130,7 +130,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             num_prompt_tokens=len(request.prompt_token_ids),
             sampling_params=request.sampling_params,
             block_hashes=list(request.block_hashes),
-            prompt_token_ids=list(request.prompt_token_ids),
         )
         super().add_request(request)
         if request.abort_immediately:
@@ -199,7 +198,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         num_prompt_tokens: int,
         sampling_params: SamplingParams | None = None,
         block_hashes: list[bytes] | None = None,
-        prompt_token_ids: list[int] | None = None,
     ) -> None:
         """发 LwdRequestNotify(请求元数据预告)。
 
@@ -241,9 +239,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             ),
             min_tokens=sp.min_tokens if sp is not None else 0,
             eos_token_id=sp.eos_token_id if sp is not None else None,
-            prompt_token_ids=(
-                list(prompt_token_ids) if prompt_token_ids is not None else []
-            ),
         )
         for attempt in range(_LWD_ADD_RETRY_STEPS):
             if publisher.publish(message):

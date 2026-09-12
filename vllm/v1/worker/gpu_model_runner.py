@@ -1593,6 +1593,17 @@ class GPUModelRunner(
     def _init_mrope_positions(self, req_state: CachedRequestState):
         model = self.get_model()
         assert supports_mrope(model), "M-RoPE support is not implemented."
+        if req_state.prompt_token_ids is None:
+            # prompt-embeds only(如 LWD 云侧):纯文本 M-RoPE positions 与
+            # ids 内容无关(扫描仅认 vision 标记,纯文本恒为 arange),
+            # 直接按 prompt 长度构造,与 get_mrope_input_positions 对
+            # 纯文本的输出逐值一致。
+            n = req_state.num_prompt_tokens
+            req_state.mrope_positions = (
+                torch.arange(n).unsqueeze(0).expand(3, n).clone()
+            )
+            req_state.mrope_position_delta = 0
+            return
         assert req_state.prompt_token_ids is not None, (
             "M-RoPE requires prompt_token_ids to be available."
         )

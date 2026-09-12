@@ -7,6 +7,8 @@ import threading
 import time
 from typing import TYPE_CHECKING
 
+import torch
+
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
@@ -212,16 +214,19 @@ class LwdCloudEngineCore(EngineCoreProc):
         # 供 min_tokens 判定;云侧无客户端 generation_config,传空。
         sampling_params.update_from_generation_config({}, wire.eos_token_id)
         LwdDebug.cloud_request_admitted(wire, sampling_params)  # [lwd-debug]
-        # 真实 prompt ids 优先(边侧预告透传);缺省回退占位零值(旧版边侧)
-        prompt_ids = (
-            list(wire.prompt_token_ids)
-            if wire.prompt_token_ids
-            else [0] * wire.num_prompt_tokens
+        # 不传真实 ids 也不造占位:按原生 prompt-embeds 语义挂零缓冲,
+        # 行数即 prompt 长度(UP chunk 注入直接写该缓冲的对应窗口);
+        # ids=None 时 input_batch 自动把 prompt 段 is_token_ids 置 False,
+        # M-RoPE 走纯文本直通构造(与扫描结果逐值一致)。
+        prompt_ids: list[int] | None = None
+        prompt_embeds = torch.zeros(
+            wire.num_prompt_tokens,
+            self.vllm_config.model_config.get_hidden_size(),
+            dtype=self.vllm_config.model_config.dtype,
         )
         logger.info(
-            "[Lwd][cloud-ctrl] build request req=%s prompt=%d ids=%s",
+            "[Lwd][cloud-ctrl] build request req=%s prompt=%d ids=none+embeds_buf",
             wire.request_id, wire.num_prompt_tokens,
-            "real" if wire.prompt_token_ids else "placeholder",
         )
         local_hasher = self.request_block_hasher
         if local_hasher is None:
@@ -229,6 +234,7 @@ class LwdCloudEngineCore(EngineCoreProc):
             return Request(
                 request_id=wire.request_id,
                 prompt_token_ids=prompt_ids,
+                prompt_embeds=prompt_embeds,
                 sampling_params=sampling_params,
                 pooling_params=None,
             )
@@ -247,6 +253,7 @@ class LwdCloudEngineCore(EngineCoreProc):
         return Request(
             request_id=wire.request_id,
             prompt_token_ids=prompt_ids,
+            prompt_embeds=prompt_embeds,
             sampling_params=sampling_params,
             pooling_params=None,
             block_hasher=block_hasher,
