@@ -31,6 +31,56 @@ class LwdDebug:
     # cloud                                                              #
     # ------------------------------------------------------------------ #
     @classmethod
+    def cloud_embeds_injected(cls, req_id, idx, start, n, buf) -> None:
+        """UP embeds 注入点:写入窗口、首行数值(与 prepared 对照)。"""
+        cls._log(
+            "[lwd-input-dbg] inject req=%s idx=%s start=%s n=%s buf=%s "
+            "row0[:6]=%s",
+            req_id,
+            idx,
+            start,
+            n,
+            tuple(buf.shape),
+            [round(v, 4) for v in buf[0, :6].tolist()] if buf.shape[0] else [],
+        )
+
+    @classmethod
+    def cloud_prepared_inputs(cls, runner, num_scheduled_tokens) -> None:
+        """base fill loop 之后:生效掩码/输入 id/embeds 首行/分支条件。
+
+        判定:
+        * mask 前 prompt 段应为全 False(True = 占位 id 0 被当真查表)
+        * inputs_embeds[0][:6] 应与 inject 的 row0[:6] 一致(不一致 =
+          fill loop 没用注入的 embeds)
+        """
+        try:
+            mask = runner.is_token_ids.cpu[:num_scheduled_tokens].tolist()
+        except Exception:  # noqa: BLE001
+            mask = None
+        try:
+            ids = runner.input_ids.gpu[: min(6, num_scheduled_tokens)].tolist()
+        except Exception:  # noqa: BLE001
+            ids = None
+        try:
+            emb = [
+                round(v, 4)
+                for v in runner.inputs_embeds.gpu[0, :6].float().cpu().tolist()
+            ]
+        except Exception:  # noqa: BLE001
+            emb = None
+        from vllm.distributed.parallel_state import get_pp_group
+
+        cls._log(
+            "[lwd-input-dbg] prepared n=%s mask=%s input_ids[:6]=%s "
+            "inputs_embeds[0][:6]=%s first_rank=%s",
+            num_scheduled_tokens,
+            mask,
+            ids,
+            emb,
+            get_pp_group().is_first_rank,
+        )
+
+    @classmethod
     def cloud_request_admitted(cls, wire, sampling_params) -> None:
         """请求准入时打停止参数(验证 max_tokens / eos / stop_ids)。"""
         cls._log(
