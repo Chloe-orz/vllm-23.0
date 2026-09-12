@@ -3468,7 +3468,19 @@ class GPUModelRunner(
         # modal outputs after that to ensure the correct order
         ec_connector_output = None
 
-        if self.supports_mm_inputs and is_first_rank and not is_encoder_decoder:
+        # 批里有 prompt embeds 时优先走 prompt-embeds 分支:MM 分支会用
+        # input_ids 现算 embedding 并整体覆盖 inputs_embeds,远程/外部
+        # embeds 全部丢失;而 prompt-embeds 分支对 embeds 位置用缓冲、对
+        # token 位置本地补 embedding,混批也是正确超集。
+        has_prompt_embeds = self.enable_prompt_embeds and bool(
+            self.input_batch.req_prompt_embeds
+        )
+        if (
+            self.supports_mm_inputs
+            and not has_prompt_embeds
+            and is_first_rank
+            and not is_encoder_decoder
+        ):
             from vllm.v1.lwd_control.lwd_debug import LwdDebug
             LwdDebug._log(  # [lwd-debug]
                 "[lwd-branch-dbg] preprocess: MM branch (supports_mm_inputs=True), "
