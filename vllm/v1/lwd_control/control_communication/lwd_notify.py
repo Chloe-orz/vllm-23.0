@@ -49,6 +49,10 @@ class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):
     """结束符 id:边侧前端自 tokenizer 解析,云侧占位 prompt 无从
     得知,必须随预告透传;缺省 None = 云侧 EOS 判定落空,仅
     max_tokens 兜底(旧版边侧,additive 兼容)。"""
+    prompt_token_ids: list[int] = []
+    """真实 prompt token ids(additive;空 = 旧版边侧,云侧回退
+    占位零值)。用于消除占位对采样惩罚/哈希等 token-id 消费者的
+    影响。"""
 
 
 class LwdAbortNotify(msgspec.Struct, gc=False, tag=True):
