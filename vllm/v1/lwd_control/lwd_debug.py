@@ -28,6 +28,27 @@ class LwdDebug:
 
         init_logger(__name__).info(msg, *args)
 
+    @staticmethod
+    def _lwd_find_text_backbone(model):
+        """定位文本 backbone:兼容普通结构(model.model.layers)与 VL
+        包装结构(model.language_model[.model].layers,顶层是 visual +
+        language_model)。返回 (backbone, layers),找不到返回 (None, None)。"""
+        # 候选路径按优先级:普通 → VL 两级
+        candidates = (
+            getattr(model, "model", None),
+            getattr(getattr(model, "language_model", None), "model", None),
+            getattr(model, "language_model", None),
+        )
+        for holder in candidates:
+            if holder is None:
+                continue
+            layers = getattr(holder, "layers", None) or getattr(
+                holder, "decoder_layers", None
+            )
+            if layers is not None:
+                return holder, layers
+        return None, None
+
     @classmethod
     def _report_model_layers_once(cls, runner) -> None:
         """一次性打云侧实际加载的 decoder 层数与首末层号。
@@ -40,10 +61,7 @@ class LwdDebug:
         cls._layers_reported = True
         try:
             model = runner.get_model()
-            backbone = getattr(model, "model", model)
-            layers = getattr(backbone, "layers", None) or getattr(
-                backbone, "decoder_layers", None
-            )
+            backbone, layers = cls._lwd_find_text_backbone(model)
             if layers is not None:
                 names = [
                     n for n, _ in list(backbone.named_children())
@@ -80,6 +98,26 @@ class LwdDebug:
             [round(v, 4) for v in buf[0, :6].tolist()] if buf.shape[0] else [],
         )
 
+    @staticmethod
+    def _embed_probes(runner, total: int):
+        """embeds 探针对:首行前 6 值 + 全排程行整体校验和。
+
+        emb_all 与集中式 embed_tokens hook 的 [layer-trace] 行对拍;
+        行内数值即模型实际吃的输入。任一失败返回 (None, None)。"""
+        try:
+            emb = [
+                round(v, 4)
+                for v in runner.inputs_embeds.gpu[0, :6].float().cpu().tolist()
+            ]
+            t = runner.inputs_embeds.gpu[:total]
+            emb_all = (
+                f"n={t.numel()} sum={t.float().sum().item():.4f} "
+                f"l2={t.float().norm().item():.4f}"
+            )
+            return emb, emb_all
+        except Exception:  # noqa: BLE001
+            return None, None
+
     @classmethod
     def cloud_prepared_inputs(cls, runner, num_scheduled_tokens) -> None:
         """base fill loop 之后:生效掩码/输入 id/embeds 首行/分支条件。
@@ -105,23 +143,7 @@ class LwdDebug:
             ids = runner.input_ids.gpu[: min(6, total)].tolist()
         except Exception:  # noqa: BLE001
             ids = None
-        try:
-            emb = [
-                round(v, 4)
-                for v in runner.inputs_embeds.gpu[0, :6].float().cpu().tolist()
-            ]
-        except Exception:  # noqa: BLE001
-            emb = None
-        # L1 对拍:全部排程行的整体校验和(与集中式 embed_tokens hook 的
-        # [layer-trace] 行对拍;行内数值即模型实际吃的输入)。
-        try:
-            t = runner.inputs_embeds.gpu[:total]
-            emb_all = (
-                f"n={t.numel()} sum={t.float().sum().item():.4f} "
-                f"l2={t.float().norm().item():.4f}"
-            )
-        except Exception:  # noqa: BLE001
-            emb_all = None
+        emb, emb_all = cls._embed_probes(runner, total)
         from vllm.distributed.parallel_state import get_pp_group
 
         # prefill forward 正确性三要素:positions / seq_lens / TP 组态
@@ -139,7 +161,8 @@ class LwdDebug:
             tp_state = None
         cls._log(
             "[lwd-input-dbg] prepared n=%s mask=%s input_ids[:6]=%s "
-            "inputs_embeds[0][:6]=%s first_rank=%s positions=%s tp=%s",
+            "inputs_embeds[0][:6]=%s embeds_all{%s} first_rank=%s "
+            "positions=%s tp=%s",
             num_scheduled_tokens,
             mask,
             ids,
