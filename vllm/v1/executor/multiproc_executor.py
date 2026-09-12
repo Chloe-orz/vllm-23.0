@@ -1004,6 +1004,11 @@ class WorkerProc:
         if isinstance(output, AsyncModelRunnerOutput):
             output = output.get_output()
 
+        if getattr(output, "lwd_c2e_meta", None) is not None:
+            logger.info(
+                "[Lwd][trace] worker response enqueued: c2e_meta reqs=%s",
+                getattr(output.lwd_c2e_meta, "req_ids", None),
+            )
         if isinstance(output, Exception):
             result = (WorkerProc.ResponseStatus.FAILURE, str(output))
         else:
@@ -1075,6 +1080,15 @@ class WorkerProc:
                 continue
 
             if self._owns_rpc_reply(output_rank):
+                if getattr(output, "lwd_c2e_meta", None) is not None:
+                    logger.info(
+                        "[Lwd][trace] worker reply claimed: method=%s "
+                        "rank=%d output_rank=%s, c2e_meta reqs=%s",
+                        method if isinstance(method, str) else "<callable>",
+                        self.rank,
+                        output_rank,
+                        getattr(output.lwd_c2e_meta, "req_ids", None),
+                    )
                 self.handle_output(output)
 
     @staticmethod

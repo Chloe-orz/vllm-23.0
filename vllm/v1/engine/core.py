@@ -461,6 +461,11 @@ class EngineCore:
             model_output = future.result()
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
+            logger.info(
+                "[Lwd][trace] engine got model_output: type=%s c2e_meta=%s",
+                type(model_output).__name__,
+                getattr(getattr(model_output, "lwd_c2e_meta", None), "req_ids", None),
+            )
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -561,6 +566,11 @@ class EngineCore:
             self.log_iteration_details(scheduler_output),
         ):
             model_output = future.result()
+            logger.info(
+                "[Lwd][trace] engine got model_output (batch_queue): type=%s c2e_meta=%s",
+                type(model_output).__name__,
+                getattr(getattr(model_output, "lwd_c2e_meta", None), "req_ids", None),
+            )
             if model_output is None:
                 # None from sample_tokens() implies that the original execute_model()
                 # call failed - raise that exception.
@@ -576,6 +586,7 @@ class EngineCore:
         # Lwd model-output seam: after native update_from_output so the
         # handler sees engine_core_outputs (per-request finish_reason) and
         # can derive per-request finish flags for the edge.
+        logger.info("start send --- ")
         model_output = self.lwd_process_model_output(model_output, engine_core_outputs)
 
         # NOTE(nick): We can either handle the deferred tasks here or save
@@ -612,6 +623,7 @@ class EngineCore:
         """Lwd model-output 扩展接口(步内输出接缝):接收步内 model_output 与
         update_from_output 产物 engine_core_outputs,调用子类覆写的处理方法;
         接口自身承载固定编排。"""
+        logger.info("start lwd_process_model_output  ----  ")
         return self.lwd_handle_model_output(model_output, engine_core_outputs)
 
     def lwd_handle_model_output(
@@ -1243,11 +1255,18 @@ class EngineCoreProc(EngineCore):
 
     def has_work(self) -> bool:
         """Returns true if the engine should be stepped."""
-        return (
-            self.engines_running
-            or self.scheduler.has_requests()
-            or bool(self.batch_queue)
+        state = (
+            self.engines_running,
+            self.scheduler.has_requests(),
+            bool(self.batch_queue),
         )
+        if state != getattr(self, "_last_has_work_state", None):
+            logger.info(
+                "[has_work] engines_running=%s has_requests=%s batch_queue=%s",
+                *state,
+            )
+            self._last_has_work_state = state
+        return state[0] or state[1] or state[2]
 
     def is_running(self) -> bool:
         """Returns true if shutdown has not been requested."""
