@@ -128,6 +128,8 @@ def compare(
     req_filter: str | None,
     edge_path: str | None = None,
     cloud_path: str | None = None,
+    verbose: bool = False,
+    full: bool = False,
 ) -> int:
     """返回总体状态: 0=全部完全一致, 1=存在仅尾部长度差, 2=真发散/缺数据。"""
     reqs = sorted(set(edge) | set(cloud))
@@ -145,25 +147,31 @@ def compare(
         return 2
 
     worst = 0
+    rows = []  # (req, 状态, len_c, len_e, 首发散/None, 错位数)
     for req in reqs:
         e, c = edge.get(req), cloud.get(req)
-        print(f"\n== req {req} ==")
-        if e is None:
-            print("  边侧日志缺此请求")
+        if e is None or c is None:
+            print(f"\n== req {req} ==")
+            print("  边侧日志缺此请求" if e is None
+                  else "  云侧日志缺此请求")
+            rows.append((req, "missing", len(c or []), len(e or []), "-", 0))
             worst = 2
-            continue
-        if c is None:
-            print("  云侧日志缺此请求")
-            worst = 2
-            continue
-        print(f"  cloud n={len(c)}: {c}")
-        print(f"  edge  n={len(e)}: {e}")
-        if c == e:
-            print("  MATCH ✅")
             continue
         diffs = [
             (i, a, b) for i, (a, b) in enumerate(zip(c, e)) if a != b
         ]
+        if c == e:
+            rows.append((req, "match", len(c), len(e), "-", 0))
+            if not verbose:
+                continue
+            print(f"\n== req {req} ==")
+            print(f"  cloud n={len(c)}: {fmt_seq(c, full)}")
+            print(f"  edge  n={len(e)}: {fmt_seq(e, full)}")
+            print("  MATCH ✅")
+            continue
+        print(f"\n== req {req} ==")
+        print(f"  cloud n={len(c)}: {fmt_seq(c, full)}")
+        print(f"  edge  n={len(e)}: {fmt_seq(e, full)}")
         if not diffs:
             # 公共前缀逐 token 一致,只有尾部长度差:多为终结步提取口径
             # (云 finish-dbg 终结变体无 out_len/last_tok;spec 步只留
@@ -171,7 +179,8 @@ def compare(
             tail = (c[len(e):] if len(c) > len(e) else e[len(c):])
             print(f"  PREFIX-MATCH ⚠️ 前 {min(len(c), len(e))} 个 token 完全"
                   f"一致,仅尾部长度差 cloud={len(c)} edge={len(e)};"
-                  f"多出方尾部: {tail}")
+                  f"多出方尾部: {fmt_seq(tail, full)}")
+            rows.append((req, "prefix", len(c), len(e), "-", 0))
             worst = max(worst, 1)
             continue
         worst = 2
@@ -180,7 +189,41 @@ def compare(
               f"长度 cloud={len(c)} edge={len(e)} 错位 {len(diffs)} 处")
         for i, a, b in diffs[:10]:
             print(f"    idx={i}: cloud={a}  edge={b}")
+        rows.append((req, "mismatch", len(c), len(e), first, len(diffs)))
+
+    print_summary(rows)
     return worst
+
+
+def print_summary(rows) -> None:
+    """多请求汇总:每请求一行 + 总体统计。"""
+    if not rows:
+        return
+    print("\n== 汇总 ==")
+    print(f"{'req':<44} {'cloud':>6} {'edge':>6}  {'状态':<9} "
+          f"{'首发散':>6} {'错位':>4}")
+    for req, st, lc, le, first, nd in rows:
+        short = req if len(req) <= 42 else req[:20] + ".." + req[-20:]
+        print(f"{short:<44} {lc:>6} {le:>6}  {st:<9} "
+              f"{str(first):>6} {nd:>4}")
+    n = len(rows)
+    by = lambda s: sum(1 for r in rows if r[1] == s)  # noqa: E731
+    compared = sum(min(r[2], r[3]) for r in rows)
+    drift = sum(r[5] for r in rows)
+    print(f"统计: {n} 请求 | 完全一致 {by('match')} | 仅尾部差 "
+          f"{by('prefix')} | 真发散 {by('mismatch')} | 缺数据 "
+          f"{by('missing')} | 公共前缀总 token {compared} | "
+          f"错位总 {drift}" + (
+              f" (漂移率 {drift / compared:.2%})" if compared else ""))
+
+
+def fmt_seq(s: list[int], full: bool = False) -> str:
+    """长序列截断显示:头 20 + ... + 尾 10;--full 全量。"""
+    if full or len(s) <= 32:
+        return str(s)
+    head = ", ".join(map(str, s[:20]))
+    tail = ", ".join(map(str, s[-10:]))
+    return f"[{head}, ... 共{len(s)}个(略{len(s) - 30}), {tail}]"
 
 
 def decode(tokenizer_path: str, seqs: list[list[int]]) -> None:
@@ -204,6 +247,10 @@ def main() -> int:
     ap.add_argument("--req", default=None, help="只对比 req_id 含此子串的请求")
     ap.add_argument("--tokenizer", default=None,
                     help="模型目录,给出则附文本解码")
+    ap.add_argument("--verbose", action="store_true",
+                    help="完全一致的请求也打印明细(默认只出汇总行)")
+    ap.add_argument("--full", action="store_true",
+                    help="不截断长序列,全量打印 token 列表")
     args = ap.parse_args()
 
     edge = extract_edge(args.edge)
@@ -220,7 +267,10 @@ def main() -> int:
         print("[i] 云侧使用 finish-dbg last_tok 链"
               "(spec 步仅保留最后一个 token)")
 
-    status = compare(edge, cloud, args.req, args.edge, args.cloud)
+    status = compare(
+        edge, cloud, args.req, args.edge, args.cloud,
+        verbose=args.verbose, full=args.full,
+    )
 
     if args.tokenizer:
         print("\n== 文本解码 ==")
