@@ -38,6 +38,11 @@ RE_CLOUD_FINISH = re.compile(
 RE_CLOUD_INTENDED = re.compile(
     r"intended sampled ids=(\[\[.*?\]\])"
 )
+# MTP 适配锚点:云侧每步每请求的完整交付 id(spec 步含多个),
+# 由 lwd_cloud_model_runner 的 [Lwd][cloud-tokens] 日志提供。
+RE_CLOUD_TOKENS = re.compile(
+    r"\[Lwd\]\[cloud-tokens\] req=(\S+) ids=\[([^\]]*)\]"
+)
 RE_EDGE_RECOVERED = re.compile(
     r"\[seqno=(\d+)\] RECV DOWN recovered token_ids=(\[\[.*?\]\])"
 )
@@ -97,11 +102,21 @@ def extract_edge(path: str) -> dict[str, list[int]]:
     return seqs
 
 
-def extract_cloud(path: str) -> tuple[dict[str, list[int]], list[int]]:
-    """云侧: finish-dbg 的 last_tok 链(按 out_len 排序) + intended 全量。"""
+def extract_cloud(
+    path: str,
+) -> tuple[dict[str, list[int]], list[int], dict[str, list[int]]]:
+    """云侧三条链: [Lwd][cloud-tokens](req 级全量,MTP 准确,优先) /
+    finish-dbg last_tok 链(按 out_len 排序) / intended 全量(仅 spec 步,
+    无 req 归属,单请求时兜底)。"""
     steps: dict[str, dict[int, int]] = {}
     intended: list[int] = []
+    tokens: dict[str, list[int]] = {}
     for line in read_lines(path):
+        m = RE_CLOUD_TOKENS.search(line)
+        if m:
+            ids = [t for t in parse_ids(m.group(2)) if t != -1]
+            tokens.setdefault(m.group(1), []).extend(ids)
+            continue
         m = RE_CLOUD_FINISH.search(line)
         if m:
             req, out_len, tok = m.group(1), int(m.group(2)), int(m.group(3))
@@ -119,7 +134,7 @@ def extract_cloud(path: str) -> tuple[dict[str, list[int]], list[int]]:
     seqs = {
         req: [toks[i] for i in sorted(toks)] for req, toks in steps.items()
     }
-    return seqs, intended
+    return seqs, intended, tokens
 
 
 def compare(
@@ -254,14 +269,20 @@ def main() -> int:
     args = ap.parse_args()
 
     edge = extract_edge(args.edge)
-    cloud_steps, intended = extract_cloud(args.cloud)
+    cloud_steps, intended, cloud_tokens = extract_cloud(args.cloud)
 
-    # 云侧序列选择: 单请求且有 intended → 用 intended(spec 准确);
-    # 否则用 finish-dbg last_tok 链。
-    if len(cloud_steps) == 1 and intended:
+    # 云侧链选择(优先级): [Lwd][cloud-tokens](req 级全量, MTP 准确)
+    # > 单请求 intended(spec 步全量但缺 prefill 首 token) > last_tok 链
+    # (非 spec 准确;spec 步每步只留最后一个)。
+    if cloud_tokens:
+        cloud = cloud_tokens
+        print(f"[i] 云侧使用 [Lwd][cloud-tokens] 全量链"
+              f"({len(cloud)} 请求, MTP 多 token/步准确)")
+    elif len(cloud_steps) == 1 and intended:
         req = next(iter(cloud_steps))
         cloud = {req: intended}
-        print(f"[i] 云侧使用 intended 全量序列(req={req}, n={len(intended)})")
+        print(f"[i] 云侧使用 intended 全量序列(req={req}, n={len(intended)};"
+              "注意仅覆盖 spec 步,prefill 首 token 缺失会与边侧错位)")
     else:
         cloud = cloud_steps
         print("[i] 云侧使用 finish-dbg last_tok 链"
@@ -318,16 +339,26 @@ def selftest() -> int:
         open(e, "w").write(SAMPLE_EDGE)
         open(c, "w").write(SAMPLE_CLOUD)
         edge = extract_edge(e)
-        cloud, intended = extract_cloud(c)
+        cloud, intended, tokens = extract_cloud(c)
         assert edge == {"chatcmpl-t": [220, 96181]}, edge
         assert intended == [220, 97900], intended
+        assert tokens == {}, tokens  # 样例无 cloud-tokens 行
         # 真发散(97900 vs 96181) → 状态 2
         assert compare(edge, cloud, None) == 2
         # 前缀一致仅尾部差 → 状态 1
         assert compare({"r": [220]}, {"r": [220, 96181]}, None) == 1
         # 完全一致 → 状态 0
         assert compare({"r": [220]}, {"r": [220]}, None) == 0
-    print("selftest OK: 三档状态(一致/仅尾部差/真发散)判定正确")
+        # MTP 多 token/行: 边 tokens=[a,b] 与云 cloud-tokens ids=[a,b]
+        open(e, "a").write(
+            "(pid=1) INFO [lwd-token-dbg] req=m tokens=[10, 11] "
+            "text='x' finish=None\n")
+        open(c, "a").write(
+            "(pid=1) INFO [Lwd][cloud-tokens] req=m ids=[10, 11]\n")
+        assert extract_edge(e)["m"] == [10, 11]
+        _, _, toks2 = extract_cloud(c)
+        assert toks2 == {"m": [10, 11]}, toks2
+    print("selftest OK: 三档状态 + MTP 多 token 行(cloud-tokens/token-dbg)")
     return 0
 
 
