@@ -112,15 +112,26 @@ class LwdDebug:
             ]
         except Exception:  # noqa: BLE001
             emb = None
+        # L1 对拍:全部排程行的整体校验和(与集中式 embed_tokens hook 的
+        # [layer-trace] 行对拍;行内数值即模型实际吃的输入)。
+        try:
+            t = runner.inputs_embeds.gpu[:total]
+            emb_all = (
+                f"n={t.numel()} sum={t.float().sum().item():.4f} "
+                f"l2={t.float().norm().item():.4f}"
+            )
+        except Exception:  # noqa: BLE001
+            emb_all = None
         from vllm.distributed.parallel_state import get_pp_group
 
         cls._log(
             "[lwd-input-dbg] prepared n=%s mask=%s input_ids[:6]=%s "
-            "inputs_embeds[0][:6]=%s first_rank=%s",
+            "inputs_embeds[0][:6]=%s embeds_all{%s} first_rank=%s",
             num_scheduled_tokens,
             mask,
             ids,
             emb,
+            emb_all,
             get_pp_group().is_first_rank,
         )
 

@@ -230,6 +230,12 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Lwd 逐层对拍(vllm 仓侧两个公共点:positions gather 与 sampler 入口)。
+# 集中式/边云同路径打点;详见 vllm_ascend/worker/lwd_layer_trace.py。
+import os as _lwd_os
+
+_LWD_LAYER_TRACE = _lwd_os.getenv("VLLM_ASCEND_LWD_LAYER_TRACE", "") == "1"
+
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
@@ -2105,6 +2111,13 @@ class GPUModelRunner(
             self.num_computed_tokens[req_indices_gpu].to(torch.int64)
             + self.query_pos.gpu[:total_num_scheduled_tokens]
         )
+        if _LWD_LAYER_TRACE:
+            _n = min(12, total_num_scheduled_tokens)
+            logger.info(
+                "[layer-trace] positions n=%d first%d=%s",
+                total_num_scheduled_tokens, _n,
+                self.positions[:_n].tolist(),
+            )
         self.seq_lens[:num_reqs] = (
             self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
         )
@@ -3545,6 +3558,20 @@ class GPUModelRunner(
         logits: torch.Tensor | None,
         spec_decode_metadata: SpecDecodeMetadata | None,
     ) -> SamplerOutput:
+        if _LWD_LAYER_TRACE and logits is not None and logits.dim() == 2:
+            _row = logits[-1].detach().float()
+            _vals, _ids = torch.topk(_row, min(20, _row.numel()))
+            logger.info(
+                "[layer-trace] sampler logits shape=%s last_row l2=%.4f "
+                "top20=%s",
+                tuple(logits.shape), _row.norm().item(),
+                list(
+                    zip(
+                        _ids.tolist(),
+                        [round(v, 3) for v in _vals.tolist()],
+                    )
+                ),
+            )
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
         # Update output token ids with tokens sampled in last step
