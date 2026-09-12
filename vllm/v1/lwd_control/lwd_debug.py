@@ -124,15 +124,30 @@ class LwdDebug:
             emb_all = None
         from vllm.distributed.parallel_state import get_pp_group
 
+        # prefill forward 正确性三要素:positions / seq_lens / TP 组态
+        try:
+            p = runner.positions
+            p = getattr(p, "cpu", p)  # CpuGpuBuffer 或裸 tensor 兼容
+            pos = p[:num_scheduled_tokens].tolist()
+        except Exception:  # noqa: BLE001
+            pos = None
+        try:
+            from vllm.distributed.parallel_state import get_tp_group
+
+            tp_state = (get_tp_group().world_size, get_tp_group().rank_in_group)
+        except Exception:  # noqa: BLE001
+            tp_state = None
         cls._log(
             "[lwd-input-dbg] prepared n=%s mask=%s input_ids[:6]=%s "
-            "inputs_embeds[0][:6]=%s embeds_all{%s} first_rank=%s",
+            "inputs_embeds[0][:6]=%s first_rank=%s positions=%s tp=%s",
             num_scheduled_tokens,
             mask,
             ids,
             emb,
             emb_all,
             get_pp_group().is_first_rank,
+            pos,
+            tp_state,
         )
 
     @classmethod

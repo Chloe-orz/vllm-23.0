@@ -212,13 +212,23 @@ class LwdCloudEngineCore(EngineCoreProc):
         # 供 min_tokens 判定;云侧无客户端 generation_config,传空。
         sampling_params.update_from_generation_config({}, wire.eos_token_id)
         LwdDebug.cloud_request_admitted(wire, sampling_params)  # [lwd-debug]
+        # 真实 prompt ids 优先(边侧预告透传);缺省回退占位零值(旧版边侧)
+        prompt_ids = (
+            list(wire.prompt_token_ids)
+            if wire.prompt_token_ids
+            else [0] * wire.num_prompt_tokens
+        )
+        logger.info(
+            "[Lwd][cloud-ctrl] build request req=%s prompt=%d ids=%s",
+            wire.request_id, wire.num_prompt_tokens,
+            "real" if wire.prompt_token_ids else "placeholder",
+        )
         local_hasher = self.request_block_hasher
         if local_hasher is None:
             # prefix caching 未启用:请求不挂 hasher,整链机制不激活
             return Request(
                 request_id=wire.request_id,
-                # 占位 token:云侧调度只看长度,真值由边侧提供
-                prompt_token_ids=[0] * wire.num_prompt_tokens,
+                prompt_token_ids=prompt_ids,
                 sampling_params=sampling_params,
                 pooling_params=None,
             )
@@ -236,7 +246,7 @@ class LwdCloudEngineCore(EngineCoreProc):
 
         return Request(
             request_id=wire.request_id,
-            prompt_token_ids=[0] * wire.num_prompt_tokens,
+            prompt_token_ids=prompt_ids,
             sampling_params=sampling_params,
             pooling_params=None,
             block_hasher=block_hasher,
