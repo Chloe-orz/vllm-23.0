@@ -53,12 +53,19 @@ class LwdDebug:
         * inputs_embeds[0][:6] 应与 inject 的 row0[:6] 一致(不一致 =
           fill loop 没用注入的 embeds)
         """
+        # num_scheduled_tokens 是逐请求 ndarray,切片前须先求总行数,
+        # 否则 min(6, ndarray) 产出数组、tensor 切片抛异常被吞成 None
+        # (decode 步的 input_ids 因此一直是盲区)。
         try:
-            mask = runner.is_token_ids.cpu[:num_scheduled_tokens].tolist()
+            total = int(num_scheduled_tokens.sum())
+        except Exception:  # noqa: BLE001
+            total = 0
+        try:
+            mask = runner.is_token_ids.cpu[:total].tolist()
         except Exception:  # noqa: BLE001
             mask = None
         try:
-            ids = runner.input_ids.gpu[: min(6, num_scheduled_tokens)].tolist()
+            ids = runner.input_ids.gpu[: min(6, total)].tolist()
         except Exception:  # noqa: BLE001
             ids = None
         try:
