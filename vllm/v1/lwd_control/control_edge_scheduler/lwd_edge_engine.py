@@ -164,6 +164,11 @@ class LwdEdgeEngineCore(EngineCoreProc):
                     threading.Event().wait(0.05)
                 hello_event.set()
             elif isinstance(msg, LwdC2eNotify):
+                logger.info(
+                    "[Lwd][edge-ctrl] C2eNotify reqs=%d down_seqno=%s",
+                    len(getattr(msg, "req_ids", []) or []),
+                    getattr(msg, "down_seqno", None),
+                )
                 self.lwd_c2e_meta_queue.put(msg)
                 self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
             else:

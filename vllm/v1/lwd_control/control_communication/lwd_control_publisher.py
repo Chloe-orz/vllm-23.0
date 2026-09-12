@@ -101,5 +101,10 @@ class LwdControlPublisher:
                 self._communicator.retarget(msg.endpoint)
                 continue
             # 无对端时 send 阻塞,背压由有界队列传导给 publish 返回值
+            logger.info(
+                "[Lwd][zmq] publish -> %s: %s",
+                self._communicator.endpoint,
+                type(msg).__name__,
+            )
             self._communicator.send(self._encoder(msg))
         self._communicator.close()

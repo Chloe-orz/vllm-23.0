@@ -269,6 +269,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 logger.warning(
                     "[Lwd] drop abort signal for %s: publish queue full", request_id
                 )
+            else:
+                logger.info(
+                    "[Lwd][edge-notify] AbortNotify req=%s", request_id
+                )
 
     def lwd_edge_update_progress(self, executed: dict[str, int]) -> None:
         """步末登记执行量;嵌入完结即转入 awaiting。

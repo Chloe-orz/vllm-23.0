@@ -4,6 +4,9 @@ send/recv 仅持有线程可调(zmq 单线程亲和);term 是跨线程打断阻�
 from __future__ import annotations
 
 import zmq
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 class LwdControlCommunicator:
@@ -22,6 +25,12 @@ class LwdControlCommunicator:
             else:
                 self._socket.connect(endpoint)
             self._endpoint = endpoint
+        logger.info(
+            "[Lwd][zmq] communicator up: type=%s mode=%s endpoint=%s",
+            "PUSH" if socket_type == zmq.PUSH else "PULL",
+            "bind" if bind else "connect",
+            endpoint,
+        )
 
     @property
     def endpoint(self) -> str | None:
@@ -35,6 +44,9 @@ class LwdControlCommunicator:
         self._socket.connect(endpoint)
         if self._endpoint is not None:
             self._socket.disconnect(self._endpoint)
+        logger.info(
+            "[Lwd][zmq] retarget: %s -> %s", self._endpoint, endpoint
+        )
         self._endpoint = endpoint
 
     def send(self, data: bytes) -> None:

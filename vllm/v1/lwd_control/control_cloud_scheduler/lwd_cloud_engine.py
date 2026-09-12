@@ -165,6 +165,7 @@ class LwdCloudEngineCore(EngineCoreProc):
             self.scheduler.prefill_notify_queue.append(msg)
             return
         if isinstance(msg, LwdAbortNotify):
+            logger.info("[Lwd][cloud-ctrl] AbortNotify req=%s", msg.request_id)
             self._lwd_gate_pending.pop(msg.request_id, None)
             # 双队列与原生 ABORT 同款:eager 处理 + 保持 input_queue 次序
             self.aborts_queue.put_nowait([msg.request_id])
@@ -174,6 +175,7 @@ class LwdCloudEngineCore(EngineCoreProc):
         if rid in self._lwd_gate_pending:
             logger.warning("[Lwd] duplicate request metadata %s ignored", rid)
             return
+        logger.info("[Lwd][cloud-ctrl] RequestNotify req=%s", rid)
         self._lwd_gate_pending[rid] = msg
         self._lwd_promote(rid)
 
@@ -284,5 +286,13 @@ class LwdCloudEngineCore(EngineCoreProc):
         )
         while not self._lwd_post_out.closed:
             if self._lwd_post_out.publish(notify):
+                logger.info(
+                    "[Lwd][cloud-ctrl] publish C2eNotify reqs=%d down_seqno=%s "
+                    "finish=%s hidden_elems=%s",
+                    len(notify.req_ids),
+                    notify.down_seqno,
+                    finish_reasons,
+                    notify.hidden_num_elements,
+                )
                 return
             time.sleep(_LWD_C2E_SEND_RETRY_SLEEP_S)

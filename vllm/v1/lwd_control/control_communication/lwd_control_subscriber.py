@@ -54,7 +54,13 @@ class LwdControlSubscriber:
                 # ETERM(关停打断)与 NOBLOCK 竞态 Again 都走此出口
                 return None
             try:
-                return self._decoder(data)
+                msg = self._decoder(data)
+                logger.info(
+                    "[Lwd][zmq] recv <- %s: %s",
+                    self._socket.endpoint,
+                    type(msg).__name__,
+                )
+                return msg
             except (msgspec.DecodeError, msgspec.ValidationError):
                 logger.warning("[Lwd] drop malformed notify frame")
         return None
