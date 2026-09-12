@@ -106,10 +106,12 @@ class LwdControlPublisher:
                 self._communicator.retarget(msg.endpoint)
                 continue
             # 无对端时 send 阻塞,背压由有界队列传导给 publish 返回值
+            _rid = getattr(msg, "request_id", None) or getattr(
+                msg, "req_ids", None)
+            _seqno = getattr(msg, "seqno", getattr(msg, "down_seqno", None))
             logger.info(
-                "[Lwd][zmq] publish -> %s: %s",
-                self._communicator.endpoint,
-                type(msg).__name__,
+                "[Lwd][DUMP][req=%s][seqno=%s] SEND %s: %r",
+                _rid, _seqno, type(msg).__name__, msg,
             )
             self._communicator.send(self._encoder(msg))
         self._communicator.close()

@@ -55,10 +55,12 @@ class LwdControlSubscriber:
                 return None
             try:
                 msg = self._decoder(data)
+                _rid = getattr(msg, "request_id", None) or getattr(
+                    msg, "req_ids", None)
+                _seqno = getattr(msg, "seqno", getattr(msg, "down_seqno", None))
                 logger.info(
-                    "[Lwd][zmq] recv <- %s: %s",
-                    self._socket.endpoint,
-                    type(msg).__name__,
+                    "[Lwd][DUMP][req=%s][seqno=%s] RECV %s: %r",
+                    _rid, _seqno, type(msg).__name__, msg,
                 )
                 return msg
             except (msgspec.DecodeError, msgspec.ValidationError):
