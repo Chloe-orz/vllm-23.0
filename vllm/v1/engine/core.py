@@ -622,6 +622,7 @@ class EngineCore:
         """子类继承 EngineCore 后覆写本方法以消费步内输出;engine_core_outputs
         携带本步逐请求 finish_reason(原生停止条件判定),父类默认原样透传,
         未覆写时原生行为不变。"""
+        logger.info("11111")
         return model_output
 
     def _process_aborts_queue(self):
