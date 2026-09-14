@@ -6,16 +6,16 @@ from __future__ import annotations
 from collections import deque
 
 from vllm.logger import init_logger
-from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import (
     LwdBatch,
     LwdBatchType,
     LwdEmbedBatch,
     SchedulerOutput,
 )
-from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
 from vllm.v1.lwd_control.control_communication.lwd_notify import LwdRangeNotify
-from vllm.v1.request import Request
+from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
+    LwdBaseScheduler,
+)
 
 logger = init_logger(__name__)
 
@@ -23,7 +23,7 @@ _LWD_PHASE_PREFILL_FIRST = "prefill_first"
 _LWD_PHASE_DECODE_FIRST = "decode_first"
 
 
-class LwdCloudPhaseScheduler(AsyncScheduler):
+class LwdCloudPhaseScheduler(LwdBaseScheduler):
     """工作纯相位批次策略;相位(prefill_first/decode_first)构造期自解析。
     前置约束:不兼容 spec decode(eagle 会 shift num_computed_tokens,纯度判据失真)。"""
 
@@ -89,44 +89,6 @@ class LwdCloudPhaseScheduler(AsyncScheduler):
     # ------------------------------------------------------------------ #
     # Phase primitives(容器交换;原生 schedule() 零改动)                  #
     # ------------------------------------------------------------------ #
-    def _lwd_new_queue(self, reqs: list[Request]) -> RequestQueue:
-        """新建调度策略队列并装入 reqs。"""
-        queue = create_request_queue(self.policy)
-        for req in reqs:
-            queue.add_request(req)
-        return queue
-
-    def _lwd_schedule_for_visible_reqs(self, req_ids: list[str]) -> SchedulerOutput:
-        """把 req_ids 指定的请求从三队列剔除、单独调度,步后按原队列拼回。
-
-        waiting/skipped 来源的请求走原生准入窗口(allocate/状态迁移/
-        记账一样不少),running 来源的走续跑。拼回:仍被调度的接在隐藏
-        running 之后,被抢占的排 waiting 尾部,被跳过的排 skipped 队首。"""
-        picked = {self.requests[req_id] for req_id in req_ids}
-        from_running = [req for req in self.running if req in picked]
-        from_waiting = [req for req in self.waiting if req in picked]
-        from_skipped = [req for req in self.skipped_waiting if req in picked]
-        # 剔除后保存队列状态(隐藏集)
-        self.running = [req for req in self.running if req not in picked]
-        self.waiting.remove_requests(from_waiting)
-        self.skipped_waiting.remove_requests(from_skipped)
-        saved = (self.running, self.waiting, self.skipped_waiting)
-        # 被剔除的请求按原队列归位成可见集,单独调度
-        self.running = from_running
-        self.waiting = self._lwd_new_queue(from_waiting)
-        self.skipped_waiting = self._lwd_new_queue(from_skipped)
-        try:
-            out = super().schedule()
-        finally:
-            # 按原队列拼回:running 存活者接尾,waiting 被抢占者排队尾,
-            # skipped 被跳过者排队首
-            post = (self.running, self.waiting, self.skipped_waiting)
-            self.running, self.waiting, self.skipped_waiting = saved
-            self.running += post[0]
-            self.waiting.extend(post[1])
-            self.skipped_waiting.prepend_requests(post[2])
-        return out
-
     def _schedule_pure_prefill(self) -> SchedulerOutput:
         """纯 prefill 步:prefill_notify_queue 有预告则取队首 msg,单独
         调度其请求(按原队列归位,waiting/skipped 来源走原生准入);没有则
@@ -135,6 +97,11 @@ class LwdCloudPhaseScheduler(AsyncScheduler):
         if notify is not None and notify.request_id not in self.requests:
             # 请求已被 abort 释放:丢弃陈旧预告,本步按空集走
             notify = None
+        if notify is not None:
+            logger.info(
+                "[Lwd][cloud-sched] prefill notify req=%s seqno=%s num=%s",
+                notify.request_id, notify.seqno, notify.num_tokens,
+            )
         req_ids = [notify.request_id] if notify is not None else []
         out = self._lwd_schedule_for_visible_reqs(req_ids)
         if notify is None:
@@ -163,9 +130,10 @@ class LwdCloudPhaseScheduler(AsyncScheduler):
 
     def _schedule_pure_decode(self) -> SchedulerOutput:
         """纯 decode 步:收集全部 decode 态请求,剔除单独调度后按落点拼回。"""
-        return self._lwd_schedule_for_visible_reqs(
-            self._lwd_collect_decode_requests()
-        )
+        req_ids = self._lwd_collect_decode_requests()
+        if req_ids:
+            logger.info("[Lwd][cloud-sched] decode reqs=%s", req_ids)
+        return self._lwd_schedule_for_visible_reqs(req_ids)
 
     @staticmethod
     def _is_empty(out: SchedulerOutput) -> bool:

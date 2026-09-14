@@ -26,7 +26,6 @@ import time
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
-from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import (
     LwdBatch,
     LwdBatchType,
@@ -34,13 +33,16 @@ from vllm.v1.core.sched.output import (
     LwdUnembedBatch,
     SchedulerOutput,
 )
-from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LwdAbortNotify,
     LwdC2eNotify,
     LwdRangeNotify,
     LwdRequestNotify,
 )
+from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
+    LwdBaseScheduler,
+)
+from vllm.v1.lwd_debug import LwdControlLog
 from vllm.v1.request import RequestStatus
 
 if TYPE_CHECKING:
@@ -57,7 +59,7 @@ _LWD_ADD_RETRY_STEPS = 5
 _LWD_ADD_RETRY_INTERVAL_S = 0.2
 
 
-class LwdEdgeScheduler(AsyncScheduler):
+class LwdEdgeScheduler(LwdBaseScheduler):
     """纯 prefill 调度语义 + 控制面出口(notify/abort/seqno)。"""
 
     def __init__(
@@ -89,52 +91,64 @@ class LwdEdgeScheduler(AsyncScheduler):
         """单请求组批 + 原生分块决策。
 
         EMBED 批的 LwdBatch(seqno/token 片段)由 lwd_edge_notify 在
-        发布成功后挂批——seqno 必须与发布成功绑定。"""
+        发布成功后挂批——seqno 必须与发布成功绑定。
+
+        开新准入:云侧在途满员(lwd_edge_max_num_seqs_check 为 False)
+        时本步空排、新开请求留 waiting 等云侧排水;running 尚有未发完
+        embed 的续传不受闸门约束(先收尾再开新,亦防上限=1 时自锁)。"""
+        LwdControlLog.flight(len(self.running), len(self._lwd_awaiting))
+        if (
+            not self.lwd_edge_max_num_seqs_check()
+            and not self._lwd_has_prefill_chunk_inflight()
+        ):
+            return SchedulerOutput.make_empty()
         return self._lwd_schedule_single()
 
-    def _lwd_schedule_single(self) -> SchedulerOutput:
-        """单请求组批:容器交换让原生 schedule() 只见到一个工作单元。
-
-        可见集只放一个 prefill 工作单元——running 中第一个 prefill
-        优先(first_running_prefill,暂离其余进行中 prefill 与全部
-        waiting),否则只放行 waiting 队首;原生 schedule() 结构上
-        见不到第二个请求,批无法跨请求,单请求内的 chunked 决策
-        (预算截断/KV 抢占)照旧。暂离的 waiting 走队首回插
-        (含被抢占回插者),暂离的 prefill 接回 running 尾部,均保 FIFO。
-        """
-        first_running_prefill = next(
+    def _lwd_pick_prefill_req_id(self) -> str | None:
+        """选下一步 embed 工作单元:running 中第一个未发完的 prefill
+        优先(断点续传,先收尾再开新),否则 waiting 队首(FCFS 到达序);
+        两处皆无返回 None。"""
+        running_prefill = next(
             (r for r in self.running if r.num_computed_tokens < r.num_prompt_tokens),
             None,
         )
-        parked_waiting = self.waiting
-        self.waiting = create_request_queue(self.policy)
-        parked_prefills: list = []
-        if first_running_prefill is not None:
-            parked_prefills = [
-                r
-                for r in self.running
-                if r is not first_running_prefill
-                and r.num_computed_tokens < r.num_prompt_tokens
-            ]
-            if parked_prefills:
-                self.running = [
-                    r
-                    for r in self.running
-                    if r is first_running_prefill
-                    or r.num_computed_tokens >= r.num_prompt_tokens
-                ]
-        elif parked_waiting:
-            self.waiting.add_request(parked_waiting.peek_request())
+        if running_prefill is not None:
+            return running_prefill.request_id
+        return self.waiting.peek_request().request_id if self.waiting else None
 
-        try:
-            return super().schedule()
-        finally:
-            leftover = self.waiting
-            self.waiting = parked_waiting
-            while leftover:
-                self.waiting.prepend_request(leftover.pop_request())
-            if parked_prefills:
-                self.running = self.running + parked_prefills
+    def _lwd_schedule_single(self) -> SchedulerOutput:
+        """单请求组批:picker 选一个工作单元,经基类可见集机制单独调度。
+
+        选择规则见 _lwd_pick_prefill_req_id;队列剔除/隔离/拼回复用基类
+        _lwd_schedule_for_visible_reqs(waiting/skipped 来源走原生准入
+        窗口,running 来源走续跑)。语义注记:与旧手写容器交换不同,
+        本步被抢占的请求回 waiting 尾部、被跳过的回 skipped 队首,均取
+        基类统一语义,不再做队首回插。"""
+        req_id = self._lwd_pick_prefill_req_id()
+        if req_id is not None:
+            logger.info("[Lwd][edge-sched] pick req=%s", req_id)
+        return self._lwd_schedule_for_visible_reqs([req_id] if req_id else [])
+
+    def lwd_edge_max_num_seqs_check(self) -> bool:
+        """max_num_seqs 适配检查:云侧在途水位(running + awaiting)是否
+        还有名额,True=可开新请求。
+
+        awaiting 请求已清出调度器,原生准入只数 running(边侧恒≤1)
+        永远拦不住;以 running+awaiting 对账云侧在途数,达到
+        max_num_running_reqs 即满员。续传豁免不在本判断(schedule
+        闸门经 _lwd_has_prefill_chunk_inflight 放行收尾);请求到达
+        时的 announce 亦不受约束(云只登记不计算)。"""
+        return len(self.running) + len(self._lwd_awaiting) < self.max_num_running_reqs
+
+    def _lwd_has_prefill_chunk_inflight(self) -> bool:
+        """running 中是否存在未发完的 embed 请求(续传收尾中)。
+
+        与 _lwd_pick_prefill_req_id 的续传分支同判据,两处需保持一致:
+        闸门放行收尾的前提是 picker 必然挑中该续传请求而非开新。"""
+        return any(
+            req.num_computed_tokens < req.num_prompt_tokens
+            for req in self.running
+        )
 
     def lwd_edge_add_request(self, request: Request) -> None:
         """请求入口:边界校验 -> 云预告 -> 本地入队。
@@ -189,6 +203,10 @@ class LwdEdgeScheduler(AsyncScheduler):
             ):
                 return False
             self._lwd_seqno = seqno + 1
+            logger.info(
+                "[Lwd][edge-notify] req=%s offset=%d num=%d seqno=%d",
+                request_id, offset, num_tokens, seqno,
+            )
             # 发布成功即组 EMBED 批挂 SO:seqno 是数据面发云张量的
             # 配对键(与云侧 RangeNotify 登记同值),embed 载荷为本
             # chunk 的 token 片段
@@ -256,6 +274,11 @@ class LwdEdgeScheduler(AsyncScheduler):
         )
         for attempt in range(_LWD_ADD_RETRY_STEPS):
             if publisher.publish(message):
+                logger.info(
+                    "[Lwd][edge-notify] request meta announced: req=%s "
+                    "prompt=%d",
+                    request_id, num_prompt_tokens,
+                )
                 return
             time.sleep(_LWD_ADD_RETRY_INTERVAL_S * (attempt + 1))
         raise RuntimeError(
@@ -277,6 +300,10 @@ class LwdEdgeScheduler(AsyncScheduler):
             if not publisher.publish(LwdAbortNotify(request_id=request_id)):
                 logger.warning(
                     "[Lwd] drop abort signal for %s: publish queue full", request_id
+                )
+            else:
+                logger.info(
+                    "[Lwd][edge-notify] AbortNotify req=%s", request_id
                 )
 
     def lwd_edge_update_progress(self, executed: dict[str, int]) -> None:
@@ -305,6 +332,10 @@ class LwdEdgeScheduler(AsyncScheduler):
             now = time.monotonic()
             for request_id in finished_ids:
                 self._lwd_awaiting[request_id] = now
+                logger.info(
+                    "[Lwd][edge-progress] req=%s embed done -> awaiting",
+                    request_id,
+                )
 
     def lwd_edge_deliver_tokens(
         self, request_id: str, token_ids: list[int], finished: bool
@@ -320,9 +351,17 @@ class LwdEdgeScheduler(AsyncScheduler):
 
         token_ids/finished 的输出组包归引擎层(EngineCoreOutputs)。"""
         if request_id not in self._lwd_awaiting:
+            logger.warning(
+                "[Lwd][edge-deliver] stale result for req=%s (not awaiting)",
+                request_id,
+            )
             return False
         if finished:
             del self._lwd_awaiting[request_id]
+        logger.info(
+            "[Lwd][edge-deliver] req=%s tokens=%d finished=%s",
+            request_id, len(token_ids), finished,
+        )
         return True
 
     @staticmethod

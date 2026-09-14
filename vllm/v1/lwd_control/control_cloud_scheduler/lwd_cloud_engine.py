@@ -7,6 +7,8 @@ import threading
 import time
 from typing import TYPE_CHECKING
 
+import torch
+
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
@@ -28,6 +30,10 @@ from vllm.v1.lwd_control.control_communication.lwd_notify import (
     lwd_encode_cloud_notify,
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import LwdConfig
+from vllm.v1.lwd_debug import LwdDebug
+from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_phase_scheduler import (
+    LwdCloudPhaseScheduler,
+)
 from vllm.v1.request import Request
 
 if TYPE_CHECKING:
@@ -45,6 +51,16 @@ _LWD_C2E_SEND_RETRY_SLEEP_S = 0.05
 
 class LwdCloudEngineCore(EngineCoreProc):
     """云 PO 引擎:覆写 socket IO 线程入口,其余全走原生。"""
+
+    def __init__(self, *args, **kwargs) -> None:
+        # 调度器自注入须赶在 super() 之前(与边侧 LwdEdgeEngineCore 同款):
+        # super 构建 self.scheduler 时一次性消费 scheduler_cls,后设无效。
+        # 依赖 lwd_serve_guard 注入不可靠——guard 只在 headless serve 入口
+        # 执行,完整 serve 路径的 EngineCore 子进程不经 guard,缺注入会让
+        # IO 线程把 RangeNotify 写进裸 AsyncScheduler 而崩溃。
+        vllm_config = kwargs["vllm_config"]
+        vllm_config.scheduler_config.scheduler_cls = LwdCloudPhaseScheduler
+        super().__init__(*args, **kwargs)
 
     def _lwd_setup_zmq(self) -> None:
         """介入 ZMQ 双面:PRE_OUT bind 收边;POST_OUT connect 边,承载首拍
@@ -117,6 +133,10 @@ class LwdCloudEngineCore(EngineCoreProc):
     def _lwd_announce(self) -> None:
         """首拍 HELLO 通告一次;队满不重试,由边侧等待超时 fail-fast 兜底。"""
         self._lwd_post_out.publish(self._lwd_hello)
+        logger.info(
+            "[Lwd][cloud] HELLO announced: pre_out=%s:%s",
+            self._lwd_hello.pre_out_host, self._lwd_hello.pre_out_port,
+        )
 
     def shutdown(self) -> None:
         """两面关停后走原生(幂等;装配失败路径两面可能未建,容忍缺省)。"""
@@ -138,12 +158,17 @@ class LwdCloudEngineCore(EngineCoreProc):
             seqnos = self._lwd_seqno_registry.setdefault(msg.request_id, [])
             if not seqnos or msg.seqno > seqnos[-1]:
                 seqnos.append(msg.seqno)
+            logger.info(
+                "[Lwd][cloud-ctrl] RangeNotify req=%s num=%s seqno=%s",
+                msg.request_id, msg.num_tokens, msg.seqno,
+            )
             # 每条预告都整条入队(重复预告即重复点名,剔除-调度-拼回幂等,
             # 无副作用;PRE_OUT 只 append,调度主线程单独 popleft,deque
             # 单操作原子;预告自带 seqno,出批时作 UP 链配对号)
             self.scheduler.prefill_notify_queue.append(msg)
             return
         if isinstance(msg, LwdAbortNotify):
+            logger.info("[Lwd][cloud-ctrl] AbortNotify req=%s", msg.request_id)
             self._lwd_gate_pending.pop(msg.request_id, None)
             # 双队列与原生 ABORT 同款:eager 处理 + 保持 input_queue 次序
             self.aborts_queue.put_nowait([msg.request_id])
@@ -153,6 +178,7 @@ class LwdCloudEngineCore(EngineCoreProc):
         if rid in self._lwd_gate_pending:
             logger.warning("[Lwd] duplicate request metadata %s ignored", rid)
             return
+        logger.info("[Lwd][cloud-ctrl] RequestNotify req=%s", rid)
         self._lwd_gate_pending[rid] = msg
         self._lwd_promote(rid)
 
@@ -187,13 +213,28 @@ class LwdCloudEngineCore(EngineCoreProc):
         # input_processor):设 _eos_token_id 并计入 _all_stop_token_ids
         # 供 min_tokens 判定;云侧无客户端 generation_config,传空。
         sampling_params.update_from_generation_config({}, wire.eos_token_id)
+        LwdDebug.cloud_request_admitted(wire, sampling_params)  # [lwd-debug]
+        # 不传真实 ids 也不造占位:按原生 prompt-embeds 语义挂零缓冲,
+        # 行数即 prompt 长度(UP chunk 注入直接写该缓冲的对应窗口);
+        # ids=None 时 input_batch 自动把 prompt 段 is_token_ids 置 False,
+        # M-RoPE 走纯文本直通构造(与扫描结果逐值一致)。
+        prompt_ids: list[int] | None = None
+        prompt_embeds = torch.zeros(
+            wire.num_prompt_tokens,
+            self.vllm_config.model_config.get_hidden_size(),
+            dtype=self.vllm_config.model_config.dtype,
+        )
+        logger.info(
+            "[Lwd][cloud-ctrl] build request req=%s prompt=%d ids=none+embeds_buf",
+            wire.request_id, wire.num_prompt_tokens,
+        )
         local_hasher = self.request_block_hasher
         if local_hasher is None:
             # prefix caching 未启用:请求不挂 hasher,整链机制不激活
             return Request(
                 request_id=wire.request_id,
-                # 占位 token:云侧调度只看长度,真值由边侧提供
-                prompt_token_ids=[0] * wire.num_prompt_tokens,
+                prompt_token_ids=prompt_ids,
+                prompt_embeds=prompt_embeds,
                 sampling_params=sampling_params,
                 pooling_params=None,
             )
@@ -211,7 +252,8 @@ class LwdCloudEngineCore(EngineCoreProc):
 
         return Request(
             request_id=wire.request_id,
-            prompt_token_ids=[0] * wire.num_prompt_tokens,
+            prompt_token_ids=prompt_ids,
+            prompt_embeds=prompt_embeds,
             sampling_params=sampling_params,
             pooling_params=None,
             block_hasher=block_hasher,
@@ -227,8 +269,19 @@ class LwdCloudEngineCore(EngineCoreProc):
         (原生停止条件即云侧 decode 终结的事实源),其余原样透传。"""
         meta = model_output.lwd_c2e_meta
         if meta is not None:
+            logger.info(
+                "[Lwd][cloud-ctrl] handle_model_output: c2e_meta received "
+                "reqs=%s down_seqno=%s, forwarding to edge",
+                getattr(meta, "req_ids", None),
+                getattr(meta, "down_seqno", None),
+            )
+            LwdDebug.cloud_step(self.scheduler, meta, engine_core_outputs)  # [lwd-debug]
             self._lwd_publish_c2e(
                 meta, self._lwd_c2e_finish_reasons(meta, engine_core_outputs)
+            )
+        else:
+            logger.info(
+                "[Lwd][cloud-ctrl] handle_model_output: no c2e_meta this step"
             )
         return model_output
 
@@ -263,5 +316,13 @@ class LwdCloudEngineCore(EngineCoreProc):
         )
         while not self._lwd_post_out.closed:
             if self._lwd_post_out.publish(notify):
+                logger.info(
+                    "[Lwd][cloud-ctrl] publish C2eNotify reqs=%d down_seqno=%s "
+                    "finish=%s hidden_elems=%s",
+                    len(notify.req_ids),
+                    notify.down_seqno,
+                    finish_reasons,
+                    notify.hidden_num_elements,
+                )
                 return
             time.sleep(_LWD_C2E_SEND_RETRY_SLEEP_S)

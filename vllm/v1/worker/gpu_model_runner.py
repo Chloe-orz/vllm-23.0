@@ -230,6 +230,12 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Lwd 逐层对拍(vllm 仓侧两个公共点:positions gather 与 sampler 入口)。
+# 集中式/边云同路径打点;详见 vllm_ascend/worker/lwd_layer_trace.py。
+import os as _lwd_os
+
+_LWD_LAYER_TRACE = _lwd_os.getenv("VLLM_ASCEND_LWD_LAYER_TRACE", "") == "1"
+
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
@@ -1593,6 +1599,17 @@ class GPUModelRunner(
     def _init_mrope_positions(self, req_state: CachedRequestState):
         model = self.get_model()
         assert supports_mrope(model), "M-RoPE support is not implemented."
+        if req_state.prompt_token_ids is None:
+            # prompt-embeds only(如 LWD 云侧):纯文本 M-RoPE positions 与
+            # ids 内容无关(扫描仅认 vision 标记,纯文本恒为 arange),
+            # 直接按 prompt 长度构造,与 get_mrope_input_positions 对
+            # 纯文本的输出逐值一致。
+            n = req_state.num_prompt_tokens
+            req_state.mrope_positions = (
+                torch.arange(n).unsqueeze(0).expand(3, n).clone()
+            )
+            req_state.mrope_position_delta = 0
+            return
         assert req_state.prompt_token_ids is not None, (
             "M-RoPE requires prompt_token_ids to be available."
         )
@@ -1983,6 +2000,13 @@ class GPUModelRunner(
                     self.inputs_embeds.cpu[
                         output_idx : output_idx + actual_num_sched
                     ].copy_(req_embeds[start_pos:actual_end])
+                    from vllm.v1.lwd_debug import LwdDebug
+                    LwdDebug.cloud_fill_window(  # [lwd-debug]
+                        self.input_batch.req_ids[req_idx],
+                        start_pos,
+                        actual_num_sched,
+                        req_embeds[start_pos:actual_end],
+                    )
 
                 output_idx += num_sched
 
@@ -2098,6 +2122,13 @@ class GPUModelRunner(
             self.num_computed_tokens[req_indices_gpu].to(torch.int64)
             + self.query_pos.gpu[:total_num_scheduled_tokens]
         )
+        if _LWD_LAYER_TRACE:
+            _n = min(12, total_num_scheduled_tokens)
+            logger.info(
+                "[layer-trace] positions n=%d first%d=%s",
+                total_num_scheduled_tokens, _n,
+                self.positions[:_n].tolist(),
+            )
         self.seq_lens[:num_reqs] = (
             self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
         )
@@ -3437,7 +3468,26 @@ class GPUModelRunner(
         # modal outputs after that to ensure the correct order
         ec_connector_output = None
 
-        if self.supports_mm_inputs and is_first_rank and not is_encoder_decoder:
+        # 批里有 prompt embeds 时优先走 prompt-embeds 分支:MM 分支会用
+        # input_ids 现算 embedding 并整体覆盖 inputs_embeds,远程/外部
+        # embeds 全部丢失;而 prompt-embeds 分支对 embeds 位置用缓冲、对
+        # token 位置本地补 embedding,混批也是正确超集。
+        has_prompt_embeds = self.enable_prompt_embeds and bool(
+            self.input_batch.req_prompt_embeds
+        )
+        if (
+            self.supports_mm_inputs
+            and not has_prompt_embeds
+            and is_first_rank
+            and not is_encoder_decoder
+        ):
+            from vllm.v1.lwd_debug import LwdDebug
+            LwdDebug._log(  # [lwd-debug]
+                "[lwd-branch-dbg] preprocess: MM branch (supports_mm_inputs=True), "
+                "n=%d, input_ids[:8]=%s",
+                num_scheduled_tokens,
+                self.input_ids.gpu[: min(8, num_scheduled_tokens)].tolist(),
+            )
             # Run the multimodal encoder if any.
             with self.maybe_get_ec_connector_output(
                 scheduler_output,
@@ -3464,6 +3514,11 @@ class GPUModelRunner(
                 **self._extract_mm_kwargs(scheduler_output),
             }
         elif self.enable_prompt_embeds and is_first_rank:
+            from vllm.v1.lwd_debug import LwdDebug
+            LwdDebug._log(  # [lwd-debug]
+                "[lwd-branch-dbg] preprocess: prompt-embeds branch, n=%d",
+                num_scheduled_tokens,
+            )
             # Get the input embeddings for the tokens that are not input embeds,
             # then put them into the appropriate positions.
             # TODO(qthequartermasterman): Since even when prompt embeds are
@@ -3490,6 +3545,11 @@ class GPUModelRunner(
             model_kwargs = self._init_model_kwargs()
             input_ids = None
         else:
+            from vllm.v1.lwd_debug import LwdDebug
+            LwdDebug._log(  # [lwd-debug]
+                "[lwd-branch-dbg] preprocess: text-only branch, n=%d",
+                num_scheduled_tokens,
+            )
             # For text-only models, we use token ids as input.
             # While it is possible to use embeddings as input just like the
             # multimodal models, it is not desirable for performance since
@@ -3538,6 +3598,20 @@ class GPUModelRunner(
         logits: torch.Tensor | None,
         spec_decode_metadata: SpecDecodeMetadata | None,
     ) -> SamplerOutput:
+        if _LWD_LAYER_TRACE and logits is not None and logits.dim() == 2:
+            _row = logits[-1].detach().float()
+            _vals, _ids = torch.topk(_row, min(20, _row.numel()))
+            logger.info(
+                "[layer-trace] sampler logits shape=%s last_row l2=%.4f "
+                "top20=%s",
+                tuple(logits.shape), _row.norm().item(),
+                list(
+                    zip(
+                        _ids.tolist(),
+                        [round(v, 3) for v in _vals.tolist()],
+                    )
+                ),
+            )
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
         # Update output token ids with tokens sampled in last step
@@ -4427,7 +4501,7 @@ class GPUModelRunner(
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
         )
-        if self.use_async_scheduling:
+        if self.use_async_scheduling and not self.parallel_config.lwd_config.enable_lwd:
             pp = get_pp_group()
             # For torchrun external_launcher PP mode with broadcast_pp_output=True,
             # PP outputs have been broadcasted to all ranks at logits computation.
@@ -4667,7 +4741,7 @@ class GPUModelRunner(
     def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
         """Receive sampled token ids broadcast from last PP stage"""
         pp = get_pp_group()
-        assert not pp.is_last_rank
+        assert not pp.is_last_rank and not self.parallel_config.lwd_config.enable_lwd
         num_reqs = self.input_batch.num_reqs
         # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
         recv = torch.empty((num_reqs, 1), dtype=torch.int32, device=self.device)

@@ -1836,7 +1836,12 @@ class EngineArgs:
             "nnodes > 1 is only supported with data_parallel_backend=mp"
         )
         inferred_data_parallel_rank = 0
-        if self.nnodes > 1:
+        # LWD (edge-cloud): enable_lwd is only back-filled into ParallelConfig
+        # in VllmConfig.__post_init__, which runs after this method, so read
+        # the raw additional_config dict here instead.
+        lwd_cfg = (self.additional_config or {}).get("lwd_config") or {}
+        lwd_enabled = bool(lwd_cfg.get("enabled", False))
+        if self.nnodes > 1 and not lwd_enabled:
             world_size = (
                 self.data_parallel_size
                 * self.pipeline_parallel_size
@@ -1867,6 +1872,9 @@ class EngineArgs:
                 self.data_parallel_size_local = max(
                     local_world_size // world_size_within_dp, 1
                 )
+        elif lwd_enabled:
+            # In LWD edge-cloud mode, all DP instances run on each node
+            self.data_parallel_size_local = self.data_parallel_size
         data_parallel_external_lb = (
             self.data_parallel_external_lb or self.data_parallel_rank is not None
         )
