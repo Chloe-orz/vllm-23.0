@@ -38,8 +38,9 @@ RE_CLOUD_NOTIFY = re.compile(
     r"\[Lwd\]\[cloud-ctrl\] handle_model_output: c2e_meta received "
     r"reqs=(\S+) down_seqno=(\d+)")
 RE_CLOUD_STEP = re.compile(r"\[Lwd\]\[perf\] cloud-step dt=([\d.]+)ms")
+# ch= 后是枚举 str(LwdChannelType.UP) 含点号,[\w.+] 才能吃下
 RE_BRIDGE = re.compile(
-    r"\[Lwd\]\[perf\] bridge-wait op=(\w+) ch=(\w+) dur=([\d.]+)ms")
+    r"\[Lwd\]\[perf\] bridge-wait op=(\w+) ch=([\w.]+) dur=([\d.]+)ms")
 RE_EDGE_UNEMBED = re.compile(r"\[Lwd\]\[edge-worker\] UNEMBED seqno=(\d+)")
 RE_EDGE_PERF = re.compile(
     r"\[Lwd\]\[perf\] unembed seqno=(\S+) post_recv=([\d.]+) "
@@ -199,7 +200,8 @@ def analyze(cloud_log: str, edge_log: str, verbose: bool) -> None:
         n_true = sum(up_recv_ready)
         print(f"   [up-recv · 云收 embed · 取用时已就绪] "
               f"{n_true}/{len(up_recv_ready)} "
-              f"(False 多 = 云侧消费拖节奏;True 多 = 边侧发送是源头)")
+              f"(False 多 = 边侧发送/传输慢,云在等数据;"
+              f"True 多 = 云侧消费拖节奏)")
 
     print("=" * 64)
     print("③ 尾巴检测(时钟无关:边事件从'等云节奏'切到'背靠背清账')")
@@ -237,11 +239,13 @@ def analyze(cloud_log: str, edge_log: str, verbose: bool) -> None:
         if ss[len(ss) // 2] > 5.0:
             verdicts.append(
                 f"embed submit_send p50={ss[len(ss) // 2]:.1f}ms 偏大:"
-                "UP 广播提交被云侧入队节奏拖住(chunk 级锁步),TTFT 主嫌疑")
+                "UP 广播提交阻塞(对照 up-recv:云若在等数据=边侧/传输慢;"
+                "首块大后续小=一次性建链)")
     if up_recv_ready and sum(up_recv_ready) < len(up_recv_ready) * 0.3:
         verdicts.append(
             f"up-recv 就绪率仅 {sum(up_recv_ready)}/{len(up_recv_ready)}:"
-            "张量长期等云侧来取——云消费节奏是 prefill 瓶颈")
+            "云先挂收在等数据——瓶颈在边侧发送/传输"
+            "(对照 embed submit_send 时长)")
     if step_dt and c_iv:
         dt_mean = sum(step_dt) / len(step_dt)
         pace = sum(c_iv) / len(c_iv)
