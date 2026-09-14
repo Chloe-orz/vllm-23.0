@@ -28,6 +28,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
+from collections import deque
 
 from vllm.logger import init_logger
 from vllm.v1.engine import (
@@ -43,7 +44,7 @@ from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
 from vllm.v1.lwd_control.control_communication.lwd_control_subscriber import (
     LwdControlSubscriber,
 )
-from vllm.v1.lwd_debug import LwdControlLog, LwdDebug, LwdLogBase
+from vllm.v1.lwd_debug import LwdDebug, LwdLogBase
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LWD_NOT_FINISHED,
     LwdC2eNotify,
@@ -64,6 +65,10 @@ logger = init_logger(__name__)
 # 云->边载荷队列容量:队满时接收线程阻塞在 put,背压沿 ZMQ 直达云侧
 # 步发送循环(载荷不可丢)
 LWD_C2E_META_QUEUE_MAX = 1000
+
+# 批队列在飞深度上限:派发(embed+unembed 合计)不收割的批数上限,
+# 突发积压时连续派发喂饱 worker(参照仓经验 >=4 才能维持流水对齐)
+LWD_EDGE_BATCH_QUEUE_DEPTH = 4
 
 
 class LwdEdgeEngineCore(EngineCoreProc):
@@ -88,6 +93,11 @@ class LwdEdgeEngineCore(EngineCoreProc):
         # UNEMBED 批的 lwd_c2e_notifies 拿元数据,不直接读队列
         # (单消费者语义)
         self.lwd_c2e_meta_queue = queue.Queue(maxsize=LWD_C2E_META_QUEUE_MAX)
+        # 已派发待收割的批队列 (kind, payload, future):kind="unembed"
+        # payload=notify;kind="embed" payload=scheduler_output。派发不
+        # 收割,队首 FIFO 收割——必须全局单队列:executor 的 FutureWrapper
+        # 按底层队列序排水,交错收割会连带等错批
+        self._lwd_batch_queue: deque = deque()
         hello_event = threading.Event()
         discovery = threading.Thread(
             target=self._receive_thread,
@@ -197,140 +207,74 @@ class LwdEdgeEngineCore(EngineCoreProc):
         return self._lwd_edge_step()
 
     def has_work(self) -> bool:
-        """c2e 载荷队列也计入工作:WAKEUP 只能打断阻塞的 get,轮询
-        循环是否退出由本判据决定(core.py while not has_work)——不含
-        载荷队列时,WAKEUP 被消费后循环重新阻塞,载荷成死信、token
-        永不投递。"""
-        return super().has_work() or not self.lwd_c2e_meta_queue.empty()
+        """c2e 载荷队列与待收割批队列都计入工作:WAKEUP 只能打断阻塞的
+        get,轮询循环是否退出由本判据决定(core.py while not has_work)。
+        批队列非空必须计入——否则最后一批派发后引擎睡眠,最终 token
+        永不收割交付。"""
+        return (super().has_work() or not self.lwd_c2e_meta_queue.empty()
+                or self._lwd_batch_queue)
 
     def _lwd_edge_step(self) -> tuple[dict[int, object] | None, bool]:
-        """单步编排:云载荷消费 -> prefill 编排 -> 步末完结登记;
-        返回 ({0: 云侧结果输出} | None, prefill 是否有工作)——主循环
-        按 frontend 字典消费(outputs.items()),单前端恒为键 0。"""
-        outputs, finished_reqs = self._lwd_edge_consume_c2e()
-        executed: dict[str, int] = {}
-        if self.scheduler.has_requests():
+        """单步编排(批队列异步化+多批在飞):收割队首直至清空 -> 消费
+        云载荷(派发至深度上限) -> prefill 连续派发 -> 返回
+        ({0: 云侧结果输出} | None, prefill 是否有派发)。
+
+        embed/unembed 均派发入队不收割,队首全局 FIFO 收割(序与
+        executor 排水序同构);突发时一步连派至深度上限喂饱 worker。
+        代价:token 交付与 embed 进度登记晚若干引擎步。"""
+        outputs: list = []
+        finished_reqs: set = set()
+        prefill_work = False
+        while self._lwd_batch_queue:
+            kind, payload, future = self._lwd_batch_queue.popleft()
+            if kind == "unembed":
+                self._lwd_deliver_unembed(
+                    payload, future, outputs, finished_reqs
+                )
+            else:
+                self.scheduler.lwd_edge_update_progress(
+                    dict(payload.num_scheduled_tokens)
+                )
+                prefill_work = True
+        self._lwd_edge_consume_c2e()
+        while (len(self._lwd_batch_queue) < LWD_EDGE_BATCH_QUEUE_DEPTH
+               and self.scheduler.has_requests()):
             scheduler_output = self.scheduler.schedule()
+            if not scheduler_output.num_scheduled_tokens:
+                break
             future = self._lwd_dispatch_embed(scheduler_output)
-            if future is not None:
-                # 同步路径 = 提交后立即收割;调度量即执行量,
-                # 数据面异步化后由此改报实际量
-                future.result()
-                executed = dict(scheduler_output.num_scheduled_tokens)
-            LwdControlLog.phase("edge step: %d reqs executed", len(executed))
-        self.scheduler.lwd_edge_update_progress(executed)
+            if future is None:
+                break
+            self._lwd_batch_queue.append(
+                ("embed", scheduler_output, future)
+            )
+            prefill_work = True
         if outputs:
             step_outputs = EngineCoreOutputs(
                 outputs=outputs,
                 finished_requests=finished_reqs or None,
             )
-            return {0: step_outputs}, bool(executed)
-        return None, bool(executed)
+            return {0: step_outputs}, prefill_work
+        return None, prefill_work
 
     def _lwd_edge_consume_c2e(self) -> tuple[list, set]:
-        """消费云载荷(LwdC2eNotify,云->边唯一载荷)并产出前端输出。
-
-        逐条通告交付(批间顺序 = 到达顺序),分流与交付逻辑收在
-        _lwd_deliver_notify:按 hidden 行数分流——有行(含完结请求,
-        终步最后一行 hidden 与完成码同通告到达)组 UNEMBED 批提交
-        worker 做 lm_head(一条通告对应一个 DOWN 张量,一一批配对
-        无需切分拼接);无行走本地终结流程(不下发 worker)。
-
-        token 逐条交付(finish_reason=None),完结请求的最后一个
-        token 随云侧完成码一并交付(STOP/LENGTH 等原样透传),流式/
-        非流式由原生前端透明处理,引擎层恒为增量;finish_reasons 与
-        req_ids 构造上严格对齐(云侧逐位推导),错配即 IndexError
-        fail-fast,无缺省兜底。
-
-        应答契约:worker 经原生 future 返回 ModelRunnerOutput 形态,
-        token ids 按 req_ids x sampled_token_ids 按位对齐还原;缺席/为空
-        即该请求 unembed 失败,以 FinishReason.ERROR 终结(原生 ERROR
-        通道转 5xx),不静默降级为空 STOP 输出。迟到载荷(请求不在
-        awaiting)丢弃告警,幂等不复活;UNEMBED 批与 prefill 排程在
-        同一线程序行,无顺序耦合。
-        """
+        """消费 c2e 通告:派发 UNEMBED 批入批队列(异步收割)。
+        云侧有活请求才产 meta(build_hidden_payload 空则返回 None),
+        每条 entry 行数>=1——通告必有行,无需无行分流。"""
+        quota = LWD_EDGE_BATCH_QUEUE_DEPTH - len(self._lwd_batch_queue)
         notifies: list[LwdC2eNotify] = []
-        while True:
+        while len(notifies) < quota:
             try:
-                notify = self.lwd_c2e_meta_queue.get_nowait()
+                notifies.append(self.lwd_c2e_meta_queue.get_nowait())
             except queue.Empty:
-                break
-            notifies.append(notify)
-            # 每步最多带一条带行(贵)通告:其余留 FIFO 队列,后续步逐条
-            # 消化——防 N 条连收时同步 unembed 垄断阻塞,挤死本步的
-            # embed 派发(收时停发);队列非空本身维持 has_work 连续步进
-            if notify.req_ids and notify.hidden_num_elements > 0:
                 break
         if not notifies:
             return [], set()
 
-        outputs: list = []
-        finished_reqs: set = set()
-
         for notify in notifies:
-            # 通告级以 hidden 行数分流,一条通告一次交付
-            self._lwd_deliver_notify(notify, outputs, finished_reqs)
-        return outputs, finished_reqs
-
-    def _lwd_deliver_finish(
-        self, notify: LwdC2eNotify, outputs: list, finished_reqs: set,
-    ) -> None:
-        """无行通告的本地终结流程:不下发 worker,带完成码的请求以云侧
-        完成码空输出终结(原样透传),无行且未完结的位无内容可交付,
-        防御跳过;迟到载荷幂等丢弃。同步/异步提交阶段共用。
-
-        仅协议容错路径:现实近乎不发生(云侧无行不发通告);完结请求
-        的最后一行 hidden 与完成码同通告到达,须走 unembed 路径恢复
-        最后一个 token,不经本方法。"""
-        for index, request_id in enumerate(notify.req_ids):
-            finish_reason = self._lwd_finish_code(notify, index)
-            if finish_reason is None:
-                # 无行且未完结:无内容可交付,防御跳过
-                continue
-            if not self.scheduler.lwd_edge_deliver_tokens(
-                request_id, [], finished=True
-            ):
-                logger.warning(
-                    "[Lwd] drop stale cloud payload for %s (not awaiting)",
-                    request_id,
-                )
-                continue
-            outputs.append(
-                EngineCoreOutput(
-                    request_id, [], finish_reason=finish_reason
-                )
-            )
-            finished_reqs.add(request_id)
-
-    def _lwd_deliver_notify(
-        self, notify: LwdC2eNotify, outputs: list, finished_reqs: set,
-    ) -> None:
-        """单条 c2e 通告的完整交付流程。
-
-        分流判据是 hidden 行数而非完成码:完结请求的最后一行 hidden
-        与完成码在同一条通告到达(云 worker 无 FIN 包,终步数据随终步
-        发出),最后一个 token 必须走 unembed 恢复——hidden_num_elements
-        > 0 一律组 UNEMBED 批下发 worker,收割侧逐请求处理完成码
-        (token 带完成码交付);仅无行通告(hidden_num_elements == 0,
-        现实近乎不发生——云侧无行不发通告)走本地终结流程,不下发
-        worker。行序 = req_ids 序,与 DOWN 张量行序一致;一条通告对应
-        一个 DOWN 张量,一一批配对无需切分拼接。
-
-        finish_reasons 与 req_ids 逐位严格对齐(云侧逐位推导),错配
-        IndexError fail-fast,无缺省兜底;迟到载荷(请求不在 awaiting)
-        幂等丢弃。应答契约:token ids 按 ModelRunnerOutput 的 req_ids x
-        sampled_token_ids 按位对齐还原(批的 req_ids 原样下发、worker
-        逐位回填),缺席/为空 = unembed 失败,ERROR 优先于云侧完成码,
-        不静默降级为空输出。"""
-
-        # ---- 无 hidden 行:纯终结通告,不下发 worker,本地终结 ----
-        if not notify.req_ids or notify.hidden_num_elements <= 0:
-            self._lwd_deliver_finish(notify, outputs, finished_reqs)
-            return
-
-        # ---- 有 hidden 行(含完结请求):组 UNEMBED 批恢复 token ----
-        future = self._lwd_dispatch_unembed(notify)
-        self._lwd_deliver_unembed(notify, future, outputs, finished_reqs)
+            future = self._lwd_dispatch_unembed(notify)
+            self._lwd_batch_queue.append(("unembed", notify, future))
+        return [], set()
 
     def _lwd_dispatch_embed(self, scheduler_output):
         """EMBED 批提交侧(唯一提交点,同步/异步共用):范围预告(发布
