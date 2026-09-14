@@ -102,11 +102,12 @@ def analyze(cloud_log: str, edge_log: str, verbose: bool) -> None:
     cloud_ts: list[float] = []
     cloud_seq: list[int] = []
     step_dt: list[float] = []
+    step_ts: list[float] = []
     bridge: dict[tuple[str, str], list[float]] = {}
     for line in read_lines(cloud_log):
+        t = parse_ts(line)
         m = RE_CLOUD_NOTIFY.search(line)
         if m:
-            t = parse_ts(line)
             if t is not None:
                 cloud_ts.append(t)
                 cloud_seq.append(int(m.group(2)))
@@ -114,26 +115,38 @@ def analyze(cloud_log: str, edge_log: str, verbose: bool) -> None:
         m = RE_CLOUD_STEP.search(line)
         if m:
             step_dt.append(float(m.group(1)))
+            if t is not None:
+                step_ts.append(t)
             continue
         m = RE_BRIDGE.search(line)
         if m:
             bridge.setdefault((m.group(1), m.group(2)), []).append(
                 float(m.group(3)))
+    # 引擎 handle_model_output 行被清理后,云事件流回退到探针行时间戳
+    if len(cloud_ts) < 10 and step_ts:
+        cloud_ts = step_ts
 
     # ---- 边侧 ----
+    # 事件锚点优先级:UNEMBED 派发行(旧)> [Lwd][perf] unembed 行(现有,
+    # 携带 seqno)——后者在"移除调试日志"提交后是唯一可靠锚
     edge_ts: list[float] = []
     edge_seq: list[int] = []
     seg: dict[str, list[float]] = {}
     for line in read_lines(edge_log):
+        t = parse_ts(line)
         m = RE_EDGE_UNEMBED.search(line)
-        if m:
-            t = parse_ts(line)
-            if t is not None:
-                edge_ts.append(t)
-                edge_seq.append(int(m.group(1)))
+        if m and t is not None:
+            edge_ts.append(t)
+            edge_seq.append(int(m.group(1)))
             continue
         m = RE_EDGE_PERF.search(line)
         if m:
+            if t is not None and not edge_ts:
+                edge_ts.append(t)
+                try:
+                    edge_seq.append(int(m.group(1)))
+                except ValueError:
+                    pass
             for name, idx in (("post_recv", 2), ("wait_tensor", 3),
                               ("lm_head", 4), ("select", 5), ("total", 6)):
                 seg.setdefault(name, []).append(float(m.group(idx)))
