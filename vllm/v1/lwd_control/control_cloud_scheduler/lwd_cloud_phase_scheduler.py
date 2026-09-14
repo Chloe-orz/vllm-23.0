@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import time
 from collections import deque
 
 from vllm.logger import init_logger
@@ -147,6 +148,15 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
         return not self._lwd_has_decode_ready()
 
     def schedule(self) -> SchedulerOutput:
+        # [Lwd][perf] 云侧每步 LWD 税分段之一:相位调度(容器交换)时长
+        _t = time.monotonic()
+        out = self._schedule_impl()
+        logger.info(
+            "[Lwd][perf] cloud-sched dur=%.2fms", (time.monotonic() - _t) * 1000
+        )
+        return out
+
+    def _schedule_impl(self) -> SchedulerOutput:
         prefer_prefill = self._prefer_prefill()
         if self._force_prefill_once:
             self._force_prefill_once = False

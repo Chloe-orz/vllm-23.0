@@ -51,6 +51,14 @@ RE_EMBED_PERF = re.compile(
     r"submit_send=([\d.]+) total=([\d.]+)ms")
 RE_UP_RECV = re.compile(
     r"\[Lwd\]\[perf\] up-recv seqno=(\S+) ready_at_take=(\w+)")
+RE_RANK = re.compile(r"\[Lwd\]\[perf\] rank-calc rows=(\d+) dur=([\d.]+)ms")
+RE_PACK = re.compile(
+    r"\[Lwd\]\[perf\] step-pack collect=([\d.]+) pack=([\d.]+) rows=(\d+)")
+RE_DOWN_SEND = re.compile(
+    r"\[Lwd\]\[perf\] down-send seqno=(\d+) submit=([\d.]+)ms")
+RE_PUBLISH = re.compile(
+    r"\[Lwd\]\[perf\] publish reqs=(\d+) dur=([\d.]+)ms")
+RE_CLOUD_SCHED = re.compile(r"\[Lwd\]\[perf\] cloud-sched dur=([\d.]+)ms")
 RE_HARVEST = re.compile(r"\[Lwd\]\[perf\] harvest dur=([\d.]+)ms")
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -110,6 +118,7 @@ def analyze(cloud_log: str, edge_log: str, verbose: bool) -> None:
     step_dt: list[float] = []
     step_ts: list[float] = []
     up_recv_ready: list[int] = []  # 1=True 0=False(云 worker 的 up-recv 行)
+    tax: dict[str, list[float]] = {}  # 云侧每步 LWD 税分段
     bridge: dict[tuple[str, str], list[float]] = {}
     for line in read_lines(cloud_log):
         t = parse_ts(line)
@@ -122,6 +131,29 @@ def analyze(cloud_log: str, edge_log: str, verbose: bool) -> None:
         m = RE_UP_RECV.search(line)
         if m:
             up_recv_ready.append(1 if m.group(2) == "True" else 0)
+            continue
+        m = RE_RANK.search(line)
+        if m:
+            tax.setdefault("rank-calc(all_gather+求和)", []).append(
+                float(m.group(2)))
+            continue
+        m = RE_PACK.search(line)
+        if m:
+            tax.setdefault("collect(采样收集)", []).append(float(m.group(1)))
+            tax.setdefault("pack(hidden拼接)", []).append(float(m.group(2)))
+            continue
+        m = RE_DOWN_SEND.search(line)
+        if m:
+            tax.setdefault("down-send(提交)", []).append(float(m.group(2)))
+            continue
+        m = RE_PUBLISH.search(line)
+        if m:
+            tax.setdefault("publish(码+ZMQ)", []).append(float(m.group(2)))
+            continue
+        m = RE_CLOUD_SCHED.search(line)
+        if m:
+            tax.setdefault("cloud-sched(相位调度)", []).append(
+                float(m.group(1)))
             continue
         m = RE_CLOUD_STEP.search(line)
         if m:
@@ -204,7 +236,15 @@ def analyze(cloud_log: str, edge_log: str, verbose: bool) -> None:
               f"True 多 = 云侧消费拖节奏)")
 
     print("=" * 64)
-    print("③ 尾巴检测(时钟无关:边事件从'等云节奏'切到'背靠背清账')")
+    print("③ 云侧每步 LWD 税分段(对账:各段之和 ≈ cloud-step dt − 纯计算)")
+    for name in ("rank-calc(all_gather+求和)", "collect(采样收集)",
+                 "pack(hidden拼接)", "down-send(提交)",
+                 "publish(码+ZMQ)", "cloud-sched(相位调度)"):
+        if name in tax:
+            print(f"   {name:<26}: {stats(tax[name])} ms")
+
+    print("=" * 64)
+    print("④ 尾巴检测(时钟无关:边事件从'等云节奏'切到'背靠背清账')")
     tail_cnt = tail_ms = 0
     if e_iv and seg.get("total"):
         svc = sum(seg["total"]) / len(seg["total"])  # 边服务时长

@@ -285,8 +285,14 @@ class LwdCloudEngineCore(EngineCoreProc):
                 getattr(meta, "down_seqno", None),
             )
             LwdDebug.cloud_step(self.scheduler, meta, engine_core_outputs)  # [lwd-debug]
+            _t = time.monotonic()
             self._lwd_publish_c2e(
                 meta, self._lwd_c2e_finish_reasons(meta, engine_core_outputs)
+            )
+            # [Lwd][perf] 云侧 LWD 税:finish 码推导 + ZMQ publish
+            logger.info(
+                "[Lwd][perf] publish reqs=%d dur=%.2fms",
+                len(meta.req_ids), (time.monotonic() - _t) * 1000,
             )
         else:
             logger.info(
