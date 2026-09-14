@@ -313,6 +313,7 @@ class LwdCloudEngineCore(EngineCoreProc):
             req_ids=meta.req_ids,
             finish_reasons=finish_reasons,
             down_seqno=meta.down_seqno,
+            token_ids=meta.token_ids,
         )
         while not self._lwd_post_out.closed:
             if self._lwd_post_out.publish(notify):

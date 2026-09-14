@@ -258,6 +258,11 @@ class LwdC2eMeta:
     # pairing on the tag-less HCCL wire.
     down_seqno: int = -1
 
+    # token_id direct mode: per-request sampled token ids of this step,
+    # aligned with req_ids (spec steps carry accepted+bonus ids).  Empty
+    # = no token rows (rank-replay mode / finish-only notify).
+    token_ids: list[list[int]] = field(default_factory=list)
+
 
 # ModelRunnerOutput is serialized and sent to the scheduler process.
 # This is expensive for torch.Tensor so prefer to use list instead.
