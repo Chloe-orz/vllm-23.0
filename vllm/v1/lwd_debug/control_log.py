@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
+from vllm.logger import init_logger
 from vllm.v1.lwd_debug.log_base import LwdLogBase
+
+logger = init_logger(__name__)
 
 # flight 水位日志限频间隔(秒)
 LWD_FLIGHT_LOG_INTERVAL_S = 5.0
@@ -16,16 +19,14 @@ class LwdControlLog(LwdLogBase):
 
     @classmethod
     def flight(cls, running: int, awaiting: int) -> None:
-        """在飞请求水位(running + awaiting);每步可调,限频隔几秒一条。
+        """在飞请求水位(running + awaiting);常开,限频隔几秒一条。
 
-        接口隔离:只收数值,不感知调度器结构;限频状态内聚于基类
-        助手。默认随 debug 开关关闭,生产路径零输出。"""
-        if not cls.DEBUG:
-            return
+        常开不走 debug 门:一条水位线是调度观测的基本面,限频后
+        日志量可忽略。接口隔离:只收数值,不感知调度器结构;限频
+        状态内聚于基类助手。"""
         if not cls._rate_pass("flight", LWD_FLIGHT_LOG_INTERVAL_S):
             return
-        cls.event(
-            "flight",
-            "running=%d awaiting=%d cloud_active=%d",
+        logger.info(
+            "[Lwd][control-flight] running=%d awaiting=%d cloud_active=%d",
             running, awaiting, running + awaiting,
         )
