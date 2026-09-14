@@ -45,6 +45,11 @@ RE_EDGE_PERF = re.compile(
     r"\[Lwd\]\[perf\] unembed seqno=(\S+) post_recv=([\d.]+) "
     r"wait_tensor=([\d.]+) lm_head=([\d.]+) select=([\d.]+) "
     r"total=([\d.]+)ms")
+RE_EMBED_PERF = re.compile(
+    r"\[Lwd\]\[perf\] embed seqno=(\S+) forward=([\d.]+) "
+    r"submit_send=([\d.]+) total=([\d.]+)ms")
+RE_UP_RECV = re.compile(
+    r"\[Lwd\]\[perf\] up-recv seqno=(\S+) ready_at_take=(\w+)")
 RE_HARVEST = re.compile(r"\[Lwd\]\[perf\] harvest dur=([\d.]+)ms")
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -103,6 +108,7 @@ def analyze(cloud_log: str, edge_log: str, verbose: bool) -> None:
     cloud_seq: list[int] = []
     step_dt: list[float] = []
     step_ts: list[float] = []
+    up_recv_ready: list[int] = []  # 1=True 0=False(云 worker 的 up-recv 行)
     bridge: dict[tuple[str, str], list[float]] = {}
     for line in read_lines(cloud_log):
         t = parse_ts(line)
@@ -111,6 +117,10 @@ def analyze(cloud_log: str, edge_log: str, verbose: bool) -> None:
             if t is not None:
                 cloud_ts.append(t)
                 cloud_seq.append(int(m.group(2)))
+            continue
+        m = RE_UP_RECV.search(line)
+        if m:
+            up_recv_ready.append(1 if m.group(2) == "True" else 0)
             continue
         m = RE_CLOUD_STEP.search(line)
         if m:
@@ -131,13 +141,23 @@ def analyze(cloud_log: str, edge_log: str, verbose: bool) -> None:
     # 携带 seqno)——后者在"移除调试日志"提交后是唯一可靠锚
     edge_ts: list[float] = []
     edge_seq: list[int] = []
+    embed_ts: list[float] = []
     seg: dict[str, list[float]] = {}
+    embed_seg: dict[str, list[float]] = {}
     for line in read_lines(edge_log):
         t = parse_ts(line)
         m = RE_EDGE_UNEMBED.search(line)
         if m and t is not None:
             edge_ts.append(t)
             edge_seq.append(int(m.group(1)))
+            continue
+        m = RE_EMBED_PERF.search(line)
+        if m:
+            if t is not None:
+                embed_ts.append(t)
+            for name, idx in (("forward", 2), ("submit_send", 3),
+                              ("total", 4)):
+                embed_seg.setdefault(name, []).append(float(m.group(idx)))
             continue
         m = RE_EDGE_PERF.search(line)
         if m:
@@ -156,17 +176,30 @@ def analyze(cloud_log: str, edge_log: str, verbose: bool) -> None:
     print("① 速率对比(时钟无关:两边各自算事件间隔)")
     c_iv = ms(diffs(cloud_ts))
     e_iv = ms(diffs(edge_ts))
-    print(f"   云 notify 间隔: {stats(c_iv)} ms")
-    print(f"   边 UNEMBED 间隔: {stats(e_iv)} ms")
+    emb_iv = ms(diffs(embed_ts))
+    print(f"   云 notify 间隔    : {stats(c_iv)} ms")
+    print(f"   边 unembed 间隔   : {stats(e_iv)} ms")
+    if emb_iv:
+        print(f"   边 embed 间隔     : {stats(emb_iv)} ms  (chunk 节奏,TTFT 相关)")
     if step_dt:
-        print(f"   云步间隔(探针): {stats(step_dt)} ms")
+        print(f"   云步间隔(探针)    : {stats(step_dt)} ms")
     for k, v in sorted(bridge.items()):
         print(f"   bridge-wait {k[0]}/{k[1]}: {stats(v)} ms")
 
     print("=" * 64)
-    print("② 边单条成本分段(积压根源)")
+    print("② 边侧单条成本分段")
+    print("   [unembed · decode 回程 · DOWN 收+lm_head+重推]")
     for name in ("post_recv", "wait_tensor", "lm_head", "select", "total"):
         print(f"   {name:<11}: {stats(seg.get(name, []))} ms")
+    if embed_seg:
+        print("   [embed · prefill 上行 · embed 前向+UP 广播提交]")
+        for name in ("forward", "submit_send", "total"):
+            print(f"   {name:<11}: {stats(embed_seg.get(name, []))} ms")
+    if up_recv_ready:
+        n_true = sum(up_recv_ready)
+        print(f"   [up-recv · 云收 embed · 取用时已就绪] "
+              f"{n_true}/{len(up_recv_ready)} "
+              f"(False 多 = 云侧消费拖节奏;True 多 = 边侧发送是源头)")
 
     print("=" * 64)
     print("③ 尾巴检测(时钟无关:边事件从'等云节奏'切到'背靠背清账')")
@@ -199,6 +232,16 @@ def analyze(cloud_log: str, edge_log: str, verbose: bool) -> None:
         verdicts.append(
             f"尾巴 = 积压清账:云结束后边独自清了 {tail_cnt} 条 × "
             f"{(tail_ms / tail_cnt) if tail_cnt else 0:.0f}ms/条")
+    if embed_seg.get("submit_send"):
+        ss = sorted(embed_seg["submit_send"])
+        if ss[len(ss) // 2] > 5.0:
+            verdicts.append(
+                f"embed submit_send p50={ss[len(ss) // 2]:.1f}ms 偏大:"
+                "UP 广播提交被云侧入队节奏拖住(chunk 级锁步),TTFT 主嫌疑")
+    if up_recv_ready and sum(up_recv_ready) < len(up_recv_ready) * 0.3:
+        verdicts.append(
+            f"up-recv 就绪率仅 {sum(up_recv_ready)}/{len(up_recv_ready)}:"
+            "张量长期等云侧来取——云消费节奏是 prefill 瓶颈")
     if step_dt and c_iv:
         dt_mean = sum(step_dt) / len(step_dt)
         pace = sum(c_iv) / len(c_iv)
