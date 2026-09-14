@@ -251,8 +251,14 @@ class LwdEdgeEngineCore(EngineCoreProc):
         notifies: list[LwdC2eNotify] = []
         while True:
             try:
-                notifies.append(self.lwd_c2e_meta_queue.get_nowait())
+                notify = self.lwd_c2e_meta_queue.get_nowait()
             except queue.Empty:
+                break
+            notifies.append(notify)
+            # 每步最多带一条带行(贵)通告:其余留 FIFO 队列,后续步逐条
+            # 消化——防 N 条连收时同步 unembed 垄断阻塞,挤死本步的
+            # embed 派发(收时停发);队列非空本身维持 has_work 连续步进
+            if notify.req_ids and notify.hidden_num_elements > 0:
                 break
         if not notifies:
             return [], set()
