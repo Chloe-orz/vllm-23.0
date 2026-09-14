@@ -264,24 +264,33 @@ class LwdCloudEngineCore(EngineCoreProc):
         model_output: ModelRunnerOutput,
         engine_core_outputs: dict[int, EngineCoreOutputs],
     ) -> ModelRunnerOutput:
-        """步元数据 lwd_c2e_meta 经 POST_OUT 先于隐藏张量发边;逐请求
-        finish_reasons 完成码取自本步 engine_core_outputs 的 finish_reason
-        (原生停止条件即云侧 decode 终结的事实源),其余原样透传。"""
-        meta = model_output.lwd_c2e_meta
-        if meta is not None:
+        """控制面直接从 output 取 sampled_token_ids 组 c2e 通告发边
+        (token 直传):不再经 runner 的 collect/c2e_meta 通道;逐请求
+        finish_reasons 取自本步 engine_core_outputs(原生停止条件)。"""
+        req_ids = list(getattr(model_output, "req_ids", None) or [])
+        token_ids = getattr(model_output, "sampled_token_ids", None) or []
+        pairs = [(r, list(t)) for r, t in zip(req_ids, token_ids) if t]
+        if pairs:
+            from vllm.v1.outputs import LwdC2eMeta
+
+            meta = LwdC2eMeta(
+                hidden_num_elements=0,
+                top_id_ths=[],
+                num_accepted_tokens=[len(t) for _, t in pairs],
+                req_ids=[r for r, _ in pairs],
+                token_ids=[t for _, t in pairs],
+            )
             logger.info(
-                "[Lwd][cloud-ctrl] handle_model_output: c2e_meta received "
-                "reqs=%s down_seqno=%s, forwarding to edge",
-                getattr(meta, "req_ids", None),
-                getattr(meta, "down_seqno", None),
+                "[Lwd][cloud-ctrl] output tokens -> c2e: reqs=%s tokens=%d",
+                meta.req_ids, sum(len(t) for t in meta.token_ids),
             )
             LwdDebug.cloud_step(self.scheduler, meta, engine_core_outputs)  # [lwd-debug]
             self._lwd_publish_c2e(
                 meta, self._lwd_c2e_finish_reasons(meta, engine_core_outputs)
             )
         else:
-            logger.info(
-                "[Lwd][cloud-ctrl] handle_model_output: no c2e_meta this step"
+            logger.debug(
+                "[Lwd][cloud-ctrl] handle_model_output: no sampled tokens this step"
             )
         return model_output
 
