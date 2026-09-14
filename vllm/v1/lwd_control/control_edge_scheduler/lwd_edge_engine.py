@@ -42,7 +42,7 @@ from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
 from vllm.v1.lwd_control.control_communication.lwd_control_subscriber import (
     LwdControlSubscriber,
 )
-from vllm.v1.lwd_control.lwd_debug import LwdDebug
+from vllm.v1.lwd_debug import LwdControlLog, LwdDebug, LwdLogBase
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LWD_NOT_FINISHED,
     LwdC2eNotify,
@@ -60,17 +60,6 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler import (
 logger = init_logger(__name__)
 
 
-class LwdLog:
-    """按 debug 开关分级的极简诊断面;error 留给真正的业务中断点。"""
-
-    def __init__(self, debug: bool = False) -> None:
-        self._debug = debug
-
-    def phase(self, message: str, *args) -> None:
-        """步进/相位轨迹;默认关,生产路径零输出。"""
-        if self._debug:
-            logger.info("[Lwd] %s", message % args if args else message)
-
 # 云->边载荷队列容量:队满时接收线程阻塞在 put,背压沿 ZMQ 直达云侧
 # 步发送循环(载荷不可丢)
 LWD_C2E_META_QUEUE_MAX = 1000
@@ -86,7 +75,8 @@ class LwdEdgeEngineCore(EngineCoreProc):
         vllm_config.scheduler_config.scheduler_cls = LwdEdgeScheduler
         super().__init__(*args, **kwargs)
         config = LwdConfig.from_env_and_config(vllm_config)
-        self._lwd_log = LwdLog(config.debug)
+        # 层日志总开关:env 已开则不动,config 段开则补开(仅本进程)
+        LwdLogBase.set_debug(config.debug)
         # 通信面:bind POST_OUT 订阅面 + 延迟连接的 PRE_OUT 发布面;
         # 云端点由 HELLO 通告决定(边不预知云地址)
         self._edge_receiver = self._lwd_build_post_out(config)
@@ -226,7 +216,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 # 数据面异步化后由此改报实际量
                 future.result()
                 executed = dict(scheduler_output.num_scheduled_tokens)
-            self._lwd_log.phase("edge step: %d reqs executed", len(executed))
+            LwdControlLog.phase("edge step: %d reqs executed", len(executed))
         self.scheduler.lwd_edge_update_progress(executed)
         if outputs:
             step_outputs = EngineCoreOutputs(

@@ -2000,7 +2000,7 @@ class GPUModelRunner(
                     self.inputs_embeds.cpu[
                         output_idx : output_idx + actual_num_sched
                     ].copy_(req_embeds[start_pos:actual_end])
-                    from vllm.v1.lwd_control.lwd_debug import LwdDebug
+                    from vllm.v1.lwd_debug import LwdDebug
                     LwdDebug.cloud_fill_window(  # [lwd-debug]
                         self.input_batch.req_ids[req_idx],
                         start_pos,
@@ -3481,7 +3481,7 @@ class GPUModelRunner(
             and is_first_rank
             and not is_encoder_decoder
         ):
-            from vllm.v1.lwd_control.lwd_debug import LwdDebug
+            from vllm.v1.lwd_debug import LwdDebug
             LwdDebug._log(  # [lwd-debug]
                 "[lwd-branch-dbg] preprocess: MM branch (supports_mm_inputs=True), "
                 "n=%d, input_ids[:8]=%s",
@@ -3514,7 +3514,7 @@ class GPUModelRunner(
                 **self._extract_mm_kwargs(scheduler_output),
             }
         elif self.enable_prompt_embeds and is_first_rank:
-            from vllm.v1.lwd_control.lwd_debug import LwdDebug
+            from vllm.v1.lwd_debug import LwdDebug
             LwdDebug._log(  # [lwd-debug]
                 "[lwd-branch-dbg] preprocess: prompt-embeds branch, n=%d",
                 num_scheduled_tokens,
@@ -3545,7 +3545,7 @@ class GPUModelRunner(
             model_kwargs = self._init_model_kwargs()
             input_ids = None
         else:
-            from vllm.v1.lwd_control.lwd_debug import LwdDebug
+            from vllm.v1.lwd_debug import LwdDebug
             LwdDebug._log(  # [lwd-debug]
                 "[lwd-branch-dbg] preprocess: text-only branch, n=%d",
                 num_scheduled_tokens,

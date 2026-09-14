@@ -30,7 +30,7 @@ from vllm.v1.lwd_control.control_communication.lwd_notify import (
     lwd_encode_cloud_notify,
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import LwdConfig
-from vllm.v1.lwd_control.lwd_debug import LwdDebug
+from vllm.v1.lwd_debug import LwdDebug
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_phase_scheduler import (
     LwdCloudPhaseScheduler,
 )
