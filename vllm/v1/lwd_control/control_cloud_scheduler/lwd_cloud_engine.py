@@ -267,6 +267,15 @@ class LwdCloudEngineCore(EngineCoreProc):
         """步元数据 lwd_c2e_meta 经 POST_OUT 先于隐藏张量发边;逐请求
         finish_reasons 完成码取自本步 engine_core_outputs 的 finish_reason
         (原生停止条件即云侧 decode 终结的事实源),其余原样透传。"""
+        # [Lwd][perf] 临时探针:云相邻两步间隔——≈纯计算时长说明云自由
+        # 流水;≈计算+边尾段说明存在锁定步(云每步等边)
+        _now = time.monotonic()
+        _last = getattr(self, "_lwd_perf_last_step", 0.0)
+        if _last:
+            logger.info(
+                "[Lwd][perf] cloud-step dt=%.1fms", (_now - _last) * 1000
+            )
+        self._lwd_perf_last_step = _now
         meta = model_output.lwd_c2e_meta
         if meta is not None:
             logger.info(
