@@ -22,6 +22,7 @@ from vllm.v1.lwd_control.control_communication.lwd_control_subscriber import (
 )
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LWD_NOT_FINISHED,
+    LWD_WIRE_VERSION,
     LwdAbortNotify,
     LwdC2eNotify,
     LwdHelloNotify,
@@ -75,8 +76,14 @@ class LwdCloudEngineCore(EngineCoreProc):
             bind=False,
             encoder=lwd_encode_cloud_notify,
         )
+        # HELLO 携带线协议版本与两侧 NPU 计数,供边侧拓扑互校(fail-fast)
+        lwd = self.vllm_config.parallel_config.lwd_config
         self._lwd_hello = LwdHelloNotify(
-            pre_out_host=config.pre_out_host, pre_out_port=config.pre_out_port
+            pre_out_host=config.pre_out_host,
+            pre_out_port=config.pre_out_port,
+            wire_version=LWD_WIRE_VERSION,
+            edge_npu_count=lwd.edge_npu_count,
+            cloud_npu_count=lwd.cloud_npu_count,
         )
         # 首拍即通告(边侧可能已 bind 等待)
         self._lwd_announce()

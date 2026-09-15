@@ -47,6 +47,7 @@ from vllm.v1.lwd_control.control_communication.lwd_control_subscriber import (
 from vllm.v1.lwd_debug import LwdDebug, LwdLogBase
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LWD_NOT_FINISHED,
+    LWD_WIRE_VERSION,
     LwdC2eNotify,
     LwdHelloNotify,
     lwd_decode_cloud_notify,
@@ -100,6 +101,9 @@ class LwdEdgeEngineCore(EngineCoreProc):
         # [Lwd][sched] harvest wait(派发→收割)度量批在队列里的滞留时长
         self._lwd_batch_queue: deque = deque()
         hello_event = threading.Event()
+        # HELLO 拓扑互校失败信息:接收线程写入(置位 hello_event 唤醒构造
+        # 线程),构造线程据此 fail-fast;None = 未发现不一致
+        self._lwd_hello_error: str | None = None
         discovery = threading.Thread(
             target=self._receive_thread,
             args=(hello_event,),
@@ -115,6 +119,9 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 f"(bind {config.lwd_post_out_bind_endpoint()}; check cloud "
                 f"master_addr connectivity and POST_OUT port)"
             )
+        if self._lwd_hello_error is not None:
+            self._lwd_shutdown_planes()
+            raise RuntimeError(self._lwd_hello_error)
 
         self.scheduler.lwd_edge_publisher = self._edge_sender
         logger.info(
@@ -158,6 +165,14 @@ class LwdEdgeEngineCore(EngineCoreProc):
                     logger.info(
                         "[Lwd] cloud discovered via HELLO: PRE_OUT -> %s", endpoint
                     )
+                    hello_error = self._lwd_check_hello_topology(msg)
+                    if hello_error is not None:
+                        # 拓扑互校失败:不 retarget,置错误并唤醒构造线程
+                        # fail-fast(接收线程自 raise 只杀线程,构不成快败)
+                        logger.error("[Lwd] %s", hello_error)
+                        self._lwd_hello_error = hello_error
+                        hello_event.set()
+                        continue
                 while not publisher.retarget(endpoint):
                     if receiver.closed:
                         break
@@ -178,6 +193,36 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
             else:
                 logger.warning("[Lwd] drop unexpected POST_OUT frame %r", type(msg))
+
+    def _lwd_check_hello_topology(self, msg: LwdHelloNotify) -> str | None:
+        """HELLO 拓扑互校:返回 None = 通过;否则返回失败描述(由构造线程
+        raise fail-fast,报出两侧各自取值)。
+
+        wire_version==0 = 旧版云侧(不携带互校字段),仅告警不拒绝;
+        版本不符或 edge/cloud NPU 计数与本侧配置不符即拒绝(计数取自
+        vllm_config.parallel_config.lwd_config,不新增配置段)。"""
+        if msg.wire_version == 0:
+            logger.warning(
+                "[Lwd] cloud HELLO carries no wire version (legacy cloud); "
+                "topology cross-check skipped"
+            )
+            return None
+        if msg.wire_version != LWD_WIRE_VERSION:
+            return (
+                f"[Lwd] edge engine init failed: cloud HELLO wire version "
+                f"mismatch (cloud={msg.wire_version}, edge={LWD_WIRE_VERSION})"
+            )
+        lwd = self.vllm_config.parallel_config.lwd_config
+        if (msg.edge_npu_count != lwd.edge_npu_count
+                or msg.cloud_npu_count != lwd.cloud_npu_count):
+            return (
+                f"[Lwd] edge engine init failed: topology mismatch with cloud "
+                f"HELLO (cloud announces edge_npu_count={msg.edge_npu_count}, "
+                f"cloud_npu_count={msg.cloud_npu_count}; edge configured "
+                f"edge_npu_count={lwd.edge_npu_count}, "
+                f"cloud_npu_count={lwd.cloud_npu_count})"
+            )
+        return None
 
     def _lwd_shutdown_planes(self) -> None:
         """两面关停(幂等):receiver 先关断输入,publisher 收尾。"""

@@ -876,8 +876,9 @@ class VllmConfig:
                 else parallel_lwd.cloud_npu_count
             )
             # 边云模式并行度由拓扑推导,不接受 CLI 指定(对齐参考实现
-            # v0.23.0_lwd_prefill_only 70151bf):world = 边 + 云;PP 恒为
-            # 2(边 rank0 与云 rank0 成两段流水线,其余云 rank 单例);
+            # v0.23.0_lwd_prefill_only 70151bf):world = 边 + 云(边云共享
+            # 一个世界组,仅作 LWD 通道建组的 new_group 母体);PP 恒为
+            # 1(各侧模型执行走 pp=1 原生集中式,PP 组全单例);
             # TP 边取 edge_npu_count、云取 cloud_npu_count(云侧按此切权重)。
             if (self.parallel_config.tensor_parallel_size != 1
                     or self.parallel_config.pipeline_parallel_size != 1):
@@ -890,7 +891,7 @@ class VllmConfig:
             self.parallel_config.world_size = (
                 parallel_lwd.edge_npu_count + parallel_lwd.cloud_npu_count
             )
-            self.parallel_config.pipeline_parallel_size = 2
+            self.parallel_config.pipeline_parallel_size = 1
             self.parallel_config.tensor_parallel_size = (
                 parallel_lwd.edge_npu_count
                 if parallel_lwd.is_edge_node

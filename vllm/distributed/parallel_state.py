@@ -348,24 +348,22 @@ direct_register_custom_op(
 )
 
 
-_LWD_FULL_HEAD_TAIL = False
+_LWD_BOOTSTRAP_WORLD: "GroupCoordinator | None" = None
+"""LWD 边云模式下保存的原始全 rank 默认世界组(边云共享的 world)。
+
+该 9-rank 默认世界仅作 new_group 母体(各并行组全 rank 集体创建的
+母组),``initialize_model_parallel`` 的 LWD 分支建组完成后会把
+``_WORLD`` 替换为本实例 TP 组,原默认世界转存于此,供 LWD 通道建域期
+(ascend 侧 init_lwd_duplex_channels)取 backend 与 barrier 使用;
+运行期禁止对它做集合操作。非 LWD 模式恒为 None。
+"""
 
 
-def _is_lwd_full_head_tail() -> bool:
-    """Whether LWD (layerwise disaggregated) mode is enabled.
-
-    In prefill_only LWD both the edge and cloud sides build the full head
-    (``embed_tokens``) and tail (``norm`` / ``lm_head``), so the PP
-    first/last-rank split must be neutralized: both sides act as first AND
-    last rank on the PP group.
-
-    The flag is set at group-creation time in the LWD branch of
-    ``initialize_model_parallel`` (every worker process passes through it),
-    because the runtime config context is unavailable on the worker
-    execute path (``get_current_vllm_config_or_none()`` returns None
-    there).
-    """
-    return _LWD_FULL_HEAD_TAIL
+def get_lwd_bootstrap_world() -> "GroupCoordinator":
+    """返回 LWD 建域期用的原始全 rank 世界组;非 LWD 模式回退 _WORLD。"""
+    if _LWD_BOOTSTRAP_WORLD is not None:
+        return _LWD_BOOTSTRAP_WORLD
+    return get_world_group()
 
 
 class GroupCoordinator:
@@ -558,26 +556,12 @@ class GroupCoordinator:
 
     @property
     def is_first_rank(self):
-        """Return whether the caller is the first process in the group.
-
-        LWD prefill_only neutralizes the PP split on the PP group only:
-        both sides act as first rank so each builds the full
-        ``embed_tokens`` head.
-        """
-        if _is_lwd_full_head_tail() and self is _PP:
-            return True
+        """Return whether the caller is the first process in the group"""
         return self.rank == self.first_rank
 
     @property
     def is_last_rank(self):
-        """Return whether the caller is the last process in the group.
-
-        LWD prefill_only neutralizes the PP split on the PP group only:
-        both sides act as last rank so each builds the full ``norm`` /
-        ``lm_head`` tail.
-        """
-        if _is_lwd_full_head_tail() and self is _PP:
-            return True
+        """Return whether the caller is the last process in the group"""
         return self.rank == self.last_rank
 
     @property
@@ -1750,13 +1734,13 @@ def initialize_model_parallel(
     # 排不进原生的均匀 rank 网格,按 Lwd 布局直接构建各并行组后返回。
     # 布局(以边 1 + 云 4、dp=1、world=5 为例):
     #   TP: [[0], [1,2,3,4]]        边单例;云 4 卡合切一份权重
-    #   PP: [[0,1], [2], [3], [4]]  边 rank0 与云 rank1 组成两段流水线,
-    #                               其余云 rank 单例
+    #   PP: [[0], [1], [2], [3], [4]]  全单例(各侧 pp=1 集中式执行,
+    #                                  单例 PP 组天然 first==last)
     #   DCP/PCP/DP: 全单例
     #   EP(仅 MoE): [[0], [1,2,3,4]]
     # 所有分组都必须全 rank 集体创建,因此每个 rank 都带完整分组列表。
     if parallel_config.lwd_config.enable_lwd:
-        global _TP, _PP, _DCP, _PCP, _DP, _EP
+        global _TP, _PP, _DCP, _PCP, _DP, _EP, _WORLD, _LWD_BOOTSTRAP_WORLD
         assert not enable_elastic_ep, (
             "elastic EP is not supported in Lwd edge-cloud mode")
         lwd = parallel_config.lwd_config
@@ -1788,25 +1772,18 @@ def initialize_model_parallel(
             group_name="tp",
         )
 
-        # PP:每实例边 rank0 与云 rank0 成两段 pp 对,其余 rank 单例
+        # PP:全单例(各侧 pp=1 集中式执行,不再建边云两段流水线)
         assert _PP is None, "pipeline model parallel group is already initialized"
         pp_groups: list[list[int]] = []
         for dp_idx in range(data_parallel_size):
             base = dp_idx * world_per_dp
-            pp_groups.append([base + 0, base + edge_count])
-            for r in range(1, world_per_dp):
-                if r != edge_count:
-                    pp_groups.append([base + r])
+            pp_groups.extend([base + r] for r in range(world_per_dp))
         _PP = init_model_parallel_group(
             pp_groups,
             get_world_group().local_rank,
             backend,
             group_name="pp",
         )
-        # prefill_only 下 PP 切分在运行期中性化(两侧皆 first/last rank);
-        # 建组时直接置位,运行期不依赖 current config 上下文。
-        global _LWD_FULL_HEAD_TAIL
-        _LWD_FULL_HEAD_TAIL = True
 
         # DCP/PCP:全单例(pcp_size = dcp_size = 1)
         singleton_groups = [[r] for r in range(world_size)]
@@ -1851,6 +1828,14 @@ def initialize_model_parallel(
                 backend,
                 group_name="ep",
             )
+
+        # _WORLD 运行期替换为本实例 TP 组(云 = 云卡组、边 = 单例组):
+        # 此后 get_world_group() 的集合操作只落在本侧实例内。原边云共享的
+        # 全 rank 默认世界转存 _LWD_BOOTSTRAP_WORLD,仅供 LWD 通道建域期
+        # (ascend 侧 init_lwd_duplex_channels,经 get_lwd_bootstrap_world
+        # 访问)取 backend 与 barrier;运行期禁止对它做集合操作。
+        _LWD_BOOTSTRAP_WORLD = _WORLD
+        _WORLD = _TP
 
         logger.info(
             "Lwd edge-cloud mode initialized: rank %s, is_edge=%s, "
@@ -2157,10 +2142,14 @@ def get_node_count() -> int:
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
-    global _TP
+    global _TP, _WORLD
 
     if _TP:
         _TP.destroy()
+    # LWD 建组分支把 _WORLD 替换成了实例 TP 组(同一 GroupCoordinator),
+    # 此处一并解除引用,避免 destroy_distributed_environment 二次 destroy。
+    if _WORLD is _TP:
+        _WORLD = None
     _TP = None
 
     global _DCP
@@ -2195,10 +2184,11 @@ def destroy_model_parallel():
 
 
 def destroy_distributed_environment():
-    global _WORLD, _NODE_COUNT
+    global _WORLD, _NODE_COUNT, _LWD_BOOTSTRAP_WORLD
     if _WORLD:
         _WORLD.destroy()
     _WORLD = None
+    _LWD_BOOTSTRAP_WORLD = None
     _NODE_COUNT = None
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
