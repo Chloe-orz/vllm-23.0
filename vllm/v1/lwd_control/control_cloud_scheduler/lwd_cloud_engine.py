@@ -38,7 +38,7 @@ from vllm.v1.request import Request
 
 if TYPE_CHECKING:
     from vllm.v1.engine import EngineCoreOutputs
-    from vllm.v1.outputs import LwdC2eMeta, ModelRunnerOutput
+    from vllm.v1.outputs import ModelRunnerOutput
 
 logger = init_logger(__name__)
 
@@ -264,9 +264,10 @@ class LwdCloudEngineCore(EngineCoreProc):
         model_output: ModelRunnerOutput,
         engine_core_outputs: dict[int, EngineCoreOutputs],
     ) -> ModelRunnerOutput:
-        """步元数据 lwd_c2e_meta 经 POST_OUT 先于隐藏张量发边;逐请求
-        finish_reasons 完成码取自本步 engine_core_outputs 的 finish_reason
-        (原生停止条件即云侧 decode 终结的事实源),其余原样透传。"""
+        """token_id 版:采样 token ids 直接随 model_output 抵达(async 调度
+        下已在侧线程物化为 host 列表),由此组 c2e notify 经 POST_OUT 发边;
+        逐请求 finish_reasons 完成码取自本步 engine_core_outputs 的
+        finish_reason(原生停止条件即云侧 decode 终结的事实源)。"""
         # [Lwd][perf] 临时探针:云相邻两步间隔——≈纯计算时长说明云自由
         # 流水;≈计算+边尾段说明存在锁定步(云每步等边)
         _now = time.monotonic()
@@ -276,34 +277,41 @@ class LwdCloudEngineCore(EngineCoreProc):
                 "[Lwd][perf] cloud-step dt=%.1fms", (_now - _last) * 1000
             )
         self._lwd_perf_last_step = _now
-        meta = model_output.lwd_c2e_meta
-        if meta is not None:
+        req_ids = model_output.req_ids
+        if req_ids:
             logger.info(
-                "[Lwd][cloud-ctrl] handle_model_output: c2e_meta received "
-                "reqs=%s down_seqno=%s, forwarding to edge",
-                getattr(meta, "req_ids", None),
-                getattr(meta, "down_seqno", None),
+                "[Lwd][cloud-ctrl] handle_model_output: sampled reqs=%d, "
+                "forwarding token ids to edge",
+                len(req_ids),
             )
-            LwdDebug.cloud_step(self.scheduler, meta, engine_core_outputs)  # [lwd-debug]
+            LwdDebug.cloud_step(
+                self.scheduler, req_ids, engine_core_outputs
+            )  # [lwd-debug]
             _t = time.monotonic()
             self._lwd_publish_c2e(
-                meta, self._lwd_c2e_finish_reasons(meta, engine_core_outputs)
+                req_ids,
+                self._lwd_sampled_ids(model_output),
+                self._lwd_c2e_finish_reasons(req_ids, engine_core_outputs),
             )
             # [Lwd][perf] 云侧 LWD 税:finish 码推导 + ZMQ publish
             logger.info(
                 "[Lwd][perf] publish reqs=%d dur=%.2fms",
-                len(meta.req_ids), (time.monotonic() - _t) * 1000,
-            )
-        else:
-            logger.info(
-                "[Lwd][cloud-ctrl] handle_model_output: no c2e_meta this step"
+                len(req_ids), (time.monotonic() - _t) * 1000,
             )
         return model_output
 
     @staticmethod
+    def _lwd_sampled_ids(model_output: ModelRunnerOutput) -> list[list[int]]:
+        """采样 token 列表:async 调度下 get_output 已物化为 list;非 async
+        兜底 tolist(设备张量同步取,代价同旧同步版)。"""
+        ids = model_output.sampled_token_ids
+        if isinstance(ids, torch.Tensor):
+            ids = ids.tolist()
+        return ids
+
     @staticmethod
     def _lwd_c2e_finish_reasons(
-        meta: LwdC2eMeta,
+        req_ids: list[str],
         engine_core_outputs: dict[int, EngineCoreOutputs],
     ) -> list[int]:
         """req_ids 对齐的逐请求完成码:本步任一 EngineCoreOutputs 里带
@@ -317,28 +325,29 @@ class LwdCloudEngineCore(EngineCoreProc):
             for request_id in outputs.finished_requests or ():
                 reasons.setdefault(request_id, int(FinishReason.ABORT))
         return [reasons.get(request_id, LWD_NOT_FINISHED)
-                for request_id in meta.req_ids]
+                for request_id in req_ids]
 
-    def _lwd_publish_c2e(self, meta: LwdC2eMeta, finish_reasons: list[int]) -> None:
+    def _lwd_publish_c2e(
+        self,
+        req_ids: list[str],
+        token_ids: list[list[int]],
+        finish_reasons: list[int],
+    ) -> None:
         """步元数据(含逐请求 finish_reasons 完成码)发边:队满小睡重试
         (元数据不可丢),关停(closed)退出。"""
         notify = LwdC2eNotify(
-            hidden_num_elements=meta.hidden_num_elements,
-            top_id_ths=meta.top_id_ths,
-            num_accepted_tokens=meta.num_accepted_tokens,
-            req_ids=meta.req_ids,
+            token_ids=token_ids,
+            req_ids=req_ids,
             finish_reasons=finish_reasons,
-            down_seqno=meta.down_seqno,
         )
         while not self._lwd_post_out.closed:
             if self._lwd_post_out.publish(notify):
                 logger.info(
-                    "[Lwd][cloud-ctrl] publish C2eNotify reqs=%d down_seqno=%s "
-                    "finish=%s hidden_elems=%s",
-                    len(notify.req_ids),
-                    notify.down_seqno,
+                    "[Lwd][cloud-ctrl] publish C2eNotify reqs=%d "
+                    "finish=%s tokens=%s",
+                    len(req_ids),
                     finish_reasons,
-                    notify.hidden_num_elements,
+                    [len(t) for t in token_ids],
                 )
                 return
             time.sleep(_LWD_C2E_SEND_RETRY_SLEEP_S)

@@ -70,22 +70,19 @@ LWD_NOT_FINISHED = -1
 
 
 class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):
-    """云->边步元数据通告(POST_OUT),先于隐藏张量到达,边侧据此预挂精确
-    尺寸 recv;hidden_num_elements=0 为纯终结通告,边侧本地终结不派发 unembed。"""
+    """云->边步元数据通告(POST_OUT)。token_id 版:云侧采样结果直接以
+    token ids 回传(纯 ZMQ 控制面),无 DOWN 张量、无 rank-replay——
+    hidden/meta 尺寸与 seqno 字段整体退场。"""
 
-    hidden_num_elements: int
-    top_id_ths: list[list[int]]
-    num_accepted_tokens: list[int]
+    token_ids: list[list[int]]
+    """每请求本步采样(含 spec 接受)的 token ids,与 req_ids 按位对齐;
+    空行 = 该请求本步无产出(discard/缺席),边侧按 ERROR 终结。"""
     req_ids: list[str]
     finish_reasons: list[int] = []
     """逐请求完成码,与 req_ids 按位对齐:LWD_NOT_FINISHED(-1) = 本步未
     终结;否则为 FinishReason IntEnum 值(STOP=0/LENGTH=1/ABORT=2/ERROR=3/
     REPETITION=4),边侧原样透传 finish_reason(LENGTH 不再伪装成 STOP)。
     空列表 = 云侧未携带,错配即 IndexError fail-fast。"""
-    down_seqno: int = -1
-    """本步 DOWN 隐藏张量的通道序号,自 LwdC2eMeta.down_seqno 原样透传:
-    云 worker 发送时分配(通道级单调),边侧按此值预挂配对 irecv;
-    缺省 -1 = 旧版云侧未携带(msgspec 带默认字段,线上 additive 兼容)。"""
 
 
 # typing.Union 而非 PEP 604 `|`:msgspec 解码器的全版本支持路径

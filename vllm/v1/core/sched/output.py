@@ -30,7 +30,6 @@ else:
 
 class LwdBatchType(enum.Enum):
     LWD_EMBED = "lwd_embed"  # prefill send: token_ids -> embeddings
-    LWD_UNEMBED = "lwd_unembed"  # token recovery: batched hidden + top_id_ths -> tokens
 
 
 @dataclass
@@ -42,23 +41,12 @@ class LwdEmbedBatch:
 
 
 @dataclass
-class LwdUnembedBatch:
-    """LWD prefill_only mode edge token-recovery batch (spec-decode aware)."""
-
-    req_ids: list[str] = field(default_factory=list)
-    num_accept_tokens: list[int] = field(default_factory=list)  # per request: accepted count (<= K)
-    recv_num_elements: int = 0  # total DOWN hidden elements for the whole batch = rows_total * hidden_size
-    out_token_idxs: list[list[int]] = field(default_factory=list)  # per request: generation ordinal of each token (order-preserving emit)
-    top_id_ths: list[list[int]] = field(default_factory=list)  # per request: received Nth most probable token index (position in descending logits)
-
-
-@dataclass
 class LwdBatch:
     """LWD prefill_only mode batch dispatched by the scheduler."""
 
     batch_type: LwdBatchType
     seqno: int  # every batch has a unique seqno, increasing by 1 on every dispatch.
-    batch_meta: LwdEmbedBatch | LwdUnembedBatch | None
+    batch_meta: LwdEmbedBatch | None
 
 
 @dataclass

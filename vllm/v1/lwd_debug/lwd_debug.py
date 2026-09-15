@@ -78,16 +78,16 @@ class LwdDebug:
         )
 
     @classmethod
-    def cloud_step(cls, scheduler, meta, engine_core_outputs) -> None:
+    def cloud_step(cls, scheduler, req_ids, engine_core_outputs) -> None:
         """每步打 token 进度、最后一个 token 与推导出的 finish 码。"""
         from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_engine import (
             LwdCloudEngineCore,
         )
 
         finish_reasons = LwdCloudEngineCore._lwd_c2e_finish_reasons(
-            meta, engine_core_outputs
+            req_ids, engine_core_outputs
         )
-        for request_id, finish in zip(meta.req_ids, finish_reasons):
+        for request_id, finish in zip(req_ids, finish_reasons):
             req = scheduler.requests.get(request_id)
             if req is None:
                 cls._log(

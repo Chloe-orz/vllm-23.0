@@ -56,7 +56,6 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import (
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler import (
     LwdEdgeScheduler,
-    lwd_build_unembed_batch,
 )
 
 logger = init_logger(__name__)
@@ -168,9 +167,9 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 hello_event.set()
             elif isinstance(msg, LwdC2eNotify):
                 logger.info(
-                    "[Lwd][edge-ctrl] C2eNotify reqs=%d down_seqno=%s",
+                    "[Lwd][edge-ctrl] C2eNotify reqs=%d tokens=%s",
                     len(getattr(msg, "req_ids", []) or []),
-                    getattr(msg, "down_seqno", None),
+                    [len(t) for t in getattr(msg, "token_ids", [])],
                 )
                 # 队列元素带到达时间戳:消费滞后(c2e_wait=到达→派发)
                 # 是"边消费不动 → 云 publisher 队满小睡"闭环的前置指标
@@ -218,39 +217,33 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 or self._lwd_batch_queue)
 
     def _lwd_edge_step(self) -> tuple[dict[int, object] | None, bool]:
-        """单步编排(批队列异步化+多批在飞):收割队首直至清空 -> 消费
-        云载荷(派发至深度上限) -> prefill 连续派发 -> 返回
-        ({0: 云侧结果输出} | None, prefill 是否有派发)。
+        """单步编排(token_id 版):收割 embed 批队列直至清空 -> 消费 c2e
+        通告(token 直接交付,纯主机工作,无 worker 派发)-> prefill 连续
+        派发 -> 返回({0: 云侧结果输出} | None,prefill 是否有派发)。
 
-        embed/unembed 均派发入队不收割,队首全局 FIFO 收割(序与
-        executor 排水序同构);突发时一步连派至深度上限喂饱 worker。
-        代价:token 交付与 embed 进度登记晚若干引擎步。
+        embed 批派发入队不收割,队首 FIFO 收割(序与 executor 排水序
+        同构);云侧 token 经 ZMQ 直达引擎,交付不再经过批队列/worker。
 
-        [Lwd][sched] 三类日志(饿死分析锚点):每批 harvest(含队列滞留
-        wait)、每批 dispatch(含 ahead 队列构成/c2e 水位)、每步汇总。"""
+        [Lwd][sched] 三类日志:每批 harvest(含队列滞留 wait)、每批
+        dispatch(含队列构成/c2e 水位)、每步汇总。"""
         outputs: list = []
         finished_reqs: set = set()
         prefill_work = False
-        h_emb = h_unemb = 0
+        h_emb = 0
         while self._lwd_batch_queue:
-            kind, payload, t_dispatch, future = self._lwd_batch_queue.popleft()
-            if kind == "unembed":
-                self._lwd_deliver_unembed(
-                    payload, future, outputs, finished_reqs
-                )
-                h_unemb += 1
-            else:
-                self.scheduler.lwd_edge_update_progress(
-                    dict(payload.num_scheduled_tokens)
-                )
-                prefill_work = True
-                h_emb += 1
+            _kind, payload, t_dispatch, future = self._lwd_batch_queue.popleft()
+            self.scheduler.lwd_edge_update_progress(
+                dict(payload.num_scheduled_tokens)
+            )
+            future.result()
+            prefill_work = True
+            h_emb += 1
             logger.info(
-                "[Lwd][sched] edge harvest kind=%s seqno=%s wait=%.2fms",
-                kind, self._lwd_batch_seqno(kind, payload),
+                "[Lwd][sched] edge harvest embed seqno=%s wait=%.2fms",
+                self._lwd_batch_seqno(payload),
                 (time.monotonic() - t_dispatch) * 1000,
             )
-        d_unemb = self._lwd_edge_consume_c2e()
+        d_unemb = self._lwd_edge_consume_c2e(outputs, finished_reqs)
         d_emb = 0
         while (len(self._lwd_batch_queue) < LWD_EDGE_BATCH_QUEUE_DEPTH
                and self.scheduler.has_requests()):
@@ -265,11 +258,10 @@ class LwdEdgeEngineCore(EngineCoreProc):
             )
             prefill_work = True
             d_emb += 1
-        n_emb, n_unemb = self._lwd_queue_mix()
         logger.info(
-            "[Lwd][sched] edge step harvest_emb=%d harvest_unemb=%d "
-            "disp_emb=%d disp_unemb=%d queue=%demb/%dunemb c2e_pending=%d",
-            h_emb, h_unemb, d_emb, d_unemb, n_emb, n_unemb,
+            "[Lwd][sched] edge step harvest_emb=%d deliver_unemb=%d "
+            "disp_emb=%d queue=%demb c2e_pending=%d",
+            h_emb, d_unemb, d_emb, len(self._lwd_batch_queue),
             self.lwd_c2e_meta_queue.qsize(),
         )
         if outputs:
@@ -280,40 +272,34 @@ class LwdEdgeEngineCore(EngineCoreProc):
             return {0: step_outputs}, prefill_work
         return None, prefill_work
 
-    def _lwd_queue_mix(self) -> tuple[int, int]:
-        """批队列构成 (embed数, unembed数):dispatch 日志的 ahead_unemb
-        = EMBED 批前面压着的 UNEMBED 批数,是"EMBED 被 decode 回程挤住"
-        (饿死假说)的直接读数。"""
-        n_emb = sum(1 for e in self._lwd_batch_queue if e[0] == "embed")
-        return n_emb, len(self._lwd_batch_queue) - n_emb
-
     @staticmethod
-    def _lwd_batch_seqno(kind: str, payload) -> str:
-        """harvest 日志的配对号:unembed 用 down_seqno(与云 DOWN 同号),
-        embed 用批 seqno(与 RangeNotify/UP 同号)。"""
-        if kind == "unembed":
-            return str(getattr(payload, "down_seqno", "?"))
+    def _lwd_batch_seqno(payload) -> str:
+        """harvest 日志的配对号:embed 批 seqno(与 RangeNotify/UP 同号)。"""
         batch = getattr(payload, "lwd_batch", None)
         return str(getattr(batch, "seqno", "?")) if batch else "?"
 
-    def _lwd_edge_consume_c2e(self) -> int:
-        """消费 c2e 通告:派发 UNEMBED 批入批队列(异步收割)。
-        云侧有活请求才产 meta(build_hidden_payload 空则返回 None),
-        每条 entry 行数>=1——通告必有行,无需无行分流。
-        返回本步派发条数。"""
-        quota = LWD_EDGE_BATCH_QUEUE_DEPTH - len(self._lwd_batch_queue)
-        notifies: list[tuple[LwdC2eNotify, float]] = []
-        while len(notifies) < quota:
+    def _lwd_edge_consume_c2e(self, outputs: list, finished_reqs: set) -> int:
+        """消费 c2e 通告:token_id 版直接逐请求交付(纯主机工作,无
+        worker 派发、无批队列)。云侧有活请求才产通告,每条必有 req。
+        交付不占批队列深度,一次排空队列(队满背压由接收线程的阻塞 put
+        承担);返回本步交付条数。"""
+        delivered = 0
+        while True:
             try:
-                notifies.append(self.lwd_c2e_meta_queue.get_nowait())
+                notify, t_arrive = self.lwd_c2e_meta_queue.get_nowait()
             except queue.Empty:
                 break
-        for notify, t_arrive in notifies:
-            future = self._lwd_dispatch_unembed(notify, t_arrive)
-            self._lwd_batch_queue.append(
-                ("unembed", notify, time.monotonic(), future)
+            logger.info(
+                "[Lwd][sched] edge deliver-unembed reqs=%d tokens=%s "
+                "c2e_wait=%.2fms c2e_pending=%d",
+                len(notify.req_ids),
+                [len(t) for t in notify.token_ids],
+                (time.monotonic() - t_arrive) * 1000,
+                self.lwd_c2e_meta_queue.qsize(),
             )
-        return len(notifies)
+            self._lwd_deliver_notify(notify, outputs, finished_reqs)
+            delivered += 1
+        return delivered
 
     def _lwd_dispatch_embed(self, scheduler_output):
         """EMBED 批提交侧(唯一提交点,同步/异步共用):范围预告(发布
@@ -326,86 +312,42 @@ class LwdEdgeEngineCore(EngineCoreProc):
         if not self.scheduler.lwd_edge_notify(scheduler_output):
             return None
         batch = scheduler_output.lwd_batch
-        n_emb, n_unemb = self._lwd_queue_mix()
         logger.info(
             "[Lwd][sched] edge dispatch-embed seqno=%d req=%s tokens=%d "
-            "ahead_unemb=%d ahead_emb=%d c2e_pending=%d",
+            "queue=%demb c2e_pending=%d",
             batch.seqno, batch.batch_meta.req_ids[0],
             scheduler_output.total_num_scheduled_tokens,
-            n_unemb, n_emb, self.lwd_c2e_meta_queue.qsize(),
+            len(self._lwd_batch_queue), self.lwd_c2e_meta_queue.qsize(),
         )
         return self.model_executor.execute_model(
             scheduler_output, non_block=True
         )
 
-    def _lwd_dispatch_unembed(self, notify: LwdC2eNotify, t_arrive: float):
-        """UNEMBED 批提交侧:组批并以 non_block 提交 worker,立即返回
-        future(不等执行)。同步路径提交后立即收割;异步路径
-        (batch_queue)将 (notify, future) 入队,收割阶段再等 future——
-        提交与等待的边界即本函数返回处。
-
-        c2e_wait(到达→派发)是消费滞后读数:持续偏大说明边引擎步
-        循环被收割/派发占住,c2e 在积压,云侧 publisher 队满小睡在即。"""
-        unembed_batch = lwd_build_unembed_batch(notify)
-        n_emb, n_unemb = self._lwd_queue_mix()
-        logger.info(
-            "[Lwd][sched] edge dispatch-unembed seqno=%s reqs=%d rows=%d "
-            "ahead_unemb=%d ahead_emb=%d c2e_wait=%.2fms c2e_pending=%d",
-            notify.down_seqno, len(notify.req_ids),
-            sum(notify.num_accepted_tokens), n_unemb, n_emb,
-            (time.monotonic() - t_arrive) * 1000,
-            self.lwd_c2e_meta_queue.qsize(),
-        )
-        return self.model_executor.execute_model(
-            unembed_batch, non_block=True
-        )
-
-    def _lwd_deliver_unembed(
-        self, notify: LwdC2eNotify, future, outputs: list, finished_reqs: set,
+    def _lwd_deliver_notify(
+        self, notify: LwdC2eNotify, outputs: list, finished_reqs: set,
     ) -> None:
-        """UNEMBED 批收割侧:等 worker 应答取采样 token 表,逐请求交付。
-        不感知提交时机,只消费 (notify, future)。应答契约:
-        token ids 按 ModelRunnerOutput 的 req_ids x sampled_token_ids
-        按位对齐还原(批的 req_ids 原样下发,worker 逐位回填);请求
-        缺席或行无 token = unembed 失败,ERROR 优先于云侧完成码;
-        迟到载荷幂等丢弃。"""
-        _t = time.monotonic()
-        result = future.result()
-        # [Lwd][perf] 临时探针:收割时长 = RPC 往返 + worker 执行全长
-        # (与 worker 侧 [Lwd][perf] unembed 分段对账,差值即进程往返开销)
-        logger.info(
-            "[Lwd][perf] harvest dur=%.2fms", (time.monotonic() - _t) * 1000
-        )
-        # req_ids x sampled_token_ids 按位对齐:worker lm_head 恢复的采样
-        # token,即该请求本步的生成内容;后续仅两处流向——
-        # lwd_edge_deliver_tokens(调度器只对账 awaiting 生命周期,
-        # 不消费内容)与 EngineCoreOutput 的 new_token_ids(outputs ->
-        # EngineCoreOutputs -> 主循环按 frontend 消费 -> 前端解流交付
-        # 客户端,即最终输出的生成 token)。
-        sampled_token_map: dict[str, list[int]] = (
-            {} if result is None
-            else dict(zip(result.req_ids, result.sampled_token_ids))
-        )
+        """c2e 通告交付侧(token_id 版):token ids 云侧已随通告到达,
+        无 worker/future,逐请求直接交付。语义与旧 unembed 收割一致:
+        行无 token = 云侧本步无产出(discard/缺席),ERROR 优先于云侧
+        完成码;迟到载荷幂等丢弃。"""
+        token_map = dict(zip(notify.req_ids, notify.token_ids))
         for index, request_id in enumerate(notify.req_ids):
             finish_reason = self._lwd_finish_code(notify, index)
             finished = finish_reason is not None
-            sampled_token_ids = (
-                list(sampled_token_map.get(request_id, []))
-                if sampled_token_map else []
-            )
+            sampled_token_ids = list(token_map.get(request_id, []))
             LwdDebug.edge_tokens_delivered(  # [lwd-debug]
                 request_id, sampled_token_ids, finish_reason,
                 self.vllm_config,
             )
             if not sampled_token_ids:
-                # 行在批里但无 token = unembed 失败,ERROR 优先于云侧码
+                # 行在通告里但无 token = 本步无产出,ERROR 优先于云侧码
                 finish_reason = FinishReason.ERROR
                 finished = True
             if not self.scheduler.lwd_edge_deliver_tokens(
                 request_id, sampled_token_ids, finished=finished
             ):
                 logger.warning(
-                    "[Lwd] drop stale cloud payload for %s (not awaiting)",
+                    "[LWD] drop stale cloud payload for %s (not awaiting)",
                     request_id,
                 )
                 continue
