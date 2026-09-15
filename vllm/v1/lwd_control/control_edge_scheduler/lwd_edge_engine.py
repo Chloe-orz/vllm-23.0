@@ -65,7 +65,7 @@ logger = init_logger(__name__)
 # 步发送循环(载荷不可丢)
 LWD_C2E_META_QUEUE_MAX = 1000
 
-# 批队列在飞深度上限:派发(embed+unembed 合计)不收割的批数上限,
+# 批队列在飞深度上限:派发(embed)不收割的批数上限,
 # 突发积压时连续派发喂饱 worker(参照仓经验 >=4 才能维持流水对齐)
 LWD_EDGE_BATCH_QUEUE_DEPTH = 4
 
