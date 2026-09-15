@@ -264,9 +264,13 @@ class LwdCloudEngineCore(EngineCoreProc):
         model_output: ModelRunnerOutput,
         engine_core_outputs: dict[int, EngineCoreOutputs],
     ) -> ModelRunnerOutput:
-        """步元数据 lwd_c2e_meta 经 POST_OUT 先于隐藏张量发边;逐请求
-        finish_reasons 完成码取自本步 engine_core_outputs 的 finish_reason
-        (原生停止条件即云侧 decode 终结的事实源),其余原样透传。"""
+        """rank-replay:解码 worker 主流末尾 pinned 物化的步 meta(就绪由
+        响应入队处的 event synchronize 保证),组 c2e 通告经 POST_OUT
+        先于 hidden 发边;finish 码取自 engine_core_outputs。
+
+        pinned 布局:[ranks(各调度段行)..., counts(accepted/请求)...,
+        seg_lens(段长/请求)...];top_id_ths 按段长切,被拒行一并携带,
+        边侧按 num_accepted 取有效前缀。"""
         # [Lwd][perf] 临时探针:云相邻两步间隔——≈纯计算时长说明云自由
         # 流水;≈计算+边尾段说明存在锁定步(云每步等边)
         _now = time.monotonic()
@@ -276,13 +280,32 @@ class LwdCloudEngineCore(EngineCoreProc):
                 "[Lwd][perf] cloud-step dt=%.1fms", (_now - _last) * 1000
             )
         self._lwd_perf_last_step = _now
-        meta = model_output.lwd_c2e_meta
-        if meta is not None:
+        carrier = getattr(model_output, "lwd_down_carrier", None)
+        if carrier is not None:
+            pinned, req_ids, hidden_numel, seqno = carrier
+            n_req = len(req_ids)
+            vals = pinned.tolist()
+            counts = vals[-2 * n_req : -n_req]
+            seg_lens = vals[-n_req:]
+            ranks_flat = vals[: -2 * n_req]
+            top_id_ths: list[list[int]] = []
+            off = 0
+            for seg_len in seg_lens:
+                top_id_ths.append(ranks_flat[off : off + seg_len])
+                off += seg_len
+            from vllm.v1.outputs import LwdC2eMeta
+
+            meta = LwdC2eMeta(
+                hidden_num_elements=hidden_numel,
+                top_id_ths=top_id_ths,
+                num_accepted_tokens=list(counts),
+                req_ids=list(req_ids),
+                down_seqno=seqno,
+            )
             logger.info(
-                "[Lwd][cloud-ctrl] handle_model_output: c2e_meta received "
-                "reqs=%s down_seqno=%s, forwarding to edge",
-                getattr(meta, "req_ids", None),
-                getattr(meta, "down_seqno", None),
+                "[Lwd][cloud-ctrl] publish c2e(rank-replay): reqs=%s "
+                "rows=%d seqno=%d",
+                meta.req_ids, off, seqno,
             )
             LwdDebug.cloud_step(self.scheduler, meta, engine_core_outputs)  # [lwd-debug]
             _t = time.monotonic()
@@ -296,11 +319,10 @@ class LwdCloudEngineCore(EngineCoreProc):
             )
         else:
             logger.info(
-                "[Lwd][cloud-ctrl] handle_model_output: no c2e_meta this step"
+                "[Lwd][cloud-ctrl] handle_model_output: no down carrier this step"
             )
         return model_output
 
-    @staticmethod
     @staticmethod
     def _lwd_c2e_finish_reasons(
         meta: LwdC2eMeta,
