@@ -259,6 +259,26 @@ class LwdCloudEngineCore(EngineCoreProc):
             block_hasher=block_hasher,
         )
     
+    def step_with_batch_queue(self):
+        """步骤执行时长打点(开始执行→执行结束;不含引擎空等)。"""
+        _t0 = time.monotonic()
+        out = super().step_with_batch_queue()
+        logger.info(
+            "[Lwd][perf] cloud-step exec=%.2fms",
+            (time.monotonic() - _t0) * 1000,
+        )
+        return out
+
+    def step(self):
+        """同步步路径同款打点。"""
+        _t0 = time.monotonic()
+        out = super().step()
+        logger.info(
+            "[Lwd][perf] cloud-step exec=%.2fms",
+            (time.monotonic() - _t0) * 1000,
+        )
+        return out
+
     def lwd_handle_model_output(
         self,
         model_output: ModelRunnerOutput,
@@ -271,15 +291,8 @@ class LwdCloudEngineCore(EngineCoreProc):
         pinned 布局:[ranks(各调度段行)..., counts(accepted/请求)...,
         seg_lens(段长/请求)...];top_id_ths 按段长切,被拒行一并携带,
         边侧按 num_accepted 取有效前缀。"""
-        # [Lwd][perf] 临时探针:云相邻两步间隔——≈纯计算时长说明云自由
-        # 流水;≈计算+边尾段说明存在锁定步(云每步等边)
-        _now = time.monotonic()
-        _last = getattr(self, "_lwd_perf_last_step", 0.0)
-        if _last:
-            logger.info(
-                "[Lwd][perf] cloud-step dt=%.1fms", (_now - _last) * 1000
-            )
-        self._lwd_perf_last_step = _now
+        # [Lwd][perf] cloud-step dt 已由 exec 时长替代(见 step_with_batch_queue
+        # 覆写):开始执行→执行结束,不含无请求的空等。
         carrier = getattr(model_output, "lwd_down_carrier", None)
         if carrier is not None:
             pinned, req_ids, hidden_numel, seqno = carrier
