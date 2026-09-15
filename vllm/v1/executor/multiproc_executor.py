@@ -409,6 +409,16 @@ class MultiprocExecutor(Executor):
                 method, _time.monotonic(),
             )
         self.rpc_broadcast_mq.enqueue((send_method, args, kwargs, output_rank))
+        if self.parallel_config.lwd_config.enable_lwd:
+            import time as _time
+
+            # 探针②对照点:enqueue 返回时刻。与上行 rpc-enqueue 做差 =
+            # 引擎侧入队成本(序列化/MQ 写入阻塞);与 worker 侧
+            # rpc-dequeue 做差 = MQ 在途+排队等待。
+            logger.info(
+                "[Lwd][perf] rpc-enqueue-done method=%s ts=%.3f",
+                method, _time.monotonic(),
+            )
 
         response_mqs: Sequence[MessageQueue] = self.response_mqs
         if output_rank is not None:
@@ -1012,7 +1022,14 @@ class WorkerProc:
         # 事件由 runner 每步覆写;到期事件 synchronize 为 no-op,无需清理。
         ready_event = getattr(self.worker, "_lwd_meta_ready_event", None)
         if ready_event is not None:
+            _t_sync = time.monotonic()
             ready_event.synchronize()
+            # 探针④:输出线程被 pinned-meta 同步占住的时长(响应腿
+            # 延迟的主要来源嫌疑;~0 即到期事件,大则输出线程被拖)。
+            logger.info(
+                "[Lwd][perf] ready-event-sync dur=%.2fms ts=%.3f",
+                (time.monotonic() - _t_sync) * 1000, time.monotonic(),
+            )
 
         if isinstance(output, AsyncModelRunnerOutput):
             output = output.get_output()
@@ -1028,6 +1045,12 @@ class WorkerProc:
             result = (WorkerProc.ResponseStatus.SUCCESS, output)
         if (response_mq := self.worker_response_mq) is not None:
             response_mq.enqueue(result)
+            # 探针⑤:响应已写入 response_mq。与上一个 rpc-exec-done
+            # 做差 = 输出序列化+响应入队耗时;与引擎侧
+            # "engine got model_output" 做差 = 响应在途。
+            logger.info(
+                "[Lwd][perf] response-enqueued ts=%.3f", time.monotonic()
+            )
 
     def handle_output(self, output: Any):
         """Handles output from the worker. If async scheduling is enabled,
@@ -1070,10 +1093,22 @@ class WorkerProc:
     def worker_busy_loop(self):
         """Main busy loop for Multiprocessing Workers"""
         assert self.rpc_broadcast_mq is not None
+        _lwd_probe = getattr(
+            getattr(self.worker, "parallel_config", None), "lwd_config", None
+        )
+        _lwd_probe = bool(_lwd_probe and _lwd_probe.enable_lwd)
         while True:
             method, args, kwargs, output_rank = self.rpc_broadcast_mq.dequeue(
                 indefinite=True
             )
+            if _lwd_probe:
+                # 探针②:dequeue 返回时刻。减引擎 rpc-enqueue-done =
+                # MQ 在途+排队;减上一个 rpc-exec-done = 忙循环空转等待。
+                logger.info(
+                    "[Lwd][perf] rpc-dequeue method=%s ts=%.3f",
+                    method if isinstance(method, str) else "<callable>",
+                    time.monotonic(),
+                )
             try:
                 if isinstance(method, str):
                     func = getattr(self.worker, method)
@@ -1081,6 +1116,14 @@ class WorkerProc:
                     func = partial(cloudpickle.loads(method), self.worker)
 
                 output = func(*args, **kwargs)
+                if _lwd_probe:
+                    # 探针③:rpc 执行完毕时刻。减 rpc-dequeue = worker
+                    # 纯执行耗时(含执行内的一切阻塞)。
+                    logger.info(
+                        "[Lwd][perf] rpc-exec-done method=%s ts=%.3f",
+                        method if isinstance(method, str) else "<callable>",
+                        time.monotonic(),
+                    )
             except Exception as e:
                 # Notes have been introduced in python 3.11
                 if hasattr(e, "add_note"):
