@@ -88,15 +88,20 @@ class LwdEdgeEngineCore(EngineCoreProc):
         self._edge_sender = LwdControlPublisher(
             None, bind=False, queue_max=config.publish_queue_max
         )
-        # 云->边唯一载荷队列:生产端接收线程,消费端引擎步;数据面经
-        # UNEMBED 批的 lwd_c2e_notifies 拿元数据,不直接读队列
-        # (单消费者语义)
+        # 云->边唯一载荷队列:生产端接收线程,消费端交付线程
         self.lwd_c2e_meta_queue = queue.Queue(maxsize=LWD_C2E_META_QUEUE_MAX)
+        # token 交付线程产物缓冲:交付在独立线程做(与引擎步的模型批
+        # 完全解耦——embed 收割阻塞多久都不耽误 token 到达即付),
+        # 引擎步首在锁内一把换出,经 step() 返回值走原生输出通道
+        self._lwd_delivery_lock = threading.Lock()
+        self._lwd_delivery_outputs: list = []
+        self._lwd_delivery_finished: set = set()
+        self._lwd_delivery_stop = threading.Event()
         # 已派发待收割的批队列 (kind, payload, t_dispatch, future):
-        # kind="unembed" payload=notify;kind="embed" payload=scheduler_output。
-        # 派发不收割,队首 FIFO 收割——必须全局单队列:executor 的 FutureWrapper
-        # 按底层队列序排水,交错收割会连带等错批。t_dispatch 供
-        # [Lwd][sched] harvest wait(派发→收割)度量批在队列里的滞留时长
+        # kind="embed" payload=scheduler_output。派发不收割,队首 FIFO
+        # 收割——必须全局单队列:executor 的 FutureWrapper 按底层队列序
+        # 排水,交错收割会连带等错批。t_dispatch 供 [Lwd][sched]
+        # harvest wait(派发→收割)度量批在队列里的滞留时长
         self._lwd_batch_queue: deque = deque()
         hello_event = threading.Event()
         discovery = threading.Thread(
@@ -106,6 +111,12 @@ class LwdEdgeEngineCore(EngineCoreProc):
             daemon=True,
         )
         discovery.start()
+        delivery = threading.Thread(
+            target=self._lwd_delivery_loop,
+            name="lwd-token-deliver",
+            daemon=True,
+        )
+        delivery.start()
         if not hello_event.wait(config.hello_timeout_s):
             self._lwd_shutdown_planes()
             raise RuntimeError(
@@ -213,21 +224,27 @@ class LwdEdgeEngineCore(EngineCoreProc):
         get,轮询循环是否退出由本判据决定(core.py while not has_work)。
         批队列非空必须计入——否则最后一批派发后引擎睡眠,最终 token
         永不收割交付。"""
+        # 交付缓冲非空也计入:交付线程独立消费 c2e,引擎可能无排程
+        # 工作时缓冲里已有 token——漏计会让主循环睡眠,token 滞留
         return (super().has_work() or not self.lwd_c2e_meta_queue.empty()
-                or self._lwd_batch_queue)
+                or self._lwd_batch_queue or self._lwd_delivery_outputs)
 
     def _lwd_edge_step(self) -> tuple[dict[int, object] | None, bool]:
-        """单步编排(token_id 版):收割 embed 批队列直至清空 -> 消费 c2e
-        通告(token 直接交付,纯主机工作,无 worker 派发)-> prefill 连续
-        派发 -> 返回({0: 云侧结果输出} | None,prefill 是否有派发)。
+        """单步编排(token_id 版 + 交付线程):换出交付线程产物 -> 收割
+        embed 批队列直至清空 -> prefill 连续派发 -> 返回({0: 云侧结果
+        输出} | None,prefill 是否有派发)。
 
-        embed 批派发入队不收割,队首 FIFO 收割(序与 executor 排水序
-        同构);云侧 token 经 ZMQ 直达引擎,交付不再经过批队列/worker。
+        token 交付在独立线程(到达即付,不受 embed 收割/派发阻塞);
+        引擎步只做模型批编排。embed 批派发入队不收割,队首 FIFO 收割
+        (序与 executor 排水序同构)。
 
-        [Lwd][sched] 三类日志:每批 harvest(含队列滞留 wait)、每批
-        dispatch(含队列构成/c2e 水位)、每步汇总。"""
-        outputs: list = []
-        finished_reqs: set = set()
+        [Lwd][sched] 三类日志:交付线程 deliver、每批 harvest(含队列
+        滞留 wait)、每步汇总。"""
+        with self._lwd_delivery_lock:
+            outputs = self._lwd_delivery_outputs
+            finished_reqs = self._lwd_delivery_finished
+            self._lwd_delivery_outputs = []
+            self._lwd_delivery_finished = set()
         prefill_work = False
         h_emb = 0
         while self._lwd_batch_queue:
@@ -243,7 +260,6 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 self._lwd_batch_seqno(payload),
                 (time.monotonic() - t_dispatch) * 1000,
             )
-        d_unemb = self._lwd_edge_consume_c2e(outputs, finished_reqs)
         d_emb = 0
         while (len(self._lwd_batch_queue) < LWD_EDGE_BATCH_QUEUE_DEPTH
                and self.scheduler.has_requests()):
@@ -259,9 +275,9 @@ class LwdEdgeEngineCore(EngineCoreProc):
             prefill_work = True
             d_emb += 1
         logger.info(
-            "[Lwd][sched] edge step harvest_emb=%d deliver_unemb=%d "
+            "[Lwd][sched] edge step deliver=%d harvest_emb=%d "
             "disp_emb=%d queue=%demb c2e_pending=%d",
-            h_emb, d_unemb, d_emb, len(self._lwd_batch_queue),
+            len(outputs), h_emb, d_emb, len(self._lwd_batch_queue),
             self.lwd_c2e_meta_queue.qsize(),
         )
         if outputs:
@@ -278,17 +294,20 @@ class LwdEdgeEngineCore(EngineCoreProc):
         batch = getattr(payload, "lwd_batch", None)
         return str(getattr(batch, "seqno", "?")) if batch else "?"
 
-    def _lwd_edge_consume_c2e(self, outputs: list, finished_reqs: set) -> int:
-        """消费 c2e 通告:token_id 版直接逐请求交付(纯主机工作,无
-        worker 派发、无批队列)。云侧有活请求才产通告,每条必有 req。
-        交付不占批队列深度,一次排空队列(队满背压由接收线程的阻塞 put
-        承担);返回本步交付条数。"""
-        delivered = 0
-        while True:
+    def _lwd_delivery_loop(self) -> None:
+        """token 交付线程体:排空 c2e 队列,到达即付。
+
+        与引擎步(模型批收割/派发)完全解耦——embed future 阻塞多久都
+        不影响 token 交付;产物进缓冲并敲 WAKEUP,引擎步首换出经原生
+        通道发给前端。awaiting 台账在调度器侧以幂等操作跨线程访问。
+        """
+        while not self._lwd_delivery_stop.is_set():
             try:
-                notify, t_arrive = self.lwd_c2e_meta_queue.get_nowait()
+                notify, t_arrive = self.lwd_c2e_meta_queue.get(
+                    timeout=0.5
+                )
             except queue.Empty:
-                break
+                continue
             logger.info(
                 "[Lwd][sched] edge deliver-unembed reqs=%d tokens=%s "
                 "c2e_wait=%.2fms c2e_pending=%d",
@@ -297,9 +316,18 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 (time.monotonic() - t_arrive) * 1000,
                 self.lwd_c2e_meta_queue.qsize(),
             )
+            outputs: list = []
+            finished_reqs: set = set()
             self._lwd_deliver_notify(notify, outputs, finished_reqs)
-            delivered += 1
-        return delivered
+            if outputs:
+                with self._lwd_delivery_lock:
+                    self._lwd_delivery_outputs.extend(outputs)
+                    self._lwd_delivery_finished |= finished_reqs
+                # 引擎可能已无其他工作在睡:交付本身不产生排程事件,
+                # 须主动唤醒主循环换出缓冲(WAKEUP 多投无害)
+                self.input_queue.put_nowait(
+                    (EngineCoreRequestType.WAKEUP, None)
+                )
 
     def _lwd_dispatch_embed(self, scheduler_output):
         """EMBED 批提交侧(唯一提交点,同步/异步共用):范围预告(发布
@@ -373,6 +401,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
         return None if code == LWD_NOT_FINISHED else FinishReason(code)
 
     def shutdown(self) -> None:
-        """两面关停后走原生;初始化失败路径两面可能未建,容忍缺省。"""
+        """交付线程关停 + 两面关停后走原生;初始化失败路径容忍缺省。"""
+        getattr(self, "_lwd_delivery_stop", threading.Event()).set()
         self._lwd_shutdown_planes()
         super().shutdown()
