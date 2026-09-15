@@ -125,10 +125,33 @@ class MultiprocExecutor(Executor):
 
         set_multiprocessing_worker_envs()
 
-        # use the loopback address get_loopback_ip() for communication.
-        distributed_init_method = get_distributed_init_method(
-            get_loopback_ip(), get_open_port()
-        )
+        # LWD edge-cloud: 边云共享世界的 rendezvous 地址由 lwd_config 派生
+        # (post_out_host = 边 IP,边 rank0 为 store master;两侧同值),
+        # 不依赖 VLLM_LOOPBACK_IP/VLLM_PORT 环境变量对齐。
+        parallel_lwd = self.vllm_config.parallel_config.lwd_config
+        if parallel_lwd.enable_lwd:
+            from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import (
+                LwdConfig,
+            )
+
+            lwd_config = LwdConfig.from_env_and_config(self.vllm_config)
+            if not lwd_config.post_out_host:
+                raise ValueError(
+                    "[LWD] edge-cloud shared world requires "
+                    "lwd_config.post_out_host (= edge IP, same value on "
+                    "both sides; the edge rank-0 worker binds the "
+                    "rendezvous store there)"
+                )
+            distributed_init_method = lwd_config.lwd_wire_store_init_method()
+            logger.info(
+                "[LWD] distributed init method from lwd_config: %s",
+                distributed_init_method,
+            )
+        else:
+            # use the loopback address get_loopback_ip() for communication.
+            distributed_init_method = get_distributed_init_method(
+                get_loopback_ip(), get_open_port()
+            )
         self.rpc_broadcast_mq: MessageQueue | None = None
         scheduler_output_handle: Handle | None = None
         # Initialize worker and set up message queues for SchedulerOutputs

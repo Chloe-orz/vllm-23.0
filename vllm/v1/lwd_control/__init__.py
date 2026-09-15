@@ -61,26 +61,37 @@ def lwd_serve_guard(vllm_config) -> None:
 
 
 def _lwd_cloud_deploy_guard(vllm_config, config) -> None:
-    """云角色部署校验(fail-fast,serve 入口即拦):master_addr 非空
-    (POST_OUT 连边必需);pre_out_host 非 0.0.0.0(通告值须可路由)。"""
+    """云角色部署校验(fail-fast,serve 入口即拦):post_out_host 非空
+    (POST_OUT 连边必需,master_addr 仅兼容回退);pre_out_host 非
+    0.0.0.0(通告值须可路由)。"""
     from vllm.logger import init_logger
 
+    logger = init_logger(__name__)
     master_addr = vllm_config.parallel_config.master_addr
-    if not master_addr:
+    if not config.post_out_host and not master_addr:
         raise ValueError(
-            "[Lwd] prefill_only cloud requires --master-addr (POST_OUT connect)"
+            "[Lwd] prefill_only cloud requires lwd_config.post_out_host "
+            "(POST_OUT connect target = edge IP; --master-addr is only a "
+            "deprecated fallback)"
         )
+    if not config.post_out_host and master_addr:
+        logger.warning(
+            "[Lwd] post_out_host unset, falling back to --master-addr=%s; "
+            "prefer lwd_config.post_out_host",
+            master_addr,
+        )
+    connect_host = config.post_out_host or master_addr
     if config.pre_out_host == "0.0.0.0":
         raise ValueError(
             "[Lwd] prefill_only cloud pre_out_host=0.0.0.0 is not announceable; "
             "set a routable IP (VLLM_ASCEND_LWD_PRE_OUT_HOST)"
         )
-    if config.pre_out_host == "127.0.0.1" and master_addr not in (
+    if config.pre_out_host == "127.0.0.1" and connect_host not in (
         "127.0.0.1",
         "localhost",
     ):
-        init_logger(__name__).warning(
-            "[Lwd] cloud announces pre_out_host=127.0.0.1 but master_addr=%s "
-            "is remote; edge will fail to reach PRE_OUT unless same host",
-            master_addr,
+        logger.warning(
+            "[Lwd] cloud announces pre_out_host=127.0.0.1 but edge is remote "
+            "(%s); edge will fail to reach PRE_OUT unless same host",
+            connect_host,
         )

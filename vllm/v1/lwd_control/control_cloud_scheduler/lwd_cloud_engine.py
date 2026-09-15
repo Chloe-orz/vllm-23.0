@@ -70,9 +70,26 @@ class LwdCloudEngineCore(EngineCoreProc):
         self._lwd_subscriber = LwdControlSubscriber(
             config.lwd_pre_out_endpoint(), bind=True
         )
-        master_addr = self.vllm_config.parallel_config.master_addr
+        # POST_OUT 连边地址:post_out_host(native 语义)优先;
+        # master_addr 仅作旧部署命令的兼容回退
+        connect_host = config.post_out_host
+        if not connect_host:
+            connect_host = self.vllm_config.parallel_config.master_addr
+            if connect_host:
+                logger.warning(
+                    "[Lwd] falling back to --master-addr=%s as the POST_OUT "
+                    "connect target; prefer lwd_config.post_out_host",
+                    connect_host,
+                )
+        if not connect_host:
+            raise ValueError(
+                "[Lwd] prefill_only cloud requires lwd_config.post_out_host "
+                "(POST_OUT connect target = edge IP)"
+            )
         self._lwd_post_out = LwdControlPublisher(
-            f"tcp://{master_addr}:{config.post_out_port}",
+            config.lwd_post_out_connect_endpoint()
+            if config.post_out_host
+            else f"tcp://{connect_host}:{config.post_out_port}",
             bind=False,
             encoder=lwd_encode_cloud_notify,
         )
@@ -97,12 +114,9 @@ class LwdCloudEngineCore(EngineCoreProc):
         self._lwd_seqno_registry: dict[str, list[int]] = {}
         self.scheduler.lwd_seqno_registry = self._lwd_seqno_registry
         logger.info(
-            "[Lwd] cloud engine assembled: PRE_OUT bind %s, POST_OUT announce -> "
-            "%s:%s via master %s",
+            "[Lwd] cloud engine assembled: PRE_OUT bind %s, POST_OUT -> %s",
             config.lwd_pre_out_endpoint(),
-            config.pre_out_host,
-            config.pre_out_port,
-            master_addr,
+            f"tcp://{connect_host}:{config.post_out_port}",
         )
 
     def process_input_sockets(

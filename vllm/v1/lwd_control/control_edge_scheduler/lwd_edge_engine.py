@@ -117,7 +117,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 f"[Lwd] edge engine init failed: no cloud HELLO within "
                 f"{config.hello_timeout_s}s on POST_OUT "
                 f"(bind {config.lwd_post_out_bind_endpoint()}; check cloud "
-                f"master_addr connectivity and POST_OUT port)"
+                f"post_out_host connectivity and POST_OUT port)"
             )
         if self._lwd_hello_error is not None:
             self._lwd_shutdown_planes()

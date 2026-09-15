@@ -70,7 +70,25 @@ class UniProcExecutor(Executor):
 
     def _distributed_args(self) -> tuple[str, int, int]:
         """Return (distributed_init_method, rank, local_rank)."""
-        distributed_init_method = get_distributed_init_method(get_ip(), get_open_port())
+        parallel_lwd = self.vllm_config.parallel_config.lwd_config
+        if parallel_lwd.enable_lwd:
+            # LWD 边云共享世界:rendezvous 地址与 multiproc 执行器同源
+            # (lwd_config.post_out_host + wire_store_port),不依赖 env 对齐
+            from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import (
+                LwdConfig,
+            )
+
+            lwd_config = LwdConfig.from_env_and_config(self.vllm_config)
+            if not lwd_config.post_out_host:
+                raise ValueError(
+                    "[LWD] edge-cloud shared world requires "
+                    "lwd_config.post_out_host (= edge IP)"
+                )
+            distributed_init_method = lwd_config.lwd_wire_store_init_method()
+        else:
+            distributed_init_method = get_distributed_init_method(
+                get_ip(), get_open_port()
+            )
         # set local rank as the device index if specified
         device_info = self.vllm_config.device_config.device.__str__().split(":")
         local_rank = int(device_info[1]) if len(device_info) > 1 else 0

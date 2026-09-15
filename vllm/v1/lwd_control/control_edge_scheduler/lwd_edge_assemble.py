@@ -28,6 +28,9 @@ logger = init_logger(__name__)
 
 LWD_PRE_OUT_PORT_DEFAULT = 5558
 LWD_POST_OUT_PORT_DEFAULT = LWD_PRE_OUT_PORT_DEFAULT + 1
+# 边云共享世界 rendezvous store 的默认端口(与两个 ZMQ 端口并列的
+# 第三个部署端口)
+LWD_WIRE_STORE_PORT_DEFAULT = 29600
 # 等云首拍 HELLO 的预算:HELLO 在云引擎全量初始化(权重/KV/图编译
 # capture)完成后才发出,预算须覆盖云的全量启动时长(边不开图、
 # 云开图是本场景固定形态),默认 600s;部署可经 hello_timeout_s/env 覆盖
@@ -46,8 +49,14 @@ class LwdConfig:
     is_edge_node: bool = True
     pre_out_host: str = "127.0.0.1"
     pre_out_port: int = LWD_PRE_OUT_PORT_DEFAULT
+    # 边的 IP:云连边(POST_OUT)与边云共享世界 rendezvous store 的目标
+    # 地址;两侧同值(边侧用它 bind store,必须是边本机持有的可路由 IP)
+    post_out_host: str = ""
     post_out_port: int = LWD_POST_OUT_PORT_DEFAULT
     post_out_bind: str = "*"
+    # 边云共享世界的 rendezvous store 端口(init_method 的第三个部署端口,
+    # 边 rank0 为 store master);与 native 的 wire_store_port 同语义
+    wire_store_port: int = LWD_WIRE_STORE_PORT_DEFAULT
     hello_timeout_s: float = LWD_HELLO_TIMEOUT_S_DEFAULT
     scheduler_name: str = "prefill_first"
     publish_queue_max: int = LWD_PUBLISH_QUEUE_MAX
@@ -58,8 +67,17 @@ class LwdConfig:
         return f"tcp://{self.pre_out_host}:{self.pre_out_port}"
 
     def lwd_post_out_bind_endpoint(self) -> str:
-        """POST_OUT 端点:边侧 bind,云经 master_addr 来连。"""
+        """POST_OUT 端点:边侧 bind,云经 post_out_host 来连。"""
         return f"tcp://{self.post_out_bind}:{self.post_out_port}"
+
+    def lwd_post_out_connect_endpoint(self) -> str:
+        """POST_OUT 连接端点:云侧连边(post_out_host = 边 IP)。"""
+        return f"tcp://{self.post_out_host}:{self.post_out_port}"
+
+    def lwd_wire_store_init_method(self) -> str:
+        """边云共享世界 rendezvous 的 init_method:两侧同值,
+        边 rank0 为 store master(bind post_out_host)。"""
+        return f"tcp://{self.post_out_host}:{self.wire_store_port}"
 
     @classmethod
     def from_env_and_config(cls, vllm_config) -> LwdConfig:
@@ -73,8 +91,12 @@ class LwdConfig:
             else str(section.get("role", "edge")) == "edge",
             pre_out_host=str(section.get("pre_out_host", "127.0.0.1")),
             pre_out_port=int(section.get("pre_out_port", LWD_PRE_OUT_PORT_DEFAULT)),
+            post_out_host=str(section.get("post_out_host", "")),
             post_out_port=int(section.get("post_out_port", LWD_POST_OUT_PORT_DEFAULT)),
             post_out_bind=str(section.get("post_out_bind", "*")),
+            wire_store_port=int(
+                section.get("wire_store_port", LWD_WIRE_STORE_PORT_DEFAULT)
+            ),
             hello_timeout_s=float(
                 section.get("hello_timeout_s", LWD_HELLO_TIMEOUT_S_DEFAULT)
             ),
@@ -114,16 +136,24 @@ def _lwd_apply_env_overrides(config: LwdConfig) -> LwdConfig:
     默认,不抛(部署期输入错误不应炸掉引擎启动)。"""
     host = os.getenv(_LWD_ENV_PREFIX + "PRE_OUT_HOST")
     port = _lwd_read_env_int("PRE_OUT_PORT")
+    post_host = os.getenv(_LWD_ENV_PREFIX + "POST_OUT_HOST")
     post_port = _lwd_read_env_int("POST_OUT_PORT")
     post_bind = os.getenv(_LWD_ENV_PREFIX + "POST_OUT_BIND")
+    wire_store_port = _lwd_read_env_int("WIRE_STORE_PORT")
     hello_timeout = _lwd_read_env_float("HELLO_TIMEOUT_S")
     debug = os.getenv(_LWD_ENV_PREFIX + "DEBUG")
     return LwdConfig(
         is_edge_node=config.is_edge_node,
         pre_out_host=host if host else config.pre_out_host,
         pre_out_port=port if port is not None else config.pre_out_port,
+        post_out_host=post_host if post_host else config.post_out_host,
         post_out_port=post_port if post_port is not None else config.post_out_port,
         post_out_bind=post_bind if post_bind else config.post_out_bind,
+        wire_store_port=(
+            wire_store_port
+            if wire_store_port is not None
+            else config.wire_store_port
+        ),
         hello_timeout_s=(
             hello_timeout if hello_timeout is not None else config.hello_timeout_s
         ),
