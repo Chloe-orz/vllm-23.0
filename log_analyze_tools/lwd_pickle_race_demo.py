@@ -69,60 +69,85 @@ def demo_snapshot_semantics() -> None:
           "        引擎侧'同步点之后再读'保护的是活缓冲,不是这份快照。\n")
 
 
-def _device_writer(carrier: Carrier, write_delay_s: float, stop: threading.Event) -> None:
-    """模拟设备 DMA:慢速逐字节写入(等效 non_blocking D2H 在设备上排队后执行)。"""
+def _device_writer(
+    carrier: Carrier,
+    tail_delay_s: float,
+    step_start: threading.Event,
+    step_done: threading.Event,
+    stop: threading.Event,
+) -> None:
+    """模拟设备侧一步:先排"计算尾部"(tail_delay,负载越大越长),
+    然后执行 D2H。小 int32 元数据的 DMA 近乎瞬时,一次性写入。"""
     while not stop.is_set():
-        for i in range(META_ELEMS):
-            if stop.is_set():
-                return
-            carrier.pinned[i] = NEW_STEP
-            time.sleep(write_delay_s)
-        # 回到"旧值"再写一轮,模拟 pinned 环轮转后下一步复用
-        for i in range(META_ELEMS):
-            if stop.is_set():
-                return
-            carrier.pinned[i] = OLD_STEP
-            time.sleep(write_delay_s)
+        step_start.wait()
+        if stop.is_set():
+            return
+        step_start.clear()
+        time.sleep(tail_delay_s)  # non_blocking 拷贝在设备上排队等计算尾部
+        carrier.pinned[:] = _meta_bytes(NEW_STEP)
+        step_done.set()
 
 
-def demo_race(load_level: int) -> None:
-    """实验 2:异步写 vs 立即 pickle 的竞态,统计快照质量。
+# worker 返回→组包→mq.put(pickle)的窗口(与负载无关)。
+# 真实管线为 µs~ms 级;demo 统一放大到 ms 标度便于跨平台稳定复现,
+# 比例关系(pickle 窗口 vs 各档计算尾部)与真实一致。
+PICKLE_DELAY_S = 3e-3
+TAIL_PER_LOAD_S = 2e-3
+TRIALS = 150
 
-    load_level 越大 = 设备尾巴越长(DMA 延迟越大),对应并发越高。
+
+def demo_race(load_level: int, trials: int = TRIALS) -> None:
+    """实验 2:异步 D2H vs 立即 pickle 的竞态,统计快照质量。
+
+    真实时序:worker 入队拷贝后立即返回→mq.put(pickle 窗口固定);
+    设备要先跑完本步计算尾部才执行拷贝——负载越大尾部越长,
+    pickle 越容易落在拷贝【之前】= 快照全是旧值(错乱元数据)。
     """
     print("=" * 60)
-    print(f"实验 2:竞态模拟(设备写延迟 = {load_level} x 基准)")
+    print(f"实验 2:竞态模拟(计算尾部 = {load_level} 档 ≈ "
+          f"{load_level * TAIL_PER_LOAD_S * 1e3:.1f}ms,"
+          f"pickle 窗口 = {PICKLE_DELAY_S * 1e3:.1f}ms;"
+          f"时标已放大,比例同真实)")
     print("=" * 60)
     carrier = Carrier()
-    stop = threading.Event()
-    # 主线程 pickle 一次的耗时约为几十 µs;写延迟按同量级放大
+    step_start, step_done, stop = threading.Event(), threading.Event(), threading.Event()
     writer = threading.Thread(
         target=_device_writer,
-        args=(carrier, load_level * 20e-6, stop),
+        args=(carrier, load_level * TAIL_PER_LOAD_S,
+              step_start, step_done, stop),
         daemon=True,
     )
     writer.start()
-    time.sleep(0.01)  # 让设备线程先进入"写新值"阶段
 
-    trials, stale, mixed, fresh = 2000, 0, 0, 0
+    stale, mixed, fresh = 0, 0, 0
     for _ in range(trials):
-        snap = pickle.loads(pickle.dumps(carrier))  # mq.put + 引擎 loads
+        # pinned 环轮转:本步开始前缓冲里是"上一步的残留"
+        carrier.pinned[:] = _meta_bytes(OLD_STEP)
+        step_start.set()                     # worker:copy_ 入队,立即返回
+        time.sleep(PICKLE_DELAY_S)           # 返回→组包→mq.put(pickle)
+        snap = pickle.loads(pickle.dumps(carrier))  # 引擎收到的快照
+        step_done.wait(); step_done.clear()  # 等设备本步写完再进下一轮
         n_new = sum(1 for b in snap.pinned if b == NEW_STEP)
         if n_new == 0:
-            stale += 1      # 全旧值:counts/seg_lens 整体错位
+            stale += 1      # 全旧值:拷贝未落地,counts/seg_lens 整体错位
         elif n_new == META_ELEMS:
-            fresh += 1      # 全新值:本步侥幸正确
+            fresh += 1      # 全新值:尾部短于 pickle 窗口,侥幸正确
         else:
-            mixed += 1      # 半新半旧:更隐蔽的垃圾
+            mixed += 1      # 拍在 DMA 写入中:窄窗口,偶发
     stop.set()
+    step_start.set()  # 唤醒写线程退出
     writer.join(timeout=1)
 
-    print(f"  {trials} 次 'worker返回→立即pickle' 中:")
-    print(f"    全新值(侥幸正确) : {fresh:5d}  ({fresh / trials:6.1%})")
-    print(f"    全旧值(整体错位) : {stale:5d}  ({stale / trials:6.1%})")
-    print(f"    混合值(部分垃圾) : {mixed:5d}  ({mixed / trials:6.1%})")
-    verdict = "竞态被踩中,快照不可信" if (stale + mixed) > 0 else "本组延迟下窗口未命中"
-    print(f"  结论:{verdict}。\n")
+    print(f"  {trials} 步 '入队→立即pickle' 中:")
+    print(f"    全新值(侥幸正确) : {fresh:4d}  ({fresh / trials:6.1%})")
+    print(f"    全旧值(整体错位) : {stale:4d}  ({stale / trials:6.1%})")
+    print(f"    混合值(部分垃圾) : {mixed:4d}  ({mixed / trials:6.1%})")
+    wrong = stale + mixed
+    verdict = ("计算尾部短于 pickle 窗口,基本不踩 —— ≈单请求/低并发,验证通过"
+               if wrong / trials < 0.05 else
+               "计算尾部超过 pickle 窗口,高概率踩中 —— ≈高并发满批,快照不可信")
+    print(f"  结论:{verdict}。\n"
+          f"  可自行对比:--load 1(≈单请求)vs --load 4(≈满批并发)。\n")
 
 
 def demo_torch_variant() -> None:
@@ -164,7 +189,8 @@ def main() -> None:
     parser.add_argument("--race-only", action="store_true", help="只跑竞态实验")
     parser.add_argument("--torch", action="store_true", help="追加 torch 版实验")
     parser.add_argument("--load", type=int, default=8,
-                        help="竞态实验的负载档位(设备写延迟倍数,默认 8)")
+                        help="竞态实验的负载档位(计算尾部倍数,默认 8;"
+                             "1≈单请求,4+≈满批并发)")
     args = parser.parse_args()
 
     random.seed(0)
