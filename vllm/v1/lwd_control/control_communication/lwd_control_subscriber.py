@@ -54,15 +54,7 @@ class LwdControlSubscriber:
                 # ETERM(关停打断)与 NOBLOCK 竞态 Again 都走此出口
                 return None
             try:
-                msg = self._decoder(data)
-                _rid = getattr(msg, "request_id", None) or getattr(
-                    msg, "req_ids", None)
-                _seqno = getattr(msg, "seqno", getattr(msg, "down_seqno", None))
-                logger.info(
-                    "[Lwd][DUMP][req=%s][seqno=%s] RECV %s: %r",
-                    _rid, _seqno, type(msg).__name__, msg,
-                )
-                return msg
+                return self._decoder(data)
             except (msgspec.DecodeError, msgspec.ValidationError):
                 logger.warning("[Lwd] drop malformed notify frame")
         return None
