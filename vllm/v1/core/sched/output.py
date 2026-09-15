@@ -39,6 +39,9 @@ class LwdEmbedBatch:
 
     req_ids: list[str] = field(default_factory=list)
     token_ids: list[list[int]] = field(default_factory=list)
+    prompt_offsets: list[int] = field(default_factory=list)
+    has_mrope: bool = False
+    mrope_positions: list[list[int]] = field(default_factory=list)
 
 
 @dataclass

@@ -20,6 +20,7 @@ class LwdRangeNotify(msgspec.Struct, gc=False, tag=True):
     offset: int
     num_tokens: int
     seqno: int
+    has_mrope: bool = False
 
 
 class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):
