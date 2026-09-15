@@ -64,6 +64,10 @@ class LwdControlPublisher:
         """已关停为 True(与 LwdControlSubscriber.closed 同语义)。"""
         return self._closed
 
+    def qsize(self) -> int:
+        """当前积压深度(背压观测;IO 线程被对端拖住时上涨)。"""
+        return self._queue.qsize()
+
     def publish(self, msg: Any) -> bool:
         """元数据入队;False = 队满未发(可预期失败,不抛异常不丢已发消息)。"""
         try:

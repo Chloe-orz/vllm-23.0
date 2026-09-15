@@ -340,8 +340,20 @@ class LwdCloudEngineCore(EngineCoreProc):
             req_ids=req_ids,
             finish_reasons=finish_reasons,
         )
+        # 队满即背压链触发(边侧消费滞后一路顶到云),50ms/次的静默
+        # 小睡等于每次吞掉数个 decode 步——必须显式留痕供定位
+        retries = 0
         while not self._lwd_post_out.closed:
             if self._lwd_post_out.publish(notify):
+                if retries:
+                    logger.warning(
+                        "[Lwd][cloud-ctrl] publish blocked by full queue: "
+                        "retries=%d stalled=%.0fms queue=%d "
+                        "(edge consumption lagging)",
+                        retries,
+                        retries * _LWD_C2E_SEND_RETRY_SLEEP_S * 1000,
+                        self._lwd_post_out.qsize(),
+                    )
                 logger.info(
                     "[Lwd][cloud-ctrl] publish C2eNotify reqs=%d "
                     "finish=%s tokens=%s",
@@ -350,4 +362,13 @@ class LwdCloudEngineCore(EngineCoreProc):
                     [len(t) for t in token_ids],
                 )
                 return
+            retries += 1
+            if retries % 10 == 0:
+                logger.warning(
+                    "[Lwd][cloud-ctrl] publish still blocked after %d "
+                    "retries (%.0fms), queue=%d",
+                    retries,
+                    retries * _LWD_C2E_SEND_RETRY_SLEEP_S * 1000,
+                    self._lwd_post_out.qsize(),
+                )
             time.sleep(_LWD_C2E_SEND_RETRY_SLEEP_S)
