@@ -18,9 +18,9 @@
      构建调度器时一次性消费该配置,后设无效;引擎构造完成后回填
      publisher(早于任何请求,等价构造注入)。
 
-步进编排:步首消费云载荷(c2e -> UNEMBED 批 -> token 交付/请求终结)
-+ prefill 编排(单请求组批 -> 范围预告 -> 原生 executor 同步执行 ->
-步末完结登记)。
+步进编排(embed 优先):步首收割在飞批(unembed 交付 token/请求终结,
+embed 登记进度)-> prefill 编排(单请求组批 -> 范围预告 -> executor
+异步执行,优先占深度配额)-> 云载荷消费(c2e -> UNEMBED 批,剩余配额)。
 """
 
 from __future__ import annotations
@@ -218,13 +218,18 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 or self._lwd_batch_queue)
 
     def _lwd_edge_step(self) -> tuple[dict[int, object] | None, bool]:
-        """单步编排(批队列异步化+多批在飞):收割队首直至清空 -> 消费
-        云载荷(派发至深度上限) -> prefill 连续派发 -> 返回
-        ({0: 云侧结果输出} | None, prefill 是否有派发)。
+        """单步编排(批队列异步化+多批在飞,embed 优先):收割队首直至
+        清空 -> prefill 连续派发(优先占深度配额) -> 消费云载荷(剩余
+        配额派发 UNEMBED)-> 返回({0: 云侧结果输出} | None,prefill
+        是否有派发)。
 
         embed/unembed 均派发入队不收割,队首全局 FIFO 收割(序与
-        executor 排水序同构);突发时一步连派至深度上限喂饱 worker。
-        代价:token 交付与 embed 进度登记晚若干引擎步。
+        executor 排水序同构,不可交错);突发时一步连派至深度上限
+        喂饱 worker。派发序 embed 优先:196 并发下每云步都产 c2e,
+        若 unembed 先吃配额会把 embed 挤出本步(EMBED 被 decode 回程
+        挤住的饿死形态),TTFT 劣化——故 embed 先占位,unembed 用剩余
+        配额,代价是 decode token 交付最多延后 1-2 步(顶部全量收割
+        + c2e 队列背压兜底,不会饿死)。
 
         [Lwd][sched] 三类日志(饿死分析锚点):每批 harvest(含队列滞留
         wait)、每批 dispatch(含 ahead 队列构成/c2e 水位)、每步汇总。"""
@@ -250,7 +255,6 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 kind, self._lwd_batch_seqno(kind, payload),
                 (time.monotonic() - t_dispatch) * 1000,
             )
-        d_unemb = self._lwd_edge_consume_c2e()
         d_emb = 0
         while (len(self._lwd_batch_queue) < LWD_EDGE_BATCH_QUEUE_DEPTH
                and self.scheduler.has_requests()):
@@ -265,6 +269,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
             )
             prefill_work = True
             d_emb += 1
+        d_unemb = self._lwd_edge_consume_c2e()
         n_emb, n_unemb = self._lwd_queue_mix()
         logger.info(
             "[Lwd][sched] edge step harvest_emb=%d harvest_unemb=%d "
