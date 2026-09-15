@@ -1001,6 +1001,14 @@ class WorkerProc:
         worker_response_mq. If the output is an Exception, it is
         converted to a FAILURE response.
         """
+        # LWD: sample_tokens 的采集在主流末尾异步物化 pinned meta,
+        # 发送响应前必须等其落地(此处是输出线程/同步路径的入队点,
+        # 非计算关键路径),保证控制面读到的 meta 是完整的。
+        # 事件由 runner 每步覆写;到期事件 synchronize 为 no-op,无需清理。
+        ready_event = getattr(self.worker, "_lwd_meta_ready_event", None)
+        if ready_event is not None:
+            ready_event.synchronize()
+
         if isinstance(output, AsyncModelRunnerOutput):
             output = output.get_output()
 
