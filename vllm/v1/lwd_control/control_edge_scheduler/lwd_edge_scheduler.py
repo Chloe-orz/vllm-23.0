@@ -349,6 +349,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
           调用方丢弃告警(幂等,不复活)。
 
         token_ids/finished 的输出组包归引擎层(EngineCoreOutputs)。"""
+        # 交付线程与引擎线程(abort/progress)并发访问台账:单条 dict
+        # 操作 GIL 原子,出账用幂等 pop——与 abort 竞态时至多一方成功
         if request_id not in self._lwd_awaiting:
             logger.warning(
                 "[Lwd][edge-deliver] stale result for req=%s (not awaiting)",
@@ -356,7 +358,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             )
             return False
         if finished:
-            del self._lwd_awaiting[request_id]
+            self._lwd_awaiting.pop(request_id, None)
         logger.info(
             "[Lwd][edge-deliver] req=%s tokens=%d finished=%s",
             request_id, len(token_ids), finished,
