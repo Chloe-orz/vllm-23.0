@@ -276,7 +276,7 @@ class LwdCloudEngineCore(EngineCoreProc):
                 "[Lwd][perf] cloud-step dt=%.1fms", (_now - _last) * 1000
             )
         self._lwd_perf_last_step = _now
-        meta = self._lwd_rebuild_meta_if_needed(model_output)
+        meta = model_output.lwd_c2e_meta
         if meta is not None:
             logger.info(
                 "[Lwd][cloud-ctrl] handle_model_output: c2e_meta received "
@@ -301,37 +301,6 @@ class LwdCloudEngineCore(EngineCoreProc):
         return model_output
 
     @staticmethod
-    def _lwd_rebuild_meta_if_needed(model_output):
-        """worker 只挂 lwd_down_carrier(pinned 引用),此处(get_output
-        的 wait_stream 同步点之后,pinned 必然就绪)读取并重建
-        LwdC2eMeta。pinned 布局 [ranks(rows), counts(n), seg_lens(n)]。"""
-        meta = getattr(model_output, "lwd_c2e_meta", None)
-        if meta is not None:
-            return meta
-        carrier = getattr(model_output, "lwd_down_carrier", None)
-        if carrier is None:
-            return None
-        from vllm.v1.outputs import LwdC2eMeta
-
-        pinned, req_ids, numel, seqno = carrier
-        n = len(req_ids)
-        total = pinned.numel()
-        seg_lens = pinned[total - n :].tolist()
-        counts = pinned[total - 2 * n : total - n].tolist()
-        ranks_flat = pinned[: total - 2 * n].tolist()
-        top_id_ths, off = [], 0
-        for s in seg_lens:
-            top_id_ths.append(ranks_flat[off : off + s])
-            off += s
-        model_output.lwd_c2e_meta = LwdC2eMeta(
-            hidden_num_elements=numel,
-            top_id_ths=top_id_ths,
-            num_accepted_tokens=counts,
-            req_ids=req_ids,
-            down_seqno=seqno,
-        )
-        return model_output.lwd_c2e_meta
-
     @staticmethod
     def _lwd_c2e_finish_reasons(
         meta: LwdC2eMeta,
