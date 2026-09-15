@@ -264,33 +264,43 @@ class LwdCloudEngineCore(EngineCoreProc):
         model_output: ModelRunnerOutput,
         engine_core_outputs: dict[int, EngineCoreOutputs],
     ) -> ModelRunnerOutput:
-        """控制面直接从 output 取 sampled_token_ids 组 c2e 通告发边
-        (token 直传);逐请求 finish_reasons 取自本步 engine_core_outputs
-        (原生停止条件)。"""
-        req_ids = list(getattr(model_output, "req_ids", None) or [])
-        token_ids = getattr(model_output, "sampled_token_ids", None) or []
-        pairs = [(r, list(t)) for r, t in zip(req_ids, token_ids) if t]
-        if pairs:
+        """rank-replay:解码 worker 主流末尾 pinned 物化的步 meta(就绪由
+        get_output 的 wait_stream(主流) 保证,无事件无同步),组 c2e 通告
+        经 POST_OUT 先于 hidden 发边;finish 码取自 engine_core_outputs。
+
+        pinned 布局:[ranks(各调度段行)..., counts(accepted/请求)...,
+        seg_lens(段长/请求)...];top_id_ths 按段长切,被拒行一并携带,
+        边侧按 num_accepted 取有效前缀。"""
+        carrier = getattr(model_output, "lwd_down_carrier", None)
+        if carrier is not None:
+            pinned, req_ids, hidden_numel, seqno = carrier
+            n_req = len(req_ids)
+            vals = pinned.tolist()
+            counts = vals[-2 * n_req : -n_req]
+            seg_lens = vals[-n_req:]
+            ranks_flat = vals[: -2 * n_req]
+            top_id_ths: list[list[int]] = []
+            off = 0
+            for seg_len in seg_lens:
+                top_id_ths.append(ranks_flat[off : off + seg_len])
+                off += seg_len
             from vllm.v1.outputs import LwdC2eMeta
 
             meta = LwdC2eMeta(
-                hidden_num_elements=0,
-                top_id_ths=[],
-                num_accepted_tokens=[len(t) for _, t in pairs],
-                req_ids=[r for r, _ in pairs],
-                token_ids=[t for _, t in pairs],
+                hidden_num_elements=hidden_numel,
+                top_id_ths=top_id_ths,
+                num_accepted_tokens=list(counts),
+                req_ids=list(req_ids),
+                down_seqno=seqno,
             )
             logger.info(
-                "[Lwd][cloud-ctrl] output tokens -> c2e: reqs=%s tokens=%d",
-                meta.req_ids, sum(len(t) for t in meta.token_ids),
+                "[Lwd][cloud-ctrl] publish c2e(rank-replay): reqs=%s "
+                "rows=%d seqno=%d",
+                meta.req_ids, off, seqno,
             )
             LwdDebug.cloud_step(self.scheduler, meta, engine_core_outputs)  # [lwd-debug]
             self._lwd_publish_c2e(
                 meta, self._lwd_c2e_finish_reasons(meta, engine_core_outputs)
-            )
-        else:
-            logger.debug(
-                "[Lwd][cloud-ctrl] handle_model_output: no sampled tokens this step"
             )
         return model_output
 
