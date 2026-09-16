@@ -32,7 +32,15 @@ from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LwdHelloNotify,
     LwdRangeNotify,
     LwdRequestNotify,
+    lwd_decode_wire_notify,
     lwd_encode_cloud_notify,
+)
+from vllm.v1.lwd_control.control_communication.lwd_role_registry import (
+    get_role_registry,
+    init_role_registry,
+)
+from vllm.v1.lwd_control.control_communication.lwd_router_channel import (
+    LwdControlRouterChannel,
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import LwdConfig
 from vllm.v1.lwd_debug import LwdDebug
@@ -53,6 +61,9 @@ LWD_PRE_OUT_RECV_TIMEOUT_MS = 5000
 # 步元数据队满重试小睡:元数据不可丢(边侧据此预挂精确尺寸 recv)
 _LWD_C2E_SEND_RETRY_SLEEP_S = 0.05
 
+# 云侧复用 consume 阻塞拍:空批时短暂等待,避免忙转
+_LWD_ROUTER_CONSUME_TIMEOUT_S = 1.0
+
 
 class LwdCloudEngineCore(EngineCoreProc):
     """云 PO 引擎:覆写 socket IO 线程入口,其余全走原生。"""
@@ -69,8 +80,41 @@ class LwdCloudEngineCore(EngineCoreProc):
 
     def _lwd_setup_zmq(self) -> None:
         """介入 ZMQ 双面:PRE_OUT bind 收边;POST_OUT connect 边,承载首拍
-        HELLO 通告与步内元数据。建站失败走 EXECUTOR_FAILED 升级。"""
+        HELLO 通告与步内元数据。建站失败走 EXECUTOR_FAILED 升级。
+
+        装配期模式分叉:registry_path 非空 = 云侧复用,建单 ROUTER 通道
+        (bind 单端口,identity=cloud{self_cloud_id}),服务全部边,无
+        mux——单 socket fair-queue + 单 IO 线程天然串行,来源 edge_id 由
+        信封 identity 携带;为空 = 现状 1E1C 单套 subscriber + publisher
+        + HELLO 首拍。"""
         config = LwdConfig.from_env_and_config(self.vllm_config)
+        self._lwd_channel: LwdControlRouterChannel | None = None
+        self._lwd_subscriber: LwdControlSubscriber | None = None
+        self._lwd_post_out: LwdControlPublisher | None = None
+        self._lwd_cloud_id = getattr(
+            self.vllm_config.parallel_config.lwd_config, "cloud_id", 0
+        )
+        if config.is_cloud_reuse:
+            registry = get_role_registry()
+            if registry is None:
+                registry = init_role_registry(config.registry_path)
+            self._lwd_channel = LwdControlRouterChannel(
+                registry.bind_endpoint(config.self_cloud_id),
+                bind=True,
+                identity=f"cloud{config.self_cloud_id}",
+                decoder=lwd_decode_wire_notify,
+                expected_instances=len(registry.edge_ids),
+            )
+            self._lwd_channel.start()
+            self._lwd_init_dispatch_state()
+            logger.info(
+                "[Lwd] cloud engine assembled: cloud-reuse router channel "
+                "bind %s (identity=cloud%d, expects %d edges)",
+                registry.bind_endpoint(config.self_cloud_id),
+                config.self_cloud_id,
+                len(registry.edge_ids),
+            )
+            return
         self._lwd_subscriber = LwdControlSubscriber(
             config.lwd_pre_out_endpoint(), bind=True
         )
@@ -80,16 +124,25 @@ class LwdCloudEngineCore(EngineCoreProc):
             bind=False,
             encoder=lwd_encode_cloud_notify,
         )
-        self._lwd_cloud_id = getattr(
-            self.vllm_config.parallel_config.lwd_config, "cloud_id", 0
-        )
         self._lwd_hello = LwdHelloNotify(
             pre_out_host=config.pre_out_host,
             pre_out_port=config.pre_out_port,
             cloud_id=self._lwd_cloud_id,
         )
+        self._lwd_init_dispatch_state()
         # 首拍即通告(边侧可能已 bind 等待)
         self._lwd_announce()
+        logger.info(
+            "[Lwd] cloud engine assembled: PRE_OUT bind %s, POST_OUT announce -> "
+            "%s:%s via master %s",
+            config.lwd_pre_out_endpoint(),
+            config.pre_out_host,
+            config.pre_out_port,
+            master_addr,
+        )
+
+    def _lwd_init_dispatch_state(self) -> None:
+        """两种模式共用的分派状态(门池/seqno 登记表)。"""
         # 门池:元数据查重与暂存,到达即构建放行;仅本 IO 线程独占
         self._lwd_gate_pending: dict[str, LwdRequestNotify] = {}
         # UP 链 seqno 登记(边→云→云 worker 的最后一跳,§9.12 接缝):
@@ -99,14 +152,6 @@ class LwdCloudEngineCore(EngineCoreProc):
         # registry 引用交付调度器(IO 线程登记 / 主循环读,dict 赋值原子)。
         self._lwd_seqno_registry: dict[str, list[int]] = {}
         self.scheduler.lwd_seqno_registry = self._lwd_seqno_registry
-        logger.info(
-            "[Lwd] cloud engine assembled: PRE_OUT bind %s, POST_OUT announce -> "
-            "%s:%s via master %s",
-            config.lwd_pre_out_endpoint(),
-            config.pre_out_host,
-            config.pre_out_port,
-            master_addr,
-        )
 
     def process_input_sockets(
         self,
@@ -125,12 +170,23 @@ class LwdCloudEngineCore(EngineCoreProc):
 
     def _lwd_pre_out_loop(self) -> None:
         """PRE_OUT 接收循环:socket 与门状态在本线程内先建后用(zmq 单线程
-        亲和);recv 挂超时拍仅作关停响应上限,关停(closed)退出。"""
+        亲和);recv 挂超时拍仅作关停响应上限,关停(closed)退出。
+
+        云侧复用:循环 consume_new_outputs() 单通道,逐条 (edge_id, notify)
+        交分派(单消费者串行,替代 mux 轮询);1E1C 阻塞收单 subscriber。"""
         try:
             self._lwd_setup_zmq()
         except Exception:
             logger.exception("[Lwd] cloud PRE_OUT setup failed")
             self.input_queue.put_nowait((EngineCoreRequestType.EXECUTOR_FAILED, b""))
+            return
+        if self._lwd_channel is not None:
+            channel = self._lwd_channel
+            while not channel.closed:
+                for edge_id, notify in channel.consume_new_outputs(
+                    timeout_s=_LWD_ROUTER_CONSUME_TIMEOUT_S
+                ):
+                    self._lwd_dispatch(edge_id, notify)
             return
         while True:
             msg = self._lwd_subscriber.recv(timeout_ms=LWD_PRE_OUT_RECV_TIMEOUT_MS)
@@ -138,7 +194,7 @@ class LwdCloudEngineCore(EngineCoreProc):
                 if self._lwd_subscriber.closed:
                     break
                 continue
-            self._lwd_dispatch(msg)
+            self._lwd_dispatch(getattr(msg, "edge_id", 0), msg)
 
     def _lwd_announce(self) -> None:
         """首拍 HELLO 通告一次;队满不重试,由边侧等待超时 fail-fast 兜底。"""
@@ -149,7 +205,10 @@ class LwdCloudEngineCore(EngineCoreProc):
         )
 
     def shutdown(self) -> None:
-        """两面关停后走原生(幂等;装配失败路径两面可能未建,容忍缺省)。"""
+        """通信面关停后走原生(幂等;装配失败路径可能未建,容忍缺省)。"""
+        channel = getattr(self, "_lwd_channel", None)
+        if channel is not None:
+            channel.shutdown()
         subscriber = getattr(self, "_lwd_subscriber", None)
         if subscriber is not None:
             subscriber.shutdown()
@@ -158,14 +217,18 @@ class LwdCloudEngineCore(EngineCoreProc):
             publisher.shutdown()
         super().shutdown()
 
-    def _lwd_dispatch(self, msg) -> None:
+    def _lwd_dispatch(self, edge_id: int, msg) -> None:
         """PRE_OUT 三类分派(本 IO 线程):元数据转 Request / abort 终结 /
-        范围预告登记 seqno。"""
+        范围预告登记 seqno。
+
+        edge_id:云侧复用取自信封 identity(来源标注免费携带,不解析
+        载荷);1E1C 取消息自带字段(缺省 0,单边兼容)。入口即做
+        req_id 命名空间包装(wrap_req_id),云内只认包装 id。"""
         if isinstance(msg, LwdRangeNotify):
             # 入口命名空间包装:云内统一用 wrapped_req_id,调度器据此
             # 解析 edge_id 做数据面分桶。
             msg = msgspec.structs.replace(
-                msg, request_id=wrap_req_id(msg.edge_id, msg.request_id)
+                msg, request_id=wrap_req_id(edge_id, msg.request_id)
             )
             # 范围预告:登记 UP 链 seqno(数据面配对键,§9.12)。幂等去重
             # 按"单调性"(seqno 不大于该请求已登记尾号即重复,边侧队满
@@ -175,7 +238,7 @@ class LwdCloudEngineCore(EngineCoreProc):
                 seqnos.append(msg.seqno)
             logger.info(
                 "[Lwd][cloud-ctrl] RangeNotify req=%s edge=%d num=%s seqno=%s",
-                msg.request_id, msg.edge_id, msg.num_tokens, msg.seqno,
+                msg.request_id, edge_id, msg.num_tokens, msg.seqno,
             )
             # 每条预告都整条入队(重复预告即重复点名,剔除-调度-拼回幂等,
             # 无副作用;PRE_OUT 只 append,调度主线程单独 popleft,deque
@@ -184,7 +247,7 @@ class LwdCloudEngineCore(EngineCoreProc):
             return
         if isinstance(msg, LwdAbortNotify):
             msg = msgspec.structs.replace(
-                msg, request_id=wrap_req_id(msg.edge_id, msg.request_id)
+                msg, request_id=wrap_req_id(edge_id, msg.request_id)
             )
             logger.info("[Lwd][cloud-ctrl] AbortNotify req=%s", msg.request_id)
             self._lwd_gate_pending.pop(msg.request_id, None)
@@ -192,12 +255,12 @@ class LwdCloudEngineCore(EngineCoreProc):
             self.aborts_queue.put_nowait([msg.request_id])
             self.input_queue.put_nowait((EngineCoreRequestType.ABORT, [msg.request_id]))
             return
-        rid = wrap_req_id(msg.edge_id, msg.request_id)
+        rid = wrap_req_id(edge_id, msg.request_id)
         msg = msgspec.structs.replace(msg, request_id=rid)
         if rid in self._lwd_gate_pending:
             logger.warning("[Lwd] duplicate request metadata %s ignored", rid)
             return
-        logger.info("[Lwd][cloud-ctrl] RequestNotify req=%s edge=%d", rid, msg.edge_id)
+        logger.info("[Lwd][cloud-ctrl] RequestNotify req=%s edge=%d", rid, edge_id)
         self._lwd_gate_pending[rid] = msg
         self._lwd_promote(rid)
 
@@ -388,7 +451,13 @@ class LwdCloudEngineCore(EngineCoreProc):
     ) -> None:
         """步元数据(含逐请求 finish_reasons 完成码)发边:队满小睡重试
         (元数据不可丢),关停(closed)退出。req_ids 出口剥离命名空间,
-        边侧只看原始 id。"""
+        边侧只看原始 id。
+
+        按边分组已在云 worker 的 down carrier 完成(每 edge 独立
+        down_seqno,一份 C2eNotify 严格配对一次 DOWN 发送),本方法只
+        按分组结果定向发布:云侧复用经单通道 publish(dest=edge_id,
+        per-identity FIFO 独立,某边消费慢只反压自己);1E1C 走单
+        publisher。"""
         notify = LwdC2eNotify(
             hidden_num_elements=meta.hidden_num_elements,
             top_id_ths=meta.top_id_ths,
@@ -398,6 +467,21 @@ class LwdCloudEngineCore(EngineCoreProc):
             down_seqno=meta.down_seqno,
             cloud_id=self._lwd_cloud_id,
         )
+        if self._lwd_channel is not None:
+            while not self._lwd_channel.closed:
+                if self._lwd_channel.publish(notify, edge_id):
+                    logger.info(
+                        "[Lwd][cloud-ctrl] publish C2eNotify edge=%d reqs=%d "
+                        "down_seqno=%s finish=%s hidden_elems=%s",
+                        edge_id,
+                        len(notify.req_ids),
+                        notify.down_seqno,
+                        finish_reasons,
+                        notify.hidden_num_elements,
+                    )
+                    return
+                time.sleep(_LWD_C2E_SEND_RETRY_SLEEP_S)
+            return
         while not self._lwd_post_out.closed:
             if self._lwd_post_out.publish(notify):
                 logger.info(

@@ -860,45 +860,94 @@ class VllmConfig:
         # VllmConfig.lwd_config, then mirror the master switch, role and CLI NPU
         # counts into the aggregated ParallelConfig.lwd_config object.
         additional = self.additional_config if isinstance(self.additional_config, dict) else {}
-        self.lwd_config = LwdConfig.from_dict(additional.get("lwd_config") or {})
+        raw_lwd = additional.get("lwd_config") or {}
+        self.lwd_config = LwdConfig.from_dict(raw_lwd)
         if self.lwd_config.enabled:
             parallel_lwd = self.parallel_config.lwd_config
             parallel_lwd.enable_lwd = True
             parallel_lwd.is_edge_node = self.lwd_config.is_edge
             parallel_lwd.instance_id = self.lwd_config.instance_id
-            parallel_lwd.edge_id = self.lwd_config.edge_id
-            parallel_lwd.cloud_id = self.lwd_config.cloud_id
-            if self.lwd_config.is_edge and parallel_lwd.edge_npu_count <= 0:
-                raise ValueError("--edge-npu-count must be positive on the LWD edge process")
-            # 运行时并行组按 LWD 布局构建(边单例 TP=edge_npu_count,
-            # 云一组 TP=cloud_npu_count);配置 tp 回填为真值,使头数/
-            # KV spec/MoE 切分等配置派生量与运行时组态对齐。
-            self.parallel_config.tensor_parallel_size = (
-                parallel_lwd.edge_npu_count
-                if self.lwd_config.is_edge
-                else parallel_lwd.cloud_npu_count
-            )
-            # 边云模式并行度由拓扑推导,不接受 CLI 指定(对齐参考实现
-            # v0.23.0_lwd_prefill_only 70151bf):world = 边 + 云;PP 恒为
-            # 2(边 rank0 与云 rank0 成两段流水线,其余云 rank 单例);
-            # TP 边取 edge_npu_count、云取 cloud_npu_count(云侧按此切权重)。
-            if (self.parallel_config.tensor_parallel_size != 1
-                    or self.parallel_config.pipeline_parallel_size != 1):
-                logger.warning(
-                    "Lwd edge-cloud mode derives parallel sizes from the "
-                    "topology; ignoring CLI tp=%s pp=%s.",
-                    self.parallel_config.tensor_parallel_size,
-                    self.parallel_config.pipeline_parallel_size,
+            # 身份三件套镜像:additional_config 显式键覆盖 CLI 同名值
+            # (--edge-id/--cloud-id/--role-registry);缺省保留 CLI 值,
+            # 避免 lwd_config 段缺省 0 抹掉 CLI 传入的实例 id。
+            if "edge_id" in raw_lwd:
+                parallel_lwd.edge_id = self.lwd_config.edge_id
+            if "cloud_id" in raw_lwd:
+                parallel_lwd.cloud_id = self.lwd_config.cloud_id
+            if self.lwd_config.role_registry_path:
+                parallel_lwd.role_registry = self.lwd_config.role_registry_path
+
+            if parallel_lwd.role_registry:
+                # 云侧复用(registry):TP/world/PP 按 registry 推导——
+                # 本实例 TP = 自身条目 rank 数;world = 全场 ranks 总和
+                # (ParallelConfig.__post_init__ 已算,此处保持一致);
+                # 各实例 rank 布局存入 parallel_lwd 供 executor/并行组建组
+                # (layout 缺省空 = 1E1C 连续 edge-first 布局,老路径不变)。
+                import yaml as _yaml
+
+                with open(parallel_lwd.role_registry, encoding="utf-8") as _f:
+                    _reg = _yaml.safe_load(_f) or {}
+                parallel_lwd.edge_ranks_layout = {
+                    int(e["id"]): list(e["ranks"]) for e in _reg["edges"]
+                }
+                parallel_lwd.cloud_ranks_layout = {
+                    int(c["id"]): list(c["ranks"]) for c in _reg["clouds"]
+                }
+                _self_id = (
+                    parallel_lwd.edge_id
+                    if self.lwd_config.is_edge
+                    else parallel_lwd.cloud_id
                 )
-            self.parallel_config.world_size = (
-                parallel_lwd.edge_npu_count + parallel_lwd.cloud_npu_count
-            )
-            self.parallel_config.pipeline_parallel_size = 2
-            self.parallel_config.tensor_parallel_size = (
-                parallel_lwd.edge_npu_count
-                if parallel_lwd.is_edge_node
-                else parallel_lwd.cloud_npu_count
-            )
+                _layout = (
+                    parallel_lwd.edge_ranks_layout
+                    if self.lwd_config.is_edge
+                    else parallel_lwd.cloud_ranks_layout
+                )
+                if _self_id not in _layout:
+                    raise ValueError(
+                        f"Lwd role={self.lwd_config.role} id={_self_id} not "
+                        f"found in role registry {parallel_lwd.role_registry}; "
+                        f"known ids={sorted(_layout)}"
+                    )
+                self.parallel_config.tensor_parallel_size = len(_layout[_self_id])
+                self.parallel_config.world_size = sum(
+                    len(r) for r in parallel_lwd.edge_ranks_layout.values()
+                ) + sum(len(r) for r in parallel_lwd.cloud_ranks_layout.values())
+                # 边云模式并行度由拓扑推导;PP 恒为 2(prefill_only 下运行
+                # 期中性化,组构成见 parallel_state LWD 分支)
+                self.parallel_config.pipeline_parallel_size = 2
+            else:
+                if self.lwd_config.is_edge and parallel_lwd.edge_npu_count <= 0:
+                    raise ValueError("--edge-npu-count must be positive on the LWD edge process")
+                # 运行时并行组按 LWD 布局构建(边单例 TP=edge_npu_count,
+                # 云一组 TP=cloud_npu_count);配置 tp 回填为真值,使头数/
+                # KV spec/MoE 切分等配置派生量与运行时组态对齐。
+                self.parallel_config.tensor_parallel_size = (
+                    parallel_lwd.edge_npu_count
+                    if self.lwd_config.is_edge
+                    else parallel_lwd.cloud_npu_count
+                )
+                # 边云模式并行度由拓扑推导,不接受 CLI 指定(对齐参考实现
+                # v0.23.0_lwd_prefill_only 70151bf):world = 边 + 云;PP 恒为
+                # 2(边 rank0 与云 rank0 成两段流水线,其余云 rank 单例);
+                # TP 边取 edge_npu_count、云取 cloud_npu_count(云侧按此切权重)。
+                if (self.parallel_config.tensor_parallel_size != 1
+                        or self.parallel_config.pipeline_parallel_size != 1):
+                    logger.warning(
+                        "Lwd edge-cloud mode derives parallel sizes from the "
+                        "topology; ignoring CLI tp=%s pp=%s.",
+                        self.parallel_config.tensor_parallel_size,
+                        self.parallel_config.pipeline_parallel_size,
+                    )
+                self.parallel_config.world_size = (
+                    parallel_lwd.edge_npu_count + parallel_lwd.cloud_npu_count
+                )
+                self.parallel_config.pipeline_parallel_size = 2
+                self.parallel_config.tensor_parallel_size = (
+                    parallel_lwd.edge_npu_count
+                    if parallel_lwd.is_edge_node
+                    else parallel_lwd.cloud_npu_count
+                )
 
         if self.performance_mode != "balanced":
             logger.info_once("Performance mode set to '%s'.", self.performance_mode)

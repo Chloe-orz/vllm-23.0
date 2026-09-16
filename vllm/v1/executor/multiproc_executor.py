@@ -169,12 +169,22 @@ class MultiprocExecutor(Executor):
         success = False
         try:
             if self.parallel_config.lwd_config.enable_lwd:
-                global_start_rank = (
-                    0
-                    if self.parallel_config.lwd_config.is_edge_node
-                    else self.parallel_config.lwd_config.edge_npu_count
-                )
+                # 多实例(registry):本进程按自身实例条目的全局 rank 列表
+                # 逐 worker 分配(支持任意布局);缺省走 1E1C 连续
+                # edge-first 布局(边 [0,E),云 [E,E+C))
+                instance_ranks = self.parallel_config.lwd_config.instance_ranks()
+                if instance_ranks is not None:
+                    global_ranks = list(instance_ranks)
+                    global_start_rank = global_ranks[0]
+                else:
+                    global_ranks = None
+                    global_start_rank = (
+                        0
+                        if self.parallel_config.lwd_config.is_edge_node
+                        else self.parallel_config.lwd_config.edge_npu_count
+                    )
             else:
+                global_ranks = None
                 global_start_rank = (
                     self.local_world_size * self.parallel_config.node_rank_within_dp
                 )
@@ -188,7 +198,11 @@ class MultiprocExecutor(Executor):
             # For CPU backend only, to setup OpenMP threads affinity
             cpu_omp_manager = OMPProcessManager(self.vllm_config)
             for local_rank in range(self.local_world_size):
-                global_rank = global_start_rank + local_rank
+                global_rank = (
+                    global_ranks[local_rank]
+                    if global_ranks is not None
+                    else global_start_rank + local_rank
+                )
                 is_driver_worker = self._is_driver_worker(global_rank)
                 with cpu_omp_manager.configure_omp_envs(
                     rank=global_rank, local_rank=local_rank
@@ -227,7 +241,13 @@ class MultiprocExecutor(Executor):
                 self.parallel_config.lwd_config.enable_lwd
             ):
                 for rank in range(self.world_size):
-                    local_idx = rank - global_start_rank
+                    if global_ranks is not None:
+                        # 多实例(registry):按自身实例 rank 列表定位本地 worker
+                        local_idx = (
+                            global_ranks.index(rank) if rank in global_ranks else -1
+                        )
+                    else:
+                        local_idx = rank - global_start_rank
                     if 0 <= local_idx < self.local_world_size:
                         local_message_queue = self.workers[
                             local_idx
@@ -292,6 +312,10 @@ class MultiprocExecutor(Executor):
             # ``rank % tp_size`` picks the wrong worker under the
             # edge-first asymmetric layout.
             lwd = self.parallel_config.lwd_config
+            instance_ranks = lwd.instance_ranks()
+            if instance_ranks is not None:
+                # 云侧复用(registry):本实例首个全局 rank 为 driver
+                return rank == instance_ranks[0]
             return rank == (0 if lwd.is_edge_node else lwd.edge_npu_count)
         return rank % self.parallel_config.tensor_parallel_size == 0
 

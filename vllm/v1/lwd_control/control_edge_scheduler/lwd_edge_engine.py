@@ -44,12 +44,19 @@ from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
 from vllm.v1.lwd_control.control_communication.lwd_control_subscriber import (
     LwdControlSubscriber,
 )
+from vllm.v1.lwd_control.control_communication.lwd_role_registry import (
+    get_role_registry,
+)
+from vllm.v1.lwd_control.control_communication.lwd_router_channel import (
+    LwdControlRouterChannel,
+)
 from vllm.v1.lwd_debug import LwdDebug, LwdLogBase
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LWD_NOT_FINISHED,
     LwdC2eNotify,
     LwdHelloNotify,
     lwd_decode_cloud_notify,
+    lwd_decode_wire_notify,
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import (
     LwdConfig,
@@ -83,15 +90,10 @@ class LwdEdgeEngineCore(EngineCoreProc):
         config = LwdConfig.from_env_and_config(vllm_config)
         # 层日志总开关:env 已开则不动,config 段开则补开(仅本进程)
         LwdLogBase.set_debug(config.debug)
-        # 通信面:bind POST_OUT 订阅面 + 延迟连接的 PRE_OUT 发布面;
-        # 云端点由 HELLO 通告决定(边不预知云地址)
-        self._edge_receiver = self._lwd_build_post_out(config)
-        self._edge_sender = LwdControlPublisher(
-            None, bind=False, queue_max=config.publish_queue_max
-        )
         # 云->边唯一载荷队列:生产端接收线程,消费端引擎步;数据面经
         # UNEMBED 批的 lwd_c2e_notifies 拿元数据,不直接读队列
-        # (单消费者语义)
+        # (单消费者语义)。云侧复用元素为 (cloud_id, notify, t),
+        # 1E1C 为 (notify, t)
         self.lwd_c2e_meta_queue = queue.Queue(maxsize=LWD_C2E_META_QUEUE_MAX)
         # 已派发待收割的批队列 (kind, payload, t_dispatch, future):
         # kind="unembed" payload=notify;kind="embed" payload=scheduler_output。
@@ -99,6 +101,32 @@ class LwdEdgeEngineCore(EngineCoreProc):
         # 按底层队列序排水,交错收割会连带等错批。t_dispatch 供
         # [Lwd][sched] harvest wait(派发→收割)度量批在队列里的滞留时长
         self._lwd_batch_queue: deque = deque()
+        # 装配期模式分叉:registry_path 非空 = 云侧复用,单 ROUTER 通道
+        # connect 全部云;为空 = 现状 1E1C 单套 Publisher/Subscriber +
+        # 阻塞等云首拍 HELLO
+        self._edge_channel: LwdControlRouterChannel | None = None
+        self._edge_receiver: LwdControlSubscriber | None = None
+        self._edge_sender: LwdControlPublisher | None = None
+        if config.is_cloud_reuse:
+            self._edge_channel = self._lwd_build_control_channel(config)
+            self.scheduler.lwd_edge_channel = self._edge_channel
+            threading.Thread(
+                target=self._receive_thread_channel,
+                name="lwd-router-in",
+                daemon=True,
+            ).start()
+            logger.info(
+                "[Lwd] edge engine assembled: cloud-reuse router channel "
+                "(identity=edge%d)",
+                config.self_edge_id,
+            )
+            return
+        # 通信面:bind POST_OUT 订阅面 + 延迟连接的 PRE_OUT 发布面;
+        # 云端点由 HELLO 通告决定(边不预知云地址)
+        self._edge_receiver = self._lwd_build_post_out(config)
+        self._edge_sender = LwdControlPublisher(
+            None, bind=False, queue_max=config.publish_queue_max
+        )
         hello_event = threading.Event()
         discovery = threading.Thread(
             target=self._receive_thread,
@@ -125,8 +153,36 @@ class LwdEdgeEngineCore(EngineCoreProc):
     # ------------------------------------------------------------------ #
     # 通信面                                                              #
     # ------------------------------------------------------------------ #
+    def _lwd_build_control_channel(self, config: LwdConfig) -> LwdControlRouterChannel:
+        """云侧复用:建单 ROUTER 通道(identity=edge{self_edge_id}),按
+        registry 端点公式 connect 全部云并逐云 HELLO;云侧就绪前消息
+        滞留 per-identity FIFO,就绪后按序补投,不阻塞装配。
+
+        connect 侧同为 ROUTER(``connect_as_router=True``,上层装配
+        决定):一个 socket 连 N 台云,双向 identity 首帧寻址。"""
+        registry = get_role_registry()
+        if registry is None:
+            from vllm.v1.lwd_control.control_communication.lwd_role_registry import (
+                init_role_registry,
+            )
+
+            registry = init_role_registry(config.registry_path)
+        channel = LwdControlRouterChannel(
+            None,
+            bind=False,
+            identity=f"edge{config.self_edge_id}",
+            decoder=lwd_decode_wire_notify,
+            expected_instances=len(registry.cloud_ids),
+            connect_as_router=True,
+        )
+        for cloud_id in registry.cloud_ids:
+            channel.connect(registry.endpoint(cloud_id))
+            channel.announce(cloud_id)
+        channel.start()
+        return channel
+
     def _lwd_build_post_out(self, config: LwdConfig) -> LwdControlSubscriber:
-        """bind POST_OUT 订阅面;云经 master_addr 主动来连。"""
+        """bind POST_OUT 订阅面;云经 master_addr 主动来连(仅 1E1C)。"""
         return LwdControlSubscriber(
             config.lwd_post_out_bind_endpoint(),
             bind=True,
@@ -179,8 +235,38 @@ class LwdEdgeEngineCore(EngineCoreProc):
             else:
                 logger.warning("[Lwd] drop unexpected POST_OUT frame %r", type(msg))
 
+    def _receive_thread_channel(self) -> None:
+        """云侧复用接收线程:轮询单通道 consume_new_outputs(),收全部云。
+
+        单 IO 线程串行收(fair-queue),来源云 id 由信封 identity 携带;
+        (cloud_id, notify) 投递 c2e 队列(阻塞 put,不可丢)+ WAKEUP
+        唤醒主循环(多生产者单消费者是 queue.Queue 标配用法),
+        _lwd_edge_step 逻辑不变。"""
+        channel = self._edge_channel
+        assert channel is not None
+        while not channel.closed:
+            batch = channel.consume_new_outputs(timeout_s=1.0)
+            for cloud_id, notify in batch:
+                if not isinstance(notify, LwdC2eNotify):
+                    logger.warning(
+                        "[Lwd] drop unexpected router frame %r from cloud%d",
+                        type(notify), cloud_id,
+                    )
+                    continue
+                # 信封携带的来源云为准(覆盖载荷字段,防错配)
+                notify.cloud_id = cloud_id
+                logger.info(
+                    "[Lwd][edge-ctrl] C2eNotify cloud=%d reqs=%d down_seqno=%s",
+                    cloud_id, len(notify.req_ids), notify.down_seqno,
+                )
+                self.lwd_c2e_meta_queue.put((cloud_id, notify, time.monotonic()))
+                self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
+
     def _lwd_shutdown_planes(self) -> None:
-        """两面关停(幂等):receiver 先关断输入,publisher 收尾。"""
+        """通信面关停(幂等):云侧复用单通道;1E1C 两面。"""
+        channel = getattr(self, "_edge_channel", None)
+        if channel is not None:
+            channel.shutdown()
         receiver = getattr(self, "_edge_receiver", None)
         if receiver is not None:
             receiver.shutdown()
@@ -305,20 +391,26 @@ class LwdEdgeEngineCore(EngineCoreProc):
         """消费 c2e 通告:派发 UNEMBED 批入批队列(异步收割)。
         云侧有活请求才产 meta(build_hidden_payload 空则返回 None),
         每条 entry 行数>=1——通告必有行,无需无行分流。
+        云侧复用队列元素为 (cloud_id, notify, t),1E1C 为 (notify, t)。
         返回本步派发条数。"""
         quota = LWD_EDGE_BATCH_QUEUE_DEPTH - len(self._lwd_batch_queue)
-        notifies: list[tuple[LwdC2eNotify, float]] = []
-        while len(notifies) < quota:
+        entries: list[tuple[LwdC2eNotify, float]] = []
+        while len(entries) < quota:
             try:
-                notifies.append(self.lwd_c2e_meta_queue.get_nowait())
+                item = self.lwd_c2e_meta_queue.get_nowait()
             except queue.Empty:
                 break
-        for notify, t_arrive in notifies:
+            if self._edge_channel is not None:
+                _, notify, t_arrive = item
+            else:
+                notify, t_arrive = item
+            entries.append((notify, t_arrive))
+        for notify, t_arrive in entries:
             future = self._lwd_dispatch_unembed(notify, t_arrive)
             self._lwd_batch_queue.append(
                 ("unembed", notify, time.monotonic(), future)
             )
-        return len(notifies)
+        return len(entries)
 
     def _lwd_dispatch_embed(self, scheduler_output):
         """EMBED 批提交侧(唯一提交点,同步/异步共用):范围预告(发布

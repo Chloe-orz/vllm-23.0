@@ -1756,7 +1756,7 @@ def initialize_model_parallel(
     #   EP(仅 MoE): [[0], [1,2,3,4]]
     # 所有分组都必须全 rank 集体创建,因此每个 rank 都带完整分组列表。
     if parallel_config.lwd_config.enable_lwd:
-        global _TP, _PP, _DCP, _PCP, _DP, _EP
+        global _TP, _PP, _DCP, _PCP, _DP, _EP, _LWD_FULL_HEAD_TAIL
         assert not enable_elastic_ep, (
             "elastic EP is not supported in Lwd edge-cloud mode")
         lwd = parallel_config.lwd_config
@@ -1765,6 +1765,100 @@ def initialize_model_parallel(
         backend = backend or torch.distributed.get_backend(
             get_world_group().device_group
         )
+        # 云侧复用(registry):TP 按实例条目建组(每边/每云各自一组),
+        # PP 首对(首边首卡, 首云首卡)保持两段、其余单例;is_edge 按
+        # 边条目 rank 集合判定。缺省走 1E1C 连续 edge-first 布局。
+        edge_layout = lwd.edge_ranks_layout
+        cloud_layout = lwd.cloud_ranks_layout
+        if edge_layout or cloud_layout:
+            expected_world = sum(len(r) for r in edge_layout.values()) + sum(
+                len(r) for r in cloud_layout.values()
+            )
+            assert world_size == expected_world, (
+                f"Lwd world size mismatch: got {world_size}, registry "
+                f"declares {expected_world}")
+            edge_rank_set = {r for ranks in edge_layout.values() for r in ranks}
+
+            # TP:每个实例的 ranks 一组
+            assert _TP is None, "tensor model parallel group is already initialized"
+            tp_groups: list[list[int]] = (
+                [list(edge_layout[e]) for e in sorted(edge_layout)]
+                + [list(cloud_layout[c]) for c in sorted(cloud_layout)]
+            )
+            _TP = init_model_parallel_group(
+                tp_groups,
+                get_world_group().local_rank,
+                backend,
+                use_message_queue_broadcaster=True,
+                group_name="tp",
+            )
+
+            # PP:首边首卡与首云首卡成两段流水线对,其余单例
+            assert _PP is None, "pipeline model parallel group is already initialized"
+            pp_edge_first = edge_layout[min(edge_layout)][0]
+            pp_cloud_first = cloud_layout[min(cloud_layout)][0]
+            pp_groups: list[list[int]] = [[pp_edge_first, pp_cloud_first]] + [
+                [r] for r in range(world_size)
+                if r not in (pp_edge_first, pp_cloud_first)
+            ]
+            _PP = init_model_parallel_group(
+                pp_groups,
+                get_world_group().local_rank,
+                backend,
+                group_name="pp",
+            )
+            # prefill_only 下 PP 切分在运行期中性化(两侧皆 first/last rank);
+            # 建组时直接置位,运行期不依赖 current config 上下文。
+            _LWD_FULL_HEAD_TAIL = True
+
+            # DCP/PCP:全单例
+            singleton_groups = [[r] for r in range(world_size)]
+            assert _DCP is None, "decode context model parallel group is already initialized"
+            _DCP = init_model_parallel_group(
+                singleton_groups,
+                get_world_group().local_rank,
+                backend,
+                use_message_queue_broadcaster=True,
+                group_name="dcp",
+            )
+            assert _PCP is None, "prefill context model parallel group is already initialized"
+            _PCP = init_model_parallel_group(
+                singleton_groups,
+                get_world_group().local_rank,
+                backend,
+                group_name="pcp",
+            )
+
+            # DP:dp=1(边云模式),全单例
+            assert _DP is None, "data parallel group is already initialized"
+            dp_groups = singleton_groups
+            _DP = init_model_parallel_group(
+                dp_groups, get_world_group().local_rank, backend, group_name="dp"
+            )
+
+            # EP(仅 MoE):全部边 rank 一组、全部云 rank 一组
+            if config.model_config is not None and config.model_config.is_moe:
+                assert _EP is None, "expert parallel group is already initialized"
+                _EP = init_model_parallel_group(
+                    [sorted(edge_rank_set),
+                     sorted(r for r in range(world_size) if r not in edge_rank_set)],
+                    get_world_group().local_rank,
+                    backend,
+                    group_name="ep",
+                )
+
+            logger.info(
+                "Lwd edge-cloud mode (registry layout) initialized: rank %s, "
+                "is_edge=%s, edges=%s, clouds=%s, world_size=%s, TP groups=%s",
+                rank,
+                rank in edge_rank_set,
+                edge_layout,
+                cloud_layout,
+                world_size,
+                tp_groups,
+            )
+            return
+
         edge_count = lwd.edge_npu_count
         cloud_count = lwd.cloud_npu_count
         world_per_dp = edge_count + cloud_count
@@ -1805,7 +1899,6 @@ def initialize_model_parallel(
         )
         # prefill_only 下 PP 切分在运行期中性化(两侧皆 first/last rank);
         # 建组时直接置位,运行期不依赖 current config 上下文。
-        global _LWD_FULL_HEAD_TAIL
         _LWD_FULL_HEAD_TAIL = True
 
         # DCP/PCP:全单例(pcp_size = dcp_size = 1)

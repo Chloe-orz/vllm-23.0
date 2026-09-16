@@ -39,6 +39,9 @@ from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LwdRangeNotify,
     LwdRequestNotify,
 )
+from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_binding import (
+    LwdEdgeBindingTable,
+)
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     LwdBaseScheduler,
 )
@@ -50,6 +53,9 @@ if TYPE_CHECKING:
     from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
         LwdControlPublisher,
     )
+    from vllm.v1.lwd_control.control_communication.lwd_router_channel import (
+        LwdControlRouterChannel,
+    )
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -60,23 +66,36 @@ _LWD_ADD_RETRY_INTERVAL_S = 0.2
 
 
 class LwdEdgeScheduler(LwdBaseScheduler):
-    """纯 prefill 调度语义 + 控制面出口(notify/abort/seqno)。"""
+    """纯 prefill 调度语义 + 控制面出口(notify/abort/seqno)。
+
+    云侧复用(``control_channel`` 注入,registry 非空):请求经
+    ``LwdEdgeBindingTable`` 绑定目标云,全部通告按 dest 定向发布;
+    seqno 按 (cloud_id) 对分域计数。1E1C(publisher 注入)行为与原
+    实现一致。
+    """
 
     def __init__(
         self,
         *args,
         publisher: LwdControlPublisher | None = None,
+        control_channel: LwdControlRouterChannel | None = None,
         **kwargs,
     ) -> None:
-        """publisher 经构造注入(与调度器同生命周期)。"""
+        """publisher(1E1C)/control_channel(云侧复用)经构造注入(与调度器
+        同生命周期);两者互斥,云侧复用只认 control_channel。"""
         super().__init__(*args, **kwargs)
         self.lwd_edge_publisher = publisher
-        self._lwd_seqno = 0
-        # 多边多云身份与选路维度:edge_id 取自身;cloud_id 为路由结果
-        # (2.2.2.4 中央调度器未接入前,默认固定云 0,单云行为不变)。
+        self.lwd_edge_channel = control_channel
+        # seqno 按 (cloud_id) 对分域:UP 数据通道按连续号序配对,号只能
+        # 分配给真正上 wire 的块(peek-then-advance,发布成功才进位);
+        # 1E1C 恒用 self._lwd_cloud_id 单键,行为与原单值计数器一致
+        self._lwd_seqno: dict[int, int] = {}
+        # 多边多云身份维度:edge_id 取自身;cloud_id 为默认绑定云。
         lwd_cfg = self.vllm_config.parallel_config.lwd_config
         self._lwd_edge_id = getattr(lwd_cfg, "edge_id", 0)
         self._lwd_cloud_id = getattr(lwd_cfg, "cloud_id", 0)
+        # 请求-云绑定表:入口登记、finish/abort 解绑、通告/abort 按它定向
+        self._lwd_binding = LwdEdgeBindingTable()
         # 前缀缓存:manager 级关命中,配置级保留使能。两级拆分的原因:
         # - 必须关命中:命中会跳过 token 排程,首条 RangeNotify 的
         #   offset != 0,云侧按 offset==0 识别首块的约定失效;且被
@@ -91,6 +110,31 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # awaiting:嵌入完待云结果的 request_id -> 登记时刻(单调钟)。
         # 请求本体已清出调度器,此表是结果路径的唯一生命周期台账。
         self._lwd_awaiting: dict[str, float] = {}
+
+    # ------------------------------------------------------------------ #
+    # 云侧复用选路与控制面出口                                            #
+    # ------------------------------------------------------------------ #
+    def _lwd_default_cloud_id(self) -> int:
+        """默认绑定云(选路接入前固定第一台云;1E1C 即单云 id)。"""
+        if self.lwd_edge_channel is None:
+            return self._lwd_cloud_id
+        from vllm.v1.lwd_control.control_communication.lwd_role_registry import (
+            get_role_registry,
+        )
+
+        registry = get_role_registry()
+        if registry is not None and registry.cloud_ids:
+            return registry.cloud_ids[0]
+        return self._lwd_cloud_id
+
+    def _lwd_publish(self, message, cloud_id: int) -> bool:
+        """控制面出口统一:云侧复用按 dest 定向 publish;1E1C 走单
+        publisher。False = 未入队(队/FIFO 满),调用方退避重试。"""
+        if self.lwd_edge_channel is not None:
+            return self.lwd_edge_channel.publish(message, cloud_id)
+        if self.lwd_edge_publisher is not None:
+            return self.lwd_edge_publisher.publish(message)
+        return False
 
     def schedule(self) -> SchedulerOutput:
         """单请求组批 + 原生分块决策。
@@ -142,7 +186,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         永远拦不住;以 running+awaiting 对账云侧在途数,达到
         max_num_running_reqs 即满员。续传豁免不在本判断(schedule
         闸门经 _lwd_has_prefill_chunk_inflight 放行收尾);请求到达
-        时的 announce 亦不受约束(云只登记不计算)。"""
+        时的 announce 亦不受约束(云只登记不计算)。
+
+        注:云侧复用下一台云收多边的请求,边侧按云聚合水位并不准确,
+        维持本判据(本地在途对账),按云配额留待云侧反馈机制接入。"""
         return len(self.running) + len(self._lwd_awaiting) < self.max_num_running_reqs
 
     def _lwd_has_prefill_chunk_inflight(self) -> bool:
@@ -156,17 +203,21 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         )
 
     def lwd_edge_add_request(self, request: Request) -> None:
-        """请求入口:边界校验 -> 云预告 -> 本地入队。
+        """请求入口:边界校验 -> 登记绑定表 -> 云预告 -> 本地入队。
 
         预告先于本地登记:云侧视图领先本地工作,云只能准备不能提前
         计算(没有 chunk 预告就不会开算)。abort_immediately 请求走
-        finish + abort 出口,与原生语义一致。"""
+        finish + abort 出口,与原生语义一致。
+        """
         self._lwd_validate_request(request)
+        cloud_id = self._lwd_default_cloud_id()
+        self._lwd_binding.bind(request.request_id, cloud_id)
         self.lwd_edge_notify_request(
             request_id=request.request_id,
             num_prompt_tokens=len(request.prompt_token_ids),
             sampling_params=request.sampling_params,
             block_hashes=list(request.block_hashes),
+            cloud_id=cloud_id,
         )
         super().add_request(request)
         if request.abort_immediately:
@@ -179,39 +230,44 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         seqno 无空洞契约:UP 数据通道按连续号序配对(通道层对超前号
         扣留等待,一个空洞即永久挂死整条链),因此号只能分配给真正
         上 wire 的块:
-        - peek-then-advance:发布成功才进位计数器;
+        - peek-then-advance:发布成功才进位该请求所属云的计数器;
         - 单 notify 前提:本方法每步至多发一条,依赖单请求组批
           约束。若放开多请求组批,部分成功的 notify 已上 wire 而
           整步不派发,会同时产生号空洞与张量失配,届时必须改为按
           已成功子集执行。
+        云侧复用 seqno 按 (cloud_id) 对分域:每对通道内无空洞契约
+        独立成立,互不影响。
 
         前提:控制面发布通道不丢消息,publish 恒成功——步末回退
         对账已按此前提移除。若前提被破坏返回 False,调用方本步不
         派发但进度不回退,该 chunk 永久丢失;重复预告在云侧按
         (request_id, offset) 幂等登记。"""
-        publisher = self.lwd_edge_publisher
         scheduled = scheduler_output.num_scheduled_tokens
         for request_id, num_tokens in scheduled.items():
             request = self.requests.get(request_id)
             if request is None:
                 continue
+            cloud_id = self._lwd_binding.cloud_of(
+                request_id, default=self._lwd_default_cloud_id()
+            )
             # _update_after_schedule 已乐观推进 num_computed,起点需回退本步量
             offset = request.num_computed_tokens - num_tokens
-            seqno = self._lwd_seqno
-            if not publisher.publish(
+            seqno = self._lwd_seqno.get(cloud_id, 0)
+            if not self._lwd_publish(
                 LwdRangeNotify(
                     request_id=request_id,
                     offset=offset,
                     num_tokens=num_tokens,
                     seqno=seqno,
                     edge_id=self._lwd_edge_id,
-                )
+                ),
+                cloud_id,
             ):
                 return False
-            self._lwd_seqno = seqno + 1
+            self._lwd_seqno[cloud_id] = seqno + 1
             logger.info(
-                "[Lwd][edge-notify] req=%s offset=%d num=%d seqno=%d",
-                request_id, offset, num_tokens, seqno,
+                "[Lwd][edge-notify] req=%s offset=%d num=%d seqno=%d cloud=%d",
+                request_id, offset, num_tokens, seqno, cloud_id,
             )
             # 发布成功即组 EMBED 批挂 SO:seqno 是数据面发云张量的
             # 配对键(与云侧 RangeNotify 登记同值),embed 载荷为本
@@ -227,7 +283,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                         )
                     ],
                     edge_id=self._lwd_edge_id,
-                    cloud_id=self._lwd_cloud_id,
+                    cloud_id=cloud_id,
                 ),
             )
         return True
@@ -238,6 +294,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         num_prompt_tokens: int,
         sampling_params: SamplingParams | None = None,
         block_hashes: list[bytes] | None = None,
+        cloud_id: int | None = None,
     ) -> None:
         """发 LwdRequestNotify(请求元数据预告)。
 
@@ -249,14 +306,18 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         EOS 策略/min_tokens);stop 字符串等 detokenizer 层参数留在
         边侧前端原生处理,不上 wire。
 
+        cloud_id:云侧复用按它定向 publish(dest=cloud_id);None 回退
+        默认绑定云(1E1C 即单云,行为不变)。
+
         失败语义 fail-fast:发布队满时短退避重试(瞬态背压几乎必在
         秒级窗口内腾出),耗尽即抛 RuntimeError——异常沿 add_request
         调用链回前端 error 通道,用户立即得到失败;不做无限阻塞
         重试(发布点在引擎主线程,云宕机会把整个引擎卡死在 add)。
         此时请求未入队、云侧零残留,无需补发 abort。"""
-        publisher = self.lwd_edge_publisher
-        if publisher is None:
+        if self.lwd_edge_publisher is None and self.lwd_edge_channel is None:
             return
+        if cloud_id is None:
+            cloud_id = self._lwd_default_cloud_id()
         sp = sampling_params
         message = LwdRequestNotify(
             request_id=request_id,
@@ -264,7 +325,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             max_tokens=(
                 sp.max_tokens if sp is not None and sp.max_tokens is not None else 16
             ),
-            cloud_id=self._lwd_cloud_id,
+            cloud_id=cloud_id,
             edge_id=self._lwd_edge_id,
             block_hashes=block_hashes if block_hashes is not None else [],
             temperature=sp.temperature if sp is not None else 1.0,
@@ -283,39 +344,49 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             eos_token_id=sp.eos_token_id if sp is not None else None,
         )
         for attempt in range(_LWD_ADD_RETRY_STEPS):
-            if publisher.publish(message):
+            if self._lwd_publish(message, cloud_id):
                 logger.info(
                     "[Lwd][edge-notify] request meta announced: req=%s "
-                    "prompt=%d",
-                    request_id, num_prompt_tokens,
+                    "prompt=%d cloud=%d",
+                    request_id, num_prompt_tokens, cloud_id,
                 )
                 return
             time.sleep(_LWD_ADD_RETRY_INTERVAL_S * (attempt + 1))
         raise RuntimeError(
             f"[LWD] add-request notify for {request_id} dropped: publish "
             f"queue full after {_LWD_ADD_RETRY_STEPS} retries "
-            f"(cloud PRE_OUT consumption stalled?)"
+            f"(cloud {cloud_id} PRE_OUT consumption stalled?)"
         )
 
     def lwd_edge_abort(self, request_ids: list[str]) -> None:
-        """发 LwdAbortNotify + 摘除 awaiting;调度器内清理走原生路径。
+        """发 LwdAbortNotify + 摘除 awaiting/绑定;调度器内清理走原生路径。
 
         awaiting 请求已不在调度器视野(嵌入完结时清出),原生
-        finish_requests 触不到它,须在此显式摘除,防迟到云结果被误认领。"""
-        publisher = self.lwd_edge_publisher
+        finish_requests 触不到它,须在此显式摘除,防迟到云结果被误认领。
+        云侧复用按绑定表的 cloud_id 定向 publish;未绑定云的请求
+        (发布前 abort)仅本地清台账。"""
         for request_id in request_ids:
             self._lwd_awaiting.pop(request_id, None)
-            if publisher is None:
+            cloud_id = self._lwd_binding.unbind(request_id)
+            if cloud_id is None and self.lwd_edge_channel is not None:
+                logger.info(
+                    "[Lwd][edge-notify] abort req=%s unbound: local cleanup only",
+                    request_id,
+                )
                 continue
-            if not publisher.publish(
-                LwdAbortNotify(request_id=request_id, edge_id=self._lwd_edge_id)
+            if cloud_id is None:
+                cloud_id = self._lwd_default_cloud_id()
+            if not self._lwd_publish(
+                LwdAbortNotify(request_id=request_id, edge_id=self._lwd_edge_id),
+                cloud_id,
             ):
                 logger.warning(
                     "[Lwd] drop abort signal for %s: publish queue full", request_id
                 )
             else:
                 logger.info(
-                    "[Lwd][edge-notify] AbortNotify req=%s", request_id
+                    "[Lwd][edge-notify] AbortNotify req=%s cloud=%d",
+                    request_id, cloud_id,
                 )
 
     def lwd_edge_update_progress(self, executed: dict[str, int]) -> None:
@@ -370,6 +441,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             return False
         if finished:
             del self._lwd_awaiting[request_id]
+            # finish 即解绑:请求与云实例的生命周期绑定结束
+            # (迟到结果不再认领,绑定表出表)
+            self._lwd_binding.unbind(request_id)
         logger.info(
             "[Lwd][edge-deliver] req=%s tokens=%d finished=%s",
             request_id, len(token_ids), finished,

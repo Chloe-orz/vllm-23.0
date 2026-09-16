@@ -487,6 +487,9 @@ class EngineArgs:
     enable_elastic_ep: bool = ParallelConfig.enable_elastic_ep
     edge_npu_count: int = 0
     cloud_npu_count: int = 0
+    role_registry: str = ""
+    edge_id: int = 0
+    cloud_id: int = 0
     enable_dbo: bool = ParallelConfig.enable_dbo
     ubatch_size: int = ParallelConfig.ubatch_size
     dbo_decode_token_threshold: int = ParallelConfig.dbo_decode_token_threshold
@@ -1088,6 +1091,23 @@ class EngineArgs:
         parallel_group.add_argument(
             "--cloud-npu-count", type=int, default=0,
             help="Total number of cloud NPUs across all DP instances (LWD mode).",
+        )
+        parallel_group.add_argument(
+            "--role-registry", type=str, default="",
+            help="Path to the shared role-registry YAML for multi-edge/"
+            "multi-cloud LWD deployments; all edge/cloud instances mount "
+            "the same file (single source of truth for membership, ranks "
+            "and cloud control-plane ports).",
+        )
+        parallel_group.add_argument(
+            "--edge-id", type=int, default=0,
+            help="This process's edge instance id (multi-edge LWD; requires "
+            "--role-registry).",
+        )
+        parallel_group.add_argument(
+            "--cloud-id", type=int, default=0,
+            help="This process's cloud instance id (multi-cloud LWD; "
+            "requires --role-registry).",
         )
         parallel_group.add_argument(
             "--dbo-decode-token-threshold",
@@ -2001,7 +2021,13 @@ class EngineArgs:
             enable_ep_weight_filter=self.enable_ep_weight_filter,
             all2all_backend=self.all2all_backend,
             enable_elastic_ep=self.enable_elastic_ep,
-            lwd_config=LwdParallelConfig(edge_npu_count=self.edge_npu_count, cloud_npu_count=self.cloud_npu_count),
+            lwd_config=LwdParallelConfig(
+                edge_npu_count=self.edge_npu_count,
+                cloud_npu_count=self.cloud_npu_count,
+                role_registry=self.role_registry,
+                edge_id=self.edge_id,
+                cloud_id=self.cloud_id,
+            ),
             enable_dbo=self.enable_dbo,
             ubatch_size=self.ubatch_size,
             dbo_decode_token_threshold=self.dbo_decode_token_threshold,

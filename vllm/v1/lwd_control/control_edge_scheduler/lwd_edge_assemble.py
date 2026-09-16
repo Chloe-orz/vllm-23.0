@@ -41,7 +41,13 @@ _LWD_ENV_PREFIX = "VLLM_ASCEND_LWD_"
 
 @dataclass(frozen=True)
 class LwdConfig:
-    """plain 值配置对象;引擎装配期一次成型。"""
+    """plain 值配置对象;引擎装配期一次成型。
+
+    云侧复用(多边多云)模式分叉只看 ``registry_path`` 是否非空(装配期
+    两处判定:边侧 ``__init__`` 装配段、云侧 ``_lwd_setup_zmq`` 建通道
+    前),运行期代码不感知模式;为空走现状 1E1C 单套 Publisher/Subscriber
+    路径。
+    """
 
     is_edge_node: bool = True
     pre_out_host: str = "127.0.0.1"
@@ -52,21 +58,46 @@ class LwdConfig:
     scheduler_name: str = "prefill_first"
     publish_queue_max: int = LWD_PUBLISH_QUEUE_MAX
     debug: bool = False
+    registry_path: str | None = None
+    """全场共享 role registry YAML 路径;非空即云侧复用(多边多云)模式。"""
+    self_edge_id: int = 0
+    """本边实例 id(云侧复用 identity=edge{self_edge_id})。"""
+    self_cloud_id: int = 0
+    """本云实例 id(云侧复用 identity=cloud{self_cloud_id})。"""
+
+    @property
+    def is_cloud_reuse(self) -> bool:
+        """云侧复用模式判定唯一入口:registry_path 非空。"""
+        return bool(self.registry_path)
 
     def lwd_pre_out_endpoint(self) -> str:
-        """PRE_OUT 端点:云侧 bind 地址,随 HELLO 通告给边。"""
+        """PRE_OUT 端点:云侧 bind 地址,随 HELLO 通告给边(仅 1E1C 路径)。"""
         return f"tcp://{self.pre_out_host}:{self.pre_out_port}"
 
     def lwd_post_out_bind_endpoint(self) -> str:
-        """POST_OUT 端点:边侧 bind,云经 master_addr 来连。"""
+        """POST_OUT 端点:边侧 bind,云经 master_addr 来连(仅 1E1C 路径)。"""
         return f"tcp://{self.post_out_bind}:{self.post_out_port}"
 
     @classmethod
     def from_env_and_config(cls, vllm_config) -> LwdConfig:
         """合并生效配置类(角色)、lwd_config 段(传输层字段)与 env
-        覆盖(地址/端口/超时/调试)。"""
+        覆盖(地址/端口/超时/调试)。
+
+        身份三件套(registry/self id)来源:``ParallelConfig.lwd_config``
+        (CLI ``--role-registry``/``--edge-id``/``--cloud-id`` 经
+        ``LwdParallelConfig`` 汇聚,``VllmConfig.__post_init__`` 把
+        additional_config 显式值镜像进去)。"""
         section = _lwd_read_section(vllm_config)
         effective = getattr(vllm_config, "lwd_config", None)
+        parallel_lwd = getattr(
+            getattr(vllm_config, "parallel_config", None), "lwd_config", None
+        )
+        registry_path = ""
+        if effective is not None and getattr(effective, "role_registry_path", ""):
+            # additional_config 显式值优先于 CLI
+            registry_path = effective.role_registry_path
+        elif parallel_lwd is not None and getattr(parallel_lwd, "role_registry", ""):
+            registry_path = parallel_lwd.role_registry
         config = cls(
             is_edge_node=effective.is_edge
             if effective is not None
@@ -83,6 +114,9 @@ class LwdConfig:
                 section.get("publish_queue_max", LWD_PUBLISH_QUEUE_MAX)
             ),
             debug=bool(section.get("debug", False)),
+            registry_path=registry_path or None,
+            self_edge_id=int(getattr(parallel_lwd, "edge_id", 0) or 0),
+            self_cloud_id=int(getattr(parallel_lwd, "cloud_id", 0) or 0),
         )
         return _lwd_apply_env_overrides(config)
 
@@ -130,6 +164,9 @@ def _lwd_apply_env_overrides(config: LwdConfig) -> LwdConfig:
         scheduler_name=config.scheduler_name,
         publish_queue_max=config.publish_queue_max,
         debug=config.debug or (debug is not None and debug.lower() == "1"),
+        registry_path=config.registry_path,
+        self_edge_id=config.self_edge_id,
+        self_cloud_id=config.self_cloud_id,
     )
 
 

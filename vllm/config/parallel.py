@@ -132,6 +132,29 @@ class LwdParallelConfig:
     """This process's edge instance id (0 in the single-edge case)."""
     cloud_id: int = 0
     """This process's cloud instance id (0 in the single-cloud case)."""
+    role_registry: str = ""
+    """Path to the shared role-registry YAML (multi-edge/multi-cloud LWD).
+
+    Set via ``--role-registry``. When set, every edge/cloud instance mounts
+    the same file; the registry is the single source of truth for instance
+    membership, global ranks, the cloud ROUTER bind ports and the whole
+    world size (recomputed from the declared ranks). Empty keeps the legacy
+    single-edge single-cloud behaviour.
+    """
+    edge_ranks_layout: dict[int, list[int]] = Field(default_factory=dict)
+    """Registry mode: edge instance id -> its global ranks (filled in
+    ``VllmConfig.__post_init__``; empty in the legacy single-pair layout)."""
+    cloud_ranks_layout: dict[int, list[int]] = Field(default_factory=dict)
+    """Registry mode: cloud instance id -> its global ranks (filled in
+    ``VllmConfig.__post_init__``; empty in the legacy single-pair layout)."""
+
+    def instance_ranks(self) -> list[int] | None:
+        """Registry mode: this process's own instance global ranks; legacy
+        single-pair layout returns None (contiguous edge-first derivation)."""
+        if not self.edge_ranks_layout and not self.cloud_ranks_layout:
+            return None
+        layout = self.edge_ranks_layout if self.is_edge_node else self.cloud_ranks_layout
+        return layout.get(self.edge_id if self.is_edge_node else self.cloud_id)
 
     def edge_npu_count_per_dp(self, data_parallel_size: int) -> int:
         """Per-DP-instance edge NPU count."""
@@ -718,6 +741,10 @@ class ParallelConfig:
             # LWD edge-cloud: each side spawns its own NPU count; the
             # world_size // nnodes_within_dp division does not apply to the
             # asymmetric edge/cloud topology.
+            instance_ranks = self.lwd_config.instance_ranks()
+            if instance_ranks is not None:
+                # 云侧复用(registry):本进程 spawn 自身实例条目的 rank 数
+                return len(instance_ranks)
             return (
                 self.lwd_config.edge_npu_count
                 if self.lwd_config.is_edge_node
@@ -842,7 +869,20 @@ class ParallelConfig:
         # NOTE: ``lwd_config.enable_lwd`` is only back-filled later in
         # ``VllmConfig.__post_init__``, so gate on the CLI-provided NPU
         # counts here instead.
-        if (
+        if self.lwd_config.role_registry:
+            # Cloud-reuse (multi-edge/multi-cloud): with a role registry,
+            # the world covers ALL edges and clouds declared in the YAML —
+            # e.g. 2 edges (1 rank each) + 1 cloud (4 ranks) => world 6,
+            # whereas the NPU-count formula would yield 5 and silently drop
+            # the second edge from the world.
+            import yaml as _yaml
+
+            with open(self.lwd_config.role_registry, encoding="utf-8") as _f:
+                _reg = _yaml.safe_load(_f) or {}
+            self.world_size = sum(len(e["ranks"]) for e in _reg["edges"]) + sum(
+                len(c["ranks"]) for c in _reg["clouds"]
+            )
+        elif (
             self.lwd_config.edge_npu_count > 0
             and self.lwd_config.cloud_npu_count > 0
         ):

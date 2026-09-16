@@ -106,11 +106,20 @@ LwdNotify = Union[LwdRangeNotify, LwdRequestNotify, LwdAbortNotify]  # noqa: UP0
 # 云->边方向(POST_OUT):HELLO 发现 + 步元数据(唯一载荷,兼结果回传
 # 驱动);重同步消息在此 union 上 additive 扩展
 LwdCloudNotify = Union[LwdHelloNotify, LwdC2eNotify]  # noqa: UP007
+# 双向全集(ROUTER-ROUTER 单通道收两个方向的载荷,按 tag 区分):
+# 边->云三类通告 + 云->边步元数据;HELLO/WELCOME 为通道层帧不进解码器
+LwdWireNotify = Union[  # noqa: UP007
+    LwdRangeNotify,
+    LwdRequestNotify,
+    LwdAbortNotify,
+    LwdC2eNotify,
+]
 # 数据面批型定义归 vllm/v1/core/sched/output.py(LwdBatch/LwdBatchType/
 # LwdEmbedBatch/LwdUnembedBatch,f8182fd5 定稿),协议层不重复声明
 
 _NOTIFY_DECODER = msgspec.msgpack.Decoder(LwdNotify)
 _CLOUD_NOTIFY_DECODER = msgspec.msgpack.Decoder(LwdCloudNotify)
+_WIRE_NOTIFY_DECODER = msgspec.msgpack.Decoder(LwdWireNotify)
 
 
 def lwd_encode_notify(message: LwdNotify) -> bytes:
@@ -131,3 +140,9 @@ def lwd_encode_cloud_notify(message: LwdCloudNotify) -> bytes:
 def lwd_decode_cloud_notify(data: bytes) -> LwdCloudNotify:
     """云->边通知解码(POST_OUT 订阅端唯一入口);坏包抛异常由接收方丢弃。"""
     return _CLOUD_NOTIFY_DECODER.decode(data)
+
+
+def lwd_decode_wire_notify(data: bytes) -> LwdWireNotify:
+    """双向全集解码(ROUTER-ROUTER 通道 IO 线程唯一入口);坏包抛异常
+    由通道捕获丢弃,不中断 IO 线程。"""
+    return _WIRE_NOTIFY_DECODER.decode(data)
