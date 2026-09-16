@@ -231,13 +231,18 @@ class LwdCloudEngineCore(EngineCoreProc):
         local_hasher = self.request_block_hasher
         if local_hasher is None:
             # prefix caching 未启用:请求不挂 hasher,整链机制不激活
-            return Request(
+            request = Request(
                 request_id=wire.request_id,
                 prompt_token_ids=prompt_ids,
                 prompt_embeds=prompt_embeds,
                 sampling_params=sampling_params,
                 pooling_params=None,
             )
+            # 占位 embeds 不随 SO 上传运输层(NewRequestData 只带形状,
+            # worker 本地分配):35MB 零 buffer 走 MQ overflow 通道实测
+            # 单程 240ms+,是 prefill SO 开工延迟的主因。
+            request.lwd_embeds_placeholder = True
+            return request
         hash_block_size = resolve_kv_cache_block_sizes(
             self.scheduler.kv_cache_config, self.vllm_config
         )[1]
@@ -250,7 +255,7 @@ class LwdCloudEngineCore(EngineCoreProc):
                     return wire.block_hashes
             return local_hasher(request)
 
-        return Request(
+        request = Request(
             request_id=wire.request_id,
             prompt_token_ids=prompt_ids,
             prompt_embeds=prompt_embeds,
@@ -258,6 +263,8 @@ class LwdCloudEngineCore(EngineCoreProc):
             pooling_params=None,
             block_hasher=block_hasher,
         )
+        request.lwd_embeds_placeholder = True  # 同上:占位 embeds 不上 MQ
+        return request
     
     def step_with_batch_queue(self):
         """步骤执行时长打点(开始执行→执行结束;不含引擎空等)。"""
