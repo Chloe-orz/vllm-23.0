@@ -865,6 +865,9 @@ class VllmConfig:
             parallel_lwd = self.parallel_config.lwd_config
             parallel_lwd.enable_lwd = True
             parallel_lwd.is_edge_node = self.lwd_config.is_edge
+            parallel_lwd.instance_id = self.lwd_config.instance_id
+            parallel_lwd.edge_id = self.lwd_config.edge_id
+            parallel_lwd.cloud_id = self.lwd_config.cloud_id
             if self.lwd_config.is_edge and parallel_lwd.edge_npu_count <= 0:
                 raise ValueError("--edge-npu-count must be positive on the LWD edge process")
             # 运行时并行组按 LWD 布局构建(边单例 TP=edge_npu_count,

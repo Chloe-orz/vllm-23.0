@@ -39,6 +39,10 @@ class LwdEmbedBatch:
 
     req_ids: list[str] = field(default_factory=list)
     token_ids: list[list[int]] = field(default_factory=list)
+    # 数据面通道选路维度:边侧按 cloud_id 选 UP 通道,云侧按 edge_id 选 UP 通道。
+    # 单边一云缺省 0,行为与原实现一致。
+    edge_id: int = 0
+    cloud_id: int = 0
 
 
 @dataclass
@@ -50,6 +54,8 @@ class LwdUnembedBatch:
     recv_num_elements: int = 0  # total DOWN hidden elements for the whole batch = rows_total * hidden_size
     out_token_idxs: list[list[int]] = field(default_factory=list)  # per request: generation ordinal of each token (order-preserving emit)
     top_id_ths: list[list[int]] = field(default_factory=list)  # per request: received Nth most probable token index (position in descending logits)
+    # 边侧 DOWN recv 选路维度(该批来自哪朵云);单云缺省 0。
+    cloud_id: int = 0
 
 
 @dataclass

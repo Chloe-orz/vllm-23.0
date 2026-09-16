@@ -7,6 +7,7 @@ import threading
 import time
 from typing import TYPE_CHECKING
 
+import msgspec
 import torch
 
 from vllm.logger import init_logger
@@ -19,6 +20,10 @@ from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
 )
 from vllm.v1.lwd_control.control_communication.lwd_control_subscriber import (
     LwdControlSubscriber,
+)
+from vllm.v1.lwd_control.control_communication.lwd_id_adapter import (
+    unwrap_req_id,
+    wrap_req_id,
 )
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LWD_NOT_FINISHED,
@@ -75,8 +80,13 @@ class LwdCloudEngineCore(EngineCoreProc):
             bind=False,
             encoder=lwd_encode_cloud_notify,
         )
+        self._lwd_cloud_id = getattr(
+            self.vllm_config.parallel_config.lwd_config, "cloud_id", 0
+        )
         self._lwd_hello = LwdHelloNotify(
-            pre_out_host=config.pre_out_host, pre_out_port=config.pre_out_port
+            pre_out_host=config.pre_out_host,
+            pre_out_port=config.pre_out_port,
+            cloud_id=self._lwd_cloud_id,
         )
         # 首拍即通告(边侧可能已 bind 等待)
         self._lwd_announce()
@@ -152,6 +162,11 @@ class LwdCloudEngineCore(EngineCoreProc):
         """PRE_OUT 三类分派(本 IO 线程):元数据转 Request / abort 终结 /
         范围预告登记 seqno。"""
         if isinstance(msg, LwdRangeNotify):
+            # 入口命名空间包装:云内统一用 wrapped_req_id,调度器据此
+            # 解析 edge_id 做数据面分桶。
+            msg = msgspec.structs.replace(
+                msg, request_id=wrap_req_id(msg.edge_id, msg.request_id)
+            )
             # 范围预告:登记 UP 链 seqno(数据面配对键,§9.12)。幂等去重
             # 按"单调性"(seqno 不大于该请求已登记尾号即重复,边侧队满
             # 重试天然产生重复预告,重试复用同一号不产生新登记)。
@@ -159,8 +174,8 @@ class LwdCloudEngineCore(EngineCoreProc):
             if not seqnos or msg.seqno > seqnos[-1]:
                 seqnos.append(msg.seqno)
             logger.info(
-                "[Lwd][cloud-ctrl] RangeNotify req=%s num=%s seqno=%s",
-                msg.request_id, msg.num_tokens, msg.seqno,
+                "[Lwd][cloud-ctrl] RangeNotify req=%s edge=%d num=%s seqno=%s",
+                msg.request_id, msg.edge_id, msg.num_tokens, msg.seqno,
             )
             # 每条预告都整条入队(重复预告即重复点名,剔除-调度-拼回幂等,
             # 无副作用;PRE_OUT 只 append,调度主线程单独 popleft,deque
@@ -168,17 +183,21 @@ class LwdCloudEngineCore(EngineCoreProc):
             self.scheduler.prefill_notify_queue.append(msg)
             return
         if isinstance(msg, LwdAbortNotify):
+            msg = msgspec.structs.replace(
+                msg, request_id=wrap_req_id(msg.edge_id, msg.request_id)
+            )
             logger.info("[Lwd][cloud-ctrl] AbortNotify req=%s", msg.request_id)
             self._lwd_gate_pending.pop(msg.request_id, None)
             # 双队列与原生 ABORT 同款:eager 处理 + 保持 input_queue 次序
             self.aborts_queue.put_nowait([msg.request_id])
             self.input_queue.put_nowait((EngineCoreRequestType.ABORT, [msg.request_id]))
             return
-        rid = msg.request_id
+        rid = wrap_req_id(msg.edge_id, msg.request_id)
+        msg = msgspec.structs.replace(msg, request_id=rid)
         if rid in self._lwd_gate_pending:
             logger.warning("[Lwd] duplicate request metadata %s ignored", rid)
             return
-        logger.info("[Lwd][cloud-ctrl] RequestNotify req=%s", rid)
+        logger.info("[Lwd][cloud-ctrl] RequestNotify req=%s edge=%d", rid, msg.edge_id)
         self._lwd_gate_pending[rid] = msg
         self._lwd_promote(rid)
 
@@ -301,42 +320,45 @@ class LwdCloudEngineCore(EngineCoreProc):
         # [Lwd][perf] cloud-step dt 已由 exec 时长替代(见 step_with_batch_queue
         # 覆写):开始执行→执行结束,不含无请求的空等。
         carrier = getattr(model_output, "lwd_down_carrier", None)
-        if carrier is not None:
-            pinned, req_ids, hidden_numel, seqno = carrier
-            n_req = len(req_ids)
-            vals = pinned.tolist()
-            counts = vals[-2 * n_req : -n_req]
-            seg_lens = vals[-n_req:]
-            ranks_flat = vals[: -2 * n_req]
-            top_id_ths: list[list[int]] = []
-            off = 0
-            for seg_len in seg_lens:
-                top_id_ths.append(ranks_flat[off : off + seg_len])
-                off += seg_len
-            from vllm.v1.outputs import LwdC2eMeta
+        if carrier:
+            for edge_id, pinned, req_ids, hidden_numel, seqno in carrier:
+                n_req = len(req_ids)
+                vals = pinned.tolist()
+                counts = vals[-2 * n_req : -n_req]
+                seg_lens = vals[-n_req:]
+                ranks_flat = vals[: -2 * n_req]
+                top_id_ths: list[list[int]] = []
+                off = 0
+                for seg_len in seg_lens:
+                    top_id_ths.append(ranks_flat[off : off + seg_len])
+                    off += seg_len
+                from vllm.v1.outputs import LwdC2eMeta
 
-            meta = LwdC2eMeta(
-                hidden_num_elements=hidden_numel,
-                top_id_ths=top_id_ths,
-                num_accepted_tokens=list(counts),
-                req_ids=list(req_ids),
-                down_seqno=seqno,
-            )
-            logger.info(
-                "[Lwd][cloud-ctrl] publish c2e(rank-replay): reqs=%s "
-                "rows=%d seqno=%d",
-                meta.req_ids, off, seqno,
-            )
-            LwdDebug.cloud_step(self.scheduler, meta, engine_core_outputs)  # [lwd-debug]
-            _t = time.monotonic()
-            self._lwd_publish_c2e(
-                meta, self._lwd_c2e_finish_reasons(meta, engine_core_outputs)
-            )
-            # [Lwd][perf] 云侧 LWD 税:finish 码推导 + ZMQ publish
-            logger.info(
-                "[Lwd][perf] publish reqs=%d dur=%.2fms",
-                len(meta.req_ids), (time.monotonic() - _t) * 1000,
-            )
+                meta = LwdC2eMeta(
+                    hidden_num_elements=hidden_numel,
+                    top_id_ths=top_id_ths,
+                    num_accepted_tokens=list(counts),
+                    req_ids=list(req_ids),
+                    down_seqno=seqno,
+                )
+                logger.info(
+                    "[Lwd][cloud-ctrl] publish c2e(rank-replay): edge=%d "
+                    "reqs=%s rows=%d seqno=%d",
+                    edge_id, meta.req_ids, off, seqno,
+                )
+                LwdDebug.cloud_step(self.scheduler, meta, engine_core_outputs)  # [lwd-debug]
+                _t = time.monotonic()
+                self._lwd_publish_c2e(
+                    edge_id,
+                    meta,
+                    self._lwd_c2e_finish_reasons(meta, engine_core_outputs),
+                )
+                # [Lwd][perf] 云侧 LWD 税:finish 码推导 + ZMQ publish
+                logger.info(
+                    "[Lwd][perf] publish edge=%d reqs=%d dur=%.2fms",
+                    edge_id, len(meta.req_ids),
+                    (time.monotonic() - _t) * 1000,
+                )
         else:
             logger.info(
                 "[Lwd][cloud-ctrl] handle_model_output: no down carrier this step"
@@ -361,22 +383,27 @@ class LwdCloudEngineCore(EngineCoreProc):
         return [reasons.get(request_id, LWD_NOT_FINISHED)
                 for request_id in meta.req_ids]
 
-    def _lwd_publish_c2e(self, meta: LwdC2eMeta, finish_reasons: list[int]) -> None:
+    def _lwd_publish_c2e(
+        self, edge_id: int, meta: LwdC2eMeta, finish_reasons: list[int]
+    ) -> None:
         """步元数据(含逐请求 finish_reasons 完成码)发边:队满小睡重试
-        (元数据不可丢),关停(closed)退出。"""
+        (元数据不可丢),关停(closed)退出。req_ids 出口剥离命名空间,
+        边侧只看原始 id。"""
         notify = LwdC2eNotify(
             hidden_num_elements=meta.hidden_num_elements,
             top_id_ths=meta.top_id_ths,
             num_accepted_tokens=meta.num_accepted_tokens,
-            req_ids=meta.req_ids,
+            req_ids=[unwrap_req_id(r) for r in meta.req_ids],
             finish_reasons=finish_reasons,
             down_seqno=meta.down_seqno,
+            cloud_id=self._lwd_cloud_id,
         )
         while not self._lwd_post_out.closed:
             if self._lwd_post_out.publish(notify):
                 logger.info(
-                    "[Lwd][cloud-ctrl] publish C2eNotify reqs=%d down_seqno=%s "
-                    "finish=%s hidden_elems=%s",
+                    "[Lwd][cloud-ctrl] publish C2eNotify edge=%d reqs=%d "
+                    "down_seqno=%s finish=%s hidden_elems=%s",
+                    edge_id,
                     len(notify.req_ids),
                     notify.down_seqno,
                     finish_reasons,

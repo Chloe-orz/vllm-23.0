@@ -126,6 +126,12 @@ class LwdParallelConfig:
     """Total number of edge NPUs across all DP instances (LWD mode)."""
     cloud_npu_count: int = Field(default=0, ge=0)
     """Total number of cloud NPUs across all DP instances (LWD mode)."""
+    instance_id: int = 0
+    """Multi-instance identity (mirror of ``LwdConfig.instance_id``)."""
+    edge_id: int = 0
+    """This process's edge instance id (0 in the single-edge case)."""
+    cloud_id: int = 0
+    """This process's cloud instance id (0 in the single-cloud case)."""
 
     def edge_npu_count_per_dp(self, data_parallel_size: int) -> int:
         """Per-DP-instance edge NPU count."""

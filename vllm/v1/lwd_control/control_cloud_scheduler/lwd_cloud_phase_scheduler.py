@@ -13,6 +13,7 @@ from vllm.v1.core.sched.output import (
     LwdEmbedBatch,
     SchedulerOutput,
 )
+from vllm.v1.lwd_control.control_communication.lwd_id_adapter import parse_edge_id
 from vllm.v1.lwd_control.control_communication.lwd_notify import LwdRangeNotify
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     LwdBaseScheduler,
@@ -122,12 +123,14 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
         # 批),token_ids 为占位列表——长度必须等于边侧实际发送的 chunk
         # token 数(= RangeNotify.num_tokens),recv numel 才能与边侧
         # isend 严格相等(HCCL P2P 要求两端 numel 匹配)。
+        edge_id, _ = parse_edge_id(notify.request_id)
         out.lwd_batch = LwdBatch(
             batch_type=LwdBatchType.LWD_EMBED,
             seqno=notify.seqno,
             batch_meta=LwdEmbedBatch(
                 req_ids=[notify.request_id],
                 token_ids=[[0] * notify.num_tokens],
+                edge_id=edge_id,
             ),
         )
         return out

@@ -72,6 +72,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         super().__init__(*args, **kwargs)
         self.lwd_edge_publisher = publisher
         self._lwd_seqno = 0
+        # 多边多云身份与选路维度:edge_id 取自身;cloud_id 为路由结果
+        # (2.2.2.4 中央调度器未接入前,默认固定云 0,单云行为不变)。
+        lwd_cfg = self.vllm_config.parallel_config.lwd_config
+        self._lwd_edge_id = getattr(lwd_cfg, "edge_id", 0)
+        self._lwd_cloud_id = getattr(lwd_cfg, "cloud_id", 0)
         # 前缀缓存:manager 级关命中,配置级保留使能。两级拆分的原因:
         # - 必须关命中:命中会跳过 token 排程,首条 RangeNotify 的
         #   offset != 0,云侧按 offset==0 识别首块的约定失效;且被
@@ -199,6 +204,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                     offset=offset,
                     num_tokens=num_tokens,
                     seqno=seqno,
+                    edge_id=self._lwd_edge_id,
                 )
             ):
                 return False
@@ -220,6 +226,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                             request.prompt_token_ids[offset : offset + num_tokens]
                         )
                     ],
+                    edge_id=self._lwd_edge_id,
+                    cloud_id=self._lwd_cloud_id,
                 ),
             )
         return True
@@ -256,6 +264,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             max_tokens=(
                 sp.max_tokens if sp is not None and sp.max_tokens is not None else 16
             ),
+            cloud_id=self._lwd_cloud_id,
+            edge_id=self._lwd_edge_id,
             block_hashes=block_hashes if block_hashes is not None else [],
             temperature=sp.temperature if sp is not None else 1.0,
             top_p=sp.top_p if sp is not None else 1.0,
@@ -297,7 +307,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             self._lwd_awaiting.pop(request_id, None)
             if publisher is None:
                 continue
-            if not publisher.publish(LwdAbortNotify(request_id=request_id)):
+            if not publisher.publish(
+                LwdAbortNotify(request_id=request_id, edge_id=self._lwd_edge_id)
+            ):
                 logger.warning(
                     "[Lwd] drop abort signal for %s: publish queue full", request_id
                 )
@@ -441,6 +453,7 @@ def lwd_build_unembed_batch(notify: LwdC2eNotify) -> SchedulerOutput:
             recv_num_elements=notify.hidden_num_elements,
             out_token_idxs=[],
             top_id_ths=list(notify.top_id_ths),
+            cloud_id=notify.cloud_id,
         ),
     )
     scheduler_output.lwd_c2e_notify = [notify]

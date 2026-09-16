@@ -49,6 +49,16 @@ class LwdConfig:
     """Layer distribution mode: "head_tail", "embedding_only" or "prefill_only"."""
     edge_head_tail_layers: tuple[int, int] = (1, 1)
     """Fixed 2-element (head_k, tail_k) asymmetric splits allowed."""
+    instance_id: int = 0
+    """Multi-instance identity of this process (edge/cloud instance id)."""
+    dispatcher_addr: str = ""
+    """Optional central-dispatcher address (multi-edge/multi-cloud routing)."""
+    role_registry_path: str = ""
+    """Optional role-registry YAML path (edge/cloud rank + ZMQ port map)."""
+    edge_id: int = 0
+    """This process's edge instance id (single-edge case = 0)."""
+    cloud_id: int = 0
+    """This process's cloud instance id (single-cloud case = 0)."""
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None) -> "LwdConfig":
@@ -57,6 +67,11 @@ class LwdConfig:
             role=str(raw.get("role", "edge")),
             mode=str(raw.get("mode", "head_tail")),
             edge_head_tail_layers=_parse_lwd_layer_split(raw.get("edge_head_tail_layers", [1, 1])),
+            instance_id=int(raw.get("instance_id", 0)),
+            dispatcher_addr=str(raw.get("dispatcher_addr", "")),
+            role_registry_path=str(raw.get("role_registry_path", "")),
+            edge_id=int(raw.get("edge_id", 0)),
+            cloud_id=int(raw.get("cloud_id", 0)),
         )
         cfg.validate()
         return cfg

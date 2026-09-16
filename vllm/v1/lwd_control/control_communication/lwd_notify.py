@@ -20,6 +20,8 @@ class LwdRangeNotify(msgspec.Struct, gc=False, tag=True):
     offset: int
     num_tokens: int
     seqno: int
+    edge_id: int = 0
+    """来源边 id(云侧据此做 req_id 命名空间包装);缺省 0 单边兼容。"""
 
 
 class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):
@@ -33,6 +35,11 @@ class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):
     request_id: str
     num_prompt_tokens: int
     max_tokens: int = 16
+    cloud_id: Optional[int] = None
+    """路由结果回填:边据此选数据面通道与 PRE_OUT 目标;None = 回退原
+    1:1 行为(单云)。"""
+    edge_id: int = 0
+    """来源边 id(云侧据此做 req_id 命名空间包装);缺省 0 单边兼容。"""
     block_hashes: list[bytes] = []
     temperature: float = 1.0
     top_p: float = 1.0
@@ -55,6 +62,8 @@ class LwdAbortNotify(msgspec.Struct, gc=False, tag=True):
     """边->云 abort 预告(PRE_OUT);云侧清理请求登记。"""
 
     request_id: str
+    edge_id: int = 0
+    """来源边 id(云侧据此定位被包装的 req_id);缺省 0 单边兼容。"""
 
 
 class LwdHelloNotify(msgspec.Struct, gc=False, tag=True):
@@ -63,6 +72,8 @@ class LwdHelloNotify(msgspec.Struct, gc=False, tag=True):
 
     pre_out_host: str
     pre_out_port: int
+    cloud_id: int = 0
+    """多云发现:边据此建 cloud_id -> 端点本地路由表;缺省 0 单云兼容。"""
 
 
 # 完成码哨兵:finish_reasons 中的"本步未终结"值
@@ -86,6 +97,8 @@ class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):
     """本步 DOWN 隐藏张量的通道序号,自 LwdC2eMeta.down_seqno 原样透传:
     云 worker 发送时分配(通道级单调),边侧按此值预挂配对 irecv;
     缺省 -1 = 旧版云侧未携带(msgspec 带默认字段,线上 additive 兼容)。"""
+    cloud_id: int = 0
+    """来源云 id:边据此选 DOWN 通道接收;缺省 0 单云兼容。"""
 
 
 # typing.Union 而非 PEP 604 `|`:msgspec 解码器的全版本支持路径
