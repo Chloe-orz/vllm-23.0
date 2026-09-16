@@ -3477,8 +3477,12 @@ class GPUModelRunner(
         # input_ids 现算 embedding 并整体覆盖 inputs_embeds,远程/外部
         # embeds 全部丢失;而 prompt-embeds 分支对 embeds 位置用缓冲、对
         # token 位置本地补 embedding,混批也是正确超集。
-        has_prompt_embeds = self.enable_prompt_embeds and bool(
-            self.input_batch.req_prompt_embeds
+        # 判据看 is_token_ids 掩码(注入侧置 False 即"该位置是 embeds"),
+        # 不看 req_prompt_embeds 存档是否存在——LWD 已移除 CPU 存档,
+        # 依 map 判定会误判掉进 MM 覆盖分支(注入数据被整体覆盖=乱码)。
+        has_prompt_embeds = self.enable_prompt_embeds and (
+            bool(self.input_batch.req_prompt_embeds)
+            or not bool(self.is_token_ids.np[:num_scheduled_tokens].all())
         )
         if (
             self.supports_mm_inputs
