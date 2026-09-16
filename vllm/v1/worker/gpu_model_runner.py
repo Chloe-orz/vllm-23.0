@@ -2680,9 +2680,9 @@ class GPUModelRunner(
 
             num_computed_tokens = self.input_batch.num_computed_tokens_cpu[index]
             num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
-            num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
-                req.prompt_token_ids, req.prompt_embeds
-            )
+            # __post_init__ 已归一三种长度来源(ids/embeds/控制面显式),
+            # 下游一律读解析结果,不再现场推导(LWD 双 None 会 raise)。
+            num_prompt_tokens = req.num_prompt_tokens
 
             if num_computed_tokens + num_scheduled_tokens > num_prompt_tokens:
                 prompt_part_len = max(0, num_prompt_tokens - num_computed_tokens)
@@ -2729,9 +2729,9 @@ class GPUModelRunner(
 
             num_computed_tokens = self.input_batch.num_computed_tokens_cpu[index]
             num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
-            num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
-                req.prompt_token_ids, req.prompt_embeds
-            )
+            # __post_init__ 已归一三种长度来源(ids/embeds/控制面显式),
+            # 下游一律读解析结果,不再现场推导(LWD 双 None 会 raise)。
+            num_prompt_tokens = req.num_prompt_tokens
 
             if num_computed_tokens + num_scheduled_tokens > num_prompt_tokens:
                 prompt_part_len = max(0, num_prompt_tokens - num_computed_tokens)
