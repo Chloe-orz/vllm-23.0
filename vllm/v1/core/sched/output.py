@@ -72,11 +72,10 @@ class NewRequestData:
     num_computed_tokens: int
     lora_request: LoRARequest | None
     prompt_embeds: "torch.Tensor | None" = None
-    # LWD 占位 embeds 的运输替代:Request 侧 35MB 级零 buffer 不上 MQ
-    # (overflow 慢通道实测单程 240ms+),只带形状/dtype,worker 侧按
-    # 此本地分配。非 LWD 请求两字段恒为 None,行为不变。
-    prompt_embeds_shape: tuple[int, ...] | None = None
-    prompt_embeds_dtype: "torch.dtype | None" = None
+    # LWD 边云:无 ids 也无 embeds 张量时的显式长度载体(替代此前随
+    # SO 运输 35MB 零占位 buffer;长度经此直达 worker,各 rank 不再
+    # 创建任何占位 buffer)。普通请求恒为 None,长度仍按原逻辑推导。
+    num_prompt_tokens: int | None = None
     prompt_is_token_ids: list[bool] | None = None
 
     # Only used for v2 model runner.
@@ -89,7 +88,6 @@ class NewRequestData:
         block_ids: tuple[list[int], ...],
         prefill_token_ids: list[int] | None = None,
     ) -> "NewRequestData":
-        lwd_placeholder = getattr(request, "lwd_embeds_placeholder", False)
         return cls(
             req_id=request.request_id,
             prompt_token_ids=request.prompt_token_ids,
@@ -99,17 +97,11 @@ class NewRequestData:
             block_ids=block_ids,
             num_computed_tokens=request.num_computed_tokens,
             lora_request=request.lora_request,
-            prompt_embeds=(
-                None if lwd_placeholder else request.prompt_embeds
-            ),
-            prompt_embeds_shape=(
-                tuple(request.prompt_embeds.shape)
-                if lwd_placeholder and request.prompt_embeds is not None
-                else None
-            ),
-            prompt_embeds_dtype=(
-                request.prompt_embeds.dtype
-                if lwd_placeholder and request.prompt_embeds is not None
+            prompt_embeds=request.prompt_embeds,
+            num_prompt_tokens=(
+                request.num_prompt_tokens
+                if request.prompt_token_ids is None
+                and request.prompt_embeds is None
                 else None
             ),
             prompt_is_token_ids=request.prompt_is_token_ids,

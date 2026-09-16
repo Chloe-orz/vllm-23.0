@@ -1230,21 +1230,11 @@ class GPUModelRunner(
                 to_update = model.pooler.get_pooling_updates(task)
                 to_update.apply(pooling_params)
 
-            # LWD 占位 embeds:SO 只带形状(零 buffer 不上 MQ),此处
-            # 按形状本地分配,与引擎侧 torch.zeros 语义一致。
-            new_prompt_embeds = new_req_data.prompt_embeds
-            if (
-                new_prompt_embeds is None
-                and new_req_data.prompt_embeds_shape is not None
-            ):
-                new_prompt_embeds = torch.zeros(
-                    new_req_data.prompt_embeds_shape,
-                    dtype=new_req_data.prompt_embeds_dtype,
-                )
             req_state = CachedRequestState(
                 req_id=req_id,
                 prompt_token_ids=new_req_data.prompt_token_ids,
-                prompt_embeds=new_prompt_embeds,
+                prompt_embeds=new_req_data.prompt_embeds,
+                num_prompt_tokens=new_req_data.num_prompt_tokens,
                 prompt_is_token_ids=new_req_data.prompt_is_token_ids,
                 mm_features=new_req_data.mm_features,
                 sampling_params=sampling_params,
@@ -1588,25 +1578,19 @@ class GPUModelRunner(
 
         req_state.prompt_token_ids = new_req_data.prompt_token_ids
         req_state.mm_features = new_req_data.mm_features
-        if (
-            new_req_data.prompt_embeds is None
-            and new_req_data.prompt_embeds_shape is not None
-        ):
-            # LWD 占位 embeds:SO 只带形状,本地按形状分配(同新建路径)
-            req_state.prompt_embeds = torch.zeros(
-                new_req_data.prompt_embeds_shape,
-                dtype=new_req_data.prompt_embeds_dtype,
+        req_state.prompt_embeds = new_req_data.prompt_embeds
+        req_state.num_prompt_tokens = (
+            new_req_data.num_prompt_tokens
+            if new_req_data.num_prompt_tokens is not None
+            else length_from_prompt_token_ids_or_embeds(
+                req_state.prompt_token_ids, req_state.prompt_embeds
             )
-        else:
-            req_state.prompt_embeds = new_req_data.prompt_embeds
+        )
         req_state.sampling_params = new_req_data.sampling_params
         req_state.pooling_params = new_req_data.pooling_params
         self.late_interaction_runner.register_request(req_id, req_state.pooling_params)
         req_state.block_ids = new_req_data.block_ids
         req_state.num_computed_tokens = new_req_data.num_computed_tokens
-        req_state.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
-            req_state.prompt_token_ids, req_state.prompt_embeds
-        )
 
         # Clear `output_token_ids` as previous output tokens are now part of
         # `prompt_token_ids`.

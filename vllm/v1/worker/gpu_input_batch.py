@@ -49,6 +49,9 @@ class CachedRequestState:
 
     lora_request: LoRARequest | None = None
     prompt_embeds: torch.Tensor | None = None
+    # LWD 边云:无 ids 也无 embeds 张量时由控制面显式给出的长度
+    # (None 时按原逻辑从 ids/embeds 推导)。
+    num_prompt_tokens: int | None = None
     # To accumulate prompt logprobs tensor chunks across prefill steps.
     in_progress_prompt_logprobs_cpu: LogprobsTensors | None = None
 
@@ -64,9 +67,10 @@ class CachedRequestState:
     pooling_states: PoolingStates | None = None
 
     def __post_init__(self):
-        self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
-            self.prompt_token_ids, self.prompt_embeds
-        )
+        if self.num_prompt_tokens is None:
+            self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
+                self.prompt_token_ids, self.prompt_embeds
+            )
 
         if self.pooling_params is not None:
             self.pooling_states = PoolingStates()
@@ -351,8 +355,15 @@ class InputBatch:
         self.req_id_to_index[req_id] = req_index
 
         # Copy the prompt token ids and output token ids.
-        num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
-            request.prompt_token_ids, request.prompt_embeds
+        # LWD 边云:无 ids 也无 embeds 时,__post_init__ 已按控制面显式
+        # 长度解析好 num_prompt_tokens,直接用解析结果。
+        num_prompt_tokens = (
+            request.num_prompt_tokens
+            if request.prompt_token_ids is None
+            and request.prompt_embeds is None
+            else length_from_prompt_token_ids_or_embeds(
+                request.prompt_token_ids, request.prompt_embeds
+            )
         )
         self.num_prompt_tokens[req_index] = num_prompt_tokens
         start_idx = num_prompt_tokens

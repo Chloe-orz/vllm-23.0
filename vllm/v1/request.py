@@ -77,6 +77,7 @@ class Request:
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         abort_immediately: bool = False,
+        num_prompt_tokens: int | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -127,8 +128,14 @@ class Request:
         # Cache per-block prompt-embed hashes to avoid rehashing the same
         # tensor slices when generating extra keys.
         self._prompt_embeds_per_block_hashes: dict[tuple[int, int], bytes] = {}
-        self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
-            prompt_token_ids, prompt_embeds
+        # LWD 边云:无 ids 也无 embeds 张量时,长度由控制面显式给出
+        # (替代此前的零占位 embeds buffer)。
+        self.num_prompt_tokens = (
+            num_prompt_tokens
+            if num_prompt_tokens is not None
+            else length_from_prompt_token_ids_or_embeds(
+                prompt_token_ids, prompt_embeds
+            )
         )
         self._output_token_ids: list[int] = []
         self._all_token_ids: list[int] = (

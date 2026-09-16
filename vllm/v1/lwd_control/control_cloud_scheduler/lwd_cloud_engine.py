@@ -214,35 +214,27 @@ class LwdCloudEngineCore(EngineCoreProc):
         # 供 min_tokens 判定;云侧无客户端 generation_config,传空。
         sampling_params.update_from_generation_config({}, wire.eos_token_id)
         LwdDebug.cloud_request_admitted(wire, sampling_params)  # [lwd-debug]
-        # 不传真实 ids 也不造占位:按原生 prompt-embeds 语义挂零缓冲,
-        # 行数即 prompt 长度(UP chunk 注入直接写该缓冲的对应窗口);
-        # ids=None 时 input_batch 自动把 prompt 段 is_token_ids 置 False,
-        # M-RoPE 走纯文本直通构造(与扫描结果逐值一致)。
+        # 不传真实 ids 也不造占位 embeds buffer:prompt 长度由控制面
+        # 显式给出(num_prompt_tokens 直达 worker,替代原 35MB 零 buffer
+        # 的形状载体作用);ids=None 时 input_batch 自动把 prompt 段
+        # is_token_ids 置 False,M-RoPE 走纯文本直通构造(与扫描结果
+        # 逐值一致)。draft 首轮直接读 NPU staging,无需 CPU 组装缓冲。
         prompt_ids: list[int] | None = None
-        prompt_embeds = torch.zeros(
-            wire.num_prompt_tokens,
-            self.vllm_config.model_config.get_hidden_size(),
-            dtype=self.vllm_config.model_config.dtype,
-        )
         logger.info(
-            "[Lwd][cloud-ctrl] build request req=%s prompt=%d ids=none+embeds_buf",
+            "[Lwd][cloud-ctrl] build request req=%s prompt=%d "
+            "ids=none+explicit_len",
             wire.request_id, wire.num_prompt_tokens,
         )
         local_hasher = self.request_block_hasher
         if local_hasher is None:
             # prefix caching 未启用:请求不挂 hasher,整链机制不激活
-            request = Request(
+            return Request(
                 request_id=wire.request_id,
                 prompt_token_ids=prompt_ids,
-                prompt_embeds=prompt_embeds,
                 sampling_params=sampling_params,
                 pooling_params=None,
+                num_prompt_tokens=wire.num_prompt_tokens,
             )
-            # 占位 embeds 不随 SO 上传运输层(NewRequestData 只带形状,
-            # worker 本地分配):35MB 零 buffer 走 MQ overflow 通道实测
-            # 单程 240ms+,是 prefill SO 开工延迟的主因。
-            request.lwd_embeds_placeholder = True
-            return request
         hash_block_size = resolve_kv_cache_block_sizes(
             self.scheduler.kv_cache_config, self.vllm_config
         )[1]
@@ -255,16 +247,14 @@ class LwdCloudEngineCore(EngineCoreProc):
                     return wire.block_hashes
             return local_hasher(request)
 
-        request = Request(
+        return Request(
             request_id=wire.request_id,
             prompt_token_ids=prompt_ids,
-            prompt_embeds=prompt_embeds,
             sampling_params=sampling_params,
             pooling_params=None,
             block_hasher=block_hasher,
+            num_prompt_tokens=wire.num_prompt_tokens,
         )
-        request.lwd_embeds_placeholder = True  # 同上:占位 embeds 不上 MQ
-        return request
     
     def step_with_batch_queue(self):
         """步骤执行时长打点(开始执行→执行结束;不含引擎空等)。"""
