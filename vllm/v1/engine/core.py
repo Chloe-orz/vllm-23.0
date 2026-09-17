@@ -576,7 +576,6 @@ class EngineCore:
         # Lwd model-output seam: after native update_from_output so the
         # handler sees engine_core_outputs (per-request finish_reason) and
         # can derive per-request finish flags for the edge.
-        logger.info("start send --- ")
         model_output = self.lwd_process_model_output(model_output, engine_core_outputs)
 
         # NOTE(nick): We can either handle the deferred tasks here or save
