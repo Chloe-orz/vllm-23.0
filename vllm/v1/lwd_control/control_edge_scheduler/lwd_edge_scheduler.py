@@ -87,25 +87,18 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # 请求本体已清出调度器,此表是结果路径的唯一生命周期台账。
         self._lwd_awaiting: dict[str, float] = {}
 
-    def schedule(self) -> SchedulerOutput:
-        """单请求组批 + 原生分块决策。
-
-        EMBED 批的 LwdBatch(seqno/token 片段)由 lwd_edge_notify 在
-        发布成功后挂批——seqno 必须与发布成功绑定。
-
-        开新准入:云侧在途满员(lwd_edge_max_num_seqs_check 为 False)
-        时本步空排、新开请求留 waiting 等云侧排水;running 尚有未发完
-        embed 的续传不受闸门约束(先收尾再开新,亦防上限=1 时自锁;
-        放行续传的前提是 picker 必然挑中该续传请求而非开新)。"""
-        if (
-            not self.lwd_edge_max_num_seqs_check()
-            and not any(
-                self._lwd_the_phase_of_req(req) is LwdReqPhase.PREFILL
-                for req in self.running
-            )
+    def _lwd_select_phase(self) -> LwdReqPhase | None:
+        """云侧在途满员(lwd_edge_max_num_seqs_check 为 False)且 running
+        无未发完的 prefill 时本步无活(None → 空排),新开请求留 waiting
+        等云侧排水;running 尚有未发完 embed 的续传不受闸门约束(先收尾
+        再开新,亦防上限=1 时自锁;放行续传的前提是 picker 必然挑中该
+        续传请求而非开新)。"""
+        if self.lwd_edge_max_num_seqs_check() or any(
+            self._lwd_the_phase_of_req(req) is LwdReqPhase.PREFILL
+            for req in self.running
         ):
-            return SchedulerOutput.make_empty()
-        return self._lwd_schedule_single()
+            return LwdReqPhase.PREFILL
+        return None
 
     def _lwd_pick_prefill_req_id(self) -> str | None:
         """选下一步 embed 工作单元:running 中第一个未发完的 prefill
@@ -120,7 +113,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             return running_prefill.request_id
         return self.waiting.peek_request().request_id if self.waiting else None
 
-    def _lwd_schedule_single(self) -> SchedulerOutput:
+    def schedule_prefill(self) -> SchedulerOutput:
         """单请求组批:picker 选一个工作单元,经基类可见集机制单独调度。
 
         选择规则见 _lwd_pick_prefill_req_id;队列剔除/隔离/拼回复用基类
@@ -132,6 +125,13 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         if req_id is not None:
             logger.info("[Lwd][edge-sched] pick req=%s", req_id)
         return self._lwd_schedule_for_visible_reqs([req_id] if req_id else [])
+
+    def schedule_decode(self) -> SchedulerOutput:
+        """纯 decode 步(unembed,输出位置阶段):随边侧原生化改造落地,
+        当前 _lwd_select_phase 不会返回 DECODE,本钩子不可达。"""
+        raise NotImplementedError(
+            "[LWD] edge decode scheduling lands with the native-step refactor"
+        )
 
     def lwd_edge_max_num_seqs_check(self) -> bool:
         """max_num_seqs 适配检查:云侧在途水位(running + awaiting)是否

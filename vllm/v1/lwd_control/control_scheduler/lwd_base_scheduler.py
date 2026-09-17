@@ -41,6 +41,42 @@ class LwdBaseScheduler(AsyncScheduler):
             return LwdReqPhase.DECODE
         return LwdReqPhase.PREFILL
 
+    def schedule(self) -> SchedulerOutput:
+        """模板:选相位 → 纯相位批 → 步后簿记;None = 本步无活(空排)。
+
+        步相位只取 LwdReqPhase 的 PREFILL/DECODE 两态(FINISHED 属请求
+        相位,不会成为步相位);选择策略与步后簿记由边云子类各自实现,
+        prefill/decode 是调度层的位置阶段词汇,worker 的执行风味
+        (embed/unembed)由两侧实现各自挂批,不在本层出现。"""
+        phase = self._lwd_select_phase()
+        if phase is None:
+            return SchedulerOutput.make_empty()
+        out = (
+            self.schedule_prefill()
+            if phase is LwdReqPhase.PREFILL
+            else self.schedule_decode()
+        )
+        self._lwd_after_phase(phase, out)
+        return out
+
+    # ------------------------------------------------------------------ #
+    # 边云钩子                                                            #
+    # ------------------------------------------------------------------ #
+    def _lwd_select_phase(self) -> LwdReqPhase | None:
+        """选择策略:返回本步步相位;None = 本步无活。"""
+        raise NotImplementedError
+
+    def schedule_prefill(self) -> SchedulerOutput:
+        """纯 prefill 步(prompt 位置阶段)。"""
+        raise NotImplementedError
+
+    def schedule_decode(self) -> SchedulerOutput:
+        """纯 decode 步(输出位置阶段)。"""
+        raise NotImplementedError
+
+    def _lwd_after_phase(self, phase: LwdReqPhase, out: SchedulerOutput) -> None:
+        """步后簿记钩子;缺省空实现。"""
+
     def _lwd_new_queue(self, reqs: list[Request]) -> RequestQueue:
         """新建调度策略队列并装入 reqs。"""
         queue = create_request_queue(self.policy)

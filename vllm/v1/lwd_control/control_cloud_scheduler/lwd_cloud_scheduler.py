@@ -60,7 +60,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
             )
         return True
 
-    def _schedule_pure_decode(self) -> SchedulerOutput:
+    def schedule_decode(self) -> SchedulerOutput:
         """纯 decode 步:收集三队列全部 decode 态请求(含被抢占回
         waiting 的),可见集单独调度。"""
         req_ids = [
@@ -73,7 +73,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
             logger.info("[Lwd][cloud-sched] decode reqs=%s", req_ids)
         return self._lwd_schedule_for_visible_reqs(req_ids)
 
-    def _schedule_pure_prefill(self) -> SchedulerOutput:
+    def schedule_prefill(self) -> SchedulerOutput:
         """纯 prefill 步:prefill_notify_queue 有预告则取队首 msg,单独
         调度其请求(按原队列归位,waiting/skipped 来源走原生准入);没有则
         空集进窗口,等价空步,三队列原样保留。"""
@@ -112,13 +112,14 @@ class LwdCloudScheduler(LwdBaseScheduler):
         )
         return out
 
-    def schedule(self) -> SchedulerOutput:
-        return self._schedule_impl()
+    def _lwd_select_phase(self) -> LwdReqPhase:
+        """相位选择:prefill_first 有 prefill 活即 prefill;decode_first
+        只要存在 decode 活就优先 decode。One-shot 强制标志与禁连续
+        prefill 不变量在此消费。
 
-    def _schedule_impl(self) -> SchedulerOutput:
-        # 相位工作量直判:prefill 活 = waiting/running 存在 PREFILL 相位
-        # 请求(被抢占回 waiting 的 DECODE 请求不算 prefill 活,由纯
-        # decode 步的三队列收集服务);decode 活 = running 存在 DECODE。
+        相位工作量直判:prefill 活 = waiting/running 存在 PREFILL 相位
+        请求(被抢占回 waiting 的 DECODE 请求不算 prefill 活,由纯
+        decode 步的三队列收集服务);decode 活 = running 存在 DECODE。"""
         has_prefill_work = any(
             self._lwd_the_phase_of_req(req) is LwdReqPhase.PREFILL
             for queue in (self.waiting, self.running)
@@ -141,18 +142,25 @@ class LwdCloudScheduler(LwdBaseScheduler):
         # 连续,空 decode 步经 _force_prefill_once 翻回。
         if prefer_prefill and self._last_step_was_prefill and self.running:
             prefer_prefill = False
-        self._last_step_was_prefill = False
+        return LwdReqPhase.PREFILL if prefer_prefill else LwdReqPhase.DECODE
 
-        if prefer_prefill:
-            out = self._schedule_pure_prefill()
+    def _lwd_after_phase(self, phase: LwdReqPhase, out: SchedulerOutput) -> None:
+        """空步翻转与禁连续 prefill 簿记。
+
+        decode 步不会改变 PREFILL 相位的成员(可见集只含 decode 态,
+        被抢占者回 waiting 后相位不变),翻转条件就地重扫与选择时直判等价。"""
+        if phase is LwdReqPhase.PREFILL:
             if not out.total_num_scheduled_tokens and self.running:
                 # prefill 受 KV 压力阻塞:放行空步,下一步转 decode 泄压
                 self._force_decode_once = True
             else:
                 self._last_step_was_prefill = True
-            return out
-        out = self._schedule_pure_decode()
-        if not out.total_num_scheduled_tokens and has_prefill_work:
+            return
+        self._last_step_was_prefill = False
+        if not out.total_num_scheduled_tokens and any(
+            self._lwd_the_phase_of_req(req) is LwdReqPhase.PREFILL
+            for queue in (self.waiting, self.running)
+            for req in queue
+        ):
             # decode 无活但有 prefill 活:翻回 prefill(不变量的空步出口)
             self._force_prefill_once = True
-        return out
