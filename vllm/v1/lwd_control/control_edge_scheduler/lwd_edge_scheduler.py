@@ -1,15 +1,9 @@
-"""边侧调度器:prompt 位置阶段发云 + 输出位置阶段收云(纯相位,与云侧镜像)。
+"""边侧调度器:prefill 相位发云(embedding),decode 相位收云(unembed)。
 
-边侧请求的完整生命周期留在原生记账内:prefill(embedding)完结后请求
-保持 decode 相位留在 running,等待云侧 c2e 通告;decode 步弹一条通告
-点名,arm 欠账后经可见集调度,worker 收 DOWN hidden 做 unembed,真实
-token 经原生 update_from_output 入账销欠、判停、finish 全走原生路径。
-迟到通告行由原生 update_from_output 跳过(requests.get 为 None 即
-continue),无需手工幂等台账。
-
-单请求组批约束:prefill 批最多含一个请求。目的:数据面 chunk 流按
-请求连续(全局 seqno 链上单请求的 chunk 相邻),消除跨请求交错带来
-的张量配对/重组复杂度。
+请求全生命周期留在原生记账内:嵌入完结后保持 decode 相位留在 running
+等云侧通告;unembed 行数以占位欠条表达,真实 token 经原生
+update_from_output 入账、判停、终结。prefill 批恒单请求(数据面 chunk
+流按请求连续)。
 """
 
 from __future__ import annotations
@@ -53,7 +47,7 @@ logger = init_logger(__name__)
 _LWD_ADD_RETRY_STEPS = 5
 _LWD_ADD_RETRY_INTERVAL_S = 0.2
 
-# 云侧完成码 -> 边侧内部终态(前端拿到的 reason 走输出通道,不用此映射)
+# 云侧完成码 -> 边侧内部终态(前端拿到的 reason 走输出通道)
 _LWD_FINISH_STATUS = {
     FinishReason.LENGTH: RequestStatus.FINISHED_LENGTH_CAPPED,
     FinishReason.ABORT: RequestStatus.FINISHED_ABORTED,
@@ -74,30 +68,17 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         super().__init__(*args, **kwargs)
         self.lwd_edge_publisher = publisher
         self._lwd_seqno = 0
-        # 前缀缓存:manager 级关命中,配置级保留使能。两级拆分的原因:
-        # - 必须关命中:命中会跳过 token 排程,首条 RangeNotify 的
-        #   offset != 0,云侧按 offset==0 识别首块的约定失效;且被
-        #   "命中"的块在 EMBED 批下从未写入 KV(边侧不落 KV),
-        #   缓存登记残留会持续占用块池。关闭后命中恒空、free 直接
-        #   归还块池。
-        # - 不能在配置级关:request_block_hasher 只在配置级使能时
-        #   创建,关掉则 Request.block_hashes 恒空,LwdRequestNotify
-        #   带不出哈希链——云侧 prompt 是占位零值 token,前缀缓存
-        #   只能靠边侧按真实内容算出的哈希链命中。
+        # 命中必须关(命中会跳过 token 排程,首条 RangeNotify 的
+        # offset != 0,云侧首块识别失效);配置级保留使能以产出哈希链
+        # (云侧占位 prompt 的前缀缓存只能靠边侧哈希链命中)
         self.kv_cache_manager.enable_caching = False
-        # decode 通告队列:云侧步元数据(C2eNotify)逐条入队,decode 步
-        # 弹队首点名其请求(跨线程单操作原子:接收线程 append/主步
-        # popleft);一步一条,行集与通告严格对齐
+        # unembed 通告队列:接收线程 append / 主步 popleft,一步一条
         self.unembed_notify_queue: deque[LwdC2eNotify] = deque()
 
     def _lwd_select_phase(self) -> LwdReqPhase | None:
-        """embed 优先直判(与旧引擎步序同语义):有 prefill 活走 prefill,
-        否则看 unembed 通告,皆无返回 None(空排)。
-
-        不做云侧的禁连续 prefill/强制翻转,原因见云侧对照:云侧 decode
-        活本地自产、两相位随时有活,不变量防 prefill 独占;边侧 decode
-        活要等本请求全部 chunk 发完云侧才产,不变量会把 chunk 发送本身
-        拦死(单请求多 chunk 死锁)。"""
+        """embed 优先:有 prefill 活走 prefill,否则看 unembed 通告,
+        皆无返回 None。不做禁连续 prefill——边侧 decode 活要等全部
+        chunk 发完云侧才产,不变量会拦死 chunk 发送(单请求死锁)。"""
         has_prefill_work = any(
             self._lwd_the_phase_of_req(req) is LwdReqPhase.PREFILL
             for req in self.running
@@ -109,9 +90,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         return None
 
     def _lwd_pick_prefill_req_id(self) -> str | None:
-        """选下一步 embed 工作单元:running 中第一个未发完的 prefill
-        优先(断点续传,先收尾再开新),否则 waiting 队首(FCFS 到达序);
-        两处皆无返回 None。"""
+        """选 prefill 工作单元:running 续传优先,否则 waiting 队首。"""
         running_prefill = next(
             (r for r in self.running
              if self._lwd_the_phase_of_req(r) is LwdReqPhase.PREFILL),
@@ -122,15 +101,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         return self.waiting.peek_request().request_id if self.waiting else None
 
     def schedule_prefill(self) -> SchedulerOutput:
-        """单请求组批:picker 选一个工作单元,经基类可见集机制单独调度,
-        发布 RangeNotify 成功后挂 EMBED 批(与云侧 schedule_prefill 尾部
-        挂批对称——发布点随调度,seqno 与发布成功绑定)。
-
-        选择规则见 _lwd_pick_prefill_req_id;队列剔除/隔离/拼回复用基类
-        _lwd_schedule_for_visible_reqs(waiting/skipped 来源走原生准入
-        窗口,running 来源走续跑)。发布失败返回空步:进度已按排程乐观
-        推进,该 chunk 随 SO 废弃即永久丢失,由发布通道不丢消息保证
-        不发生(弃批语义与 dispatch 期失败一致)。"""
+        """单请求组批:picker 选一个,可见集调度;发布 RangeNotify 成功
+        才挂 EMBED 批(seqno 与发布成功绑定)。发布失败返回空步弃批:
+        进度已乐观推进,chunk 丢失由发布通道不丢消息保证不发生。"""
         req_id = self._lwd_pick_prefill_req_id()
         if req_id is not None:
             logger.info("[Lwd][edge-sched] pick req=%s", req_id)
@@ -143,7 +116,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             request = self.requests.get(request_id)
             if request is None:
                 continue
-            # _update_after_schedule 已乐观推进 num_computed,起点回退本步量
+            # num_computed 已被乐观推进,起点回退本步量
             offset = request.num_computed_tokens - num_tokens
             seqno = self._lwd_seqno
             if publisher is None or not publisher.publish(
@@ -160,8 +133,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 "[Lwd][edge-notify] req=%s offset=%d num=%d seqno=%d",
                 request_id, offset, num_tokens, seqno,
             )
-            # 发布成功即组 EMBED 批挂 SO:seqno 是数据面发云张量的配对键
-            # (与云侧 RangeNotify 登记同值),embed 载荷为本 chunk 片段
+            # seqno 是数据面发云张量的配对键,载荷为本 chunk 片段
             out.lwd_batch = LwdBatch(
                 batch_type=LwdBatchType.LWD_EMBED,
                 seqno=seqno,
@@ -177,14 +149,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         return out
 
     def schedule_decode(self) -> SchedulerOutput:
-        """纯 decode 步(输出位置阶段):弹一条 unembed 通告点名请求,
-        校准欠账后经可见集调度,行数对齐挂 UNEMBED 批。
-
-        欠账(占位数)是"这请求有 n 行活要算"的账面表达,由通告收据
-        设定(边侧不自产 token);原生 RUNNING 循环按欠账排 n 行,worker
-        收 DOWN hidden 做 unembed,真实 token 由原生 update_from_output
-        入账销欠。全部迟到则丢弃通告;全部未准入则还原欠账、通告回塞
-        重试;部分排程 = DOWN 行无法对齐,fail-loud。"""
+        """弹一条 unembed 通告:登账行数(欠条)→ 可见集调度 → 行数断言
+        → 挂 UNEMBED 批。全部未准入则退还欠条、通告回塞;部分排程
+        (DOWN 行无法对齐)当场报错。"""
         notify = self._lwd_pop_unembed_notify()
         if notify is None:
             return SchedulerOutput.make_empty()
@@ -206,9 +173,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         return q.popleft() if (q := self.unembed_notify_queue) else None
 
     def _lwd_alive_decode_reqs(self, notify: LwdC2eNotify) -> list[str]:
-        """通告里仍可调度的请求:存在、未终结、处于 decode 相位。
-        其余(已 abort/已原生终结的)行交给收割期原生跳过,不影响
-        worker 的 DOWN 行切分(批仍带全量通告行集)。"""
+        """通告里仍可调度的请求(存在、未终结、decode 相位);其余行
+        由收割期原生跳过,批仍带全量通告行集保 worker 行切分对齐。"""
         return [
             rid for rid in notify.req_ids
             if (req := self.requests.get(rid)) is not None
@@ -218,8 +184,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
     def _lwd_reserve_rows(
         self, notify: LwdC2eNotify, targets: list[str]
     ) -> dict[str, int]:
-        """把每个目标请求的欠条(占位数)校准到通告行数,返回
-        {request_id: 占位增量} 供未准入时全额退还。"""
+        """把目标请求的欠条(占位数)校准到通告行数,返回增量供退还。"""
         rows_by_req = dict(zip(notify.req_ids, notify.num_accepted_tokens))
         row_deltas: dict[str, int] = {}
         for rid in targets:
@@ -235,7 +200,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         return row_deltas
 
     def _lwd_release_rows(self, row_deltas: dict[str, int]) -> None:
-        """退还欠条(未准入回退路径,防下次弹同一条通告双重欠账)。"""
+        """退还欠条(未准入回退,防同条通告双重欠账)。"""
         for rid, delta in row_deltas.items():
             req = self.requests.get(rid)
             if req is not None:
@@ -245,8 +210,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
     def _lwd_assert_rows_match_notify(
         out: SchedulerOutput, notify: LwdC2eNotify, targets: list[str]
     ) -> None:
-        """排程行集/行数必须与通告的目标集逐请求相等(迟到行不参与
-        排程):部分排程会让 worker 的 DOWN 行切分错位,当场报错。"""
+        """排程行集/行数须与通告目标集逐请求相等,否则 worker 的
+        DOWN 行切分错位,当场报错。"""
         rows_by_req = dict(zip(notify.req_ids, notify.num_accepted_tokens))
         scheduled = out.num_scheduled_tokens
         if set(scheduled) != set(targets) or any(
@@ -261,8 +226,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
     def _lwd_attach_unembed_batch(
         out: SchedulerOutput, notify: LwdC2eNotify
     ) -> None:
-        """挂 UNEMBED 批:行集取全量通告(worker 按 DOWN 张量实际到达
-        的行切分,recv 尺寸以整条通告为准),迟到行收割期原生跳过。"""
+        """挂 UNEMBED 批:行集取全量通告,recv 尺寸以整条通告为准。"""
         out.lwd_batch = LwdBatch(
             batch_type=LwdBatchType.LWD_UNEMBED,
             seqno=notify.down_seqno,
@@ -277,9 +241,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         out.lwd_c2e_notify = [notify]
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
-        """原生排程后抑制 decode 行的自动 +1 占位:边侧不自产 token,
-        下一步行数由下一条 c2e 决定,原生"账面领先 1"的预支在此无法
-        兑现(decode 行欠账由 schedule_decode 的 arm 精确设定)。"""
+        """抑制 decode 行的自动 +1 占位:边侧不自产 token,行数由
+        下一条通告决定,原生"账面领先 1"的预支不成立。"""
         super()._update_after_schedule(scheduler_output)
         for req_id in scheduler_output.num_scheduled_tokens:
             request = self.requests.get(req_id)
@@ -289,13 +252,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
     def update_from_output(
         self, scheduler_output: SchedulerOutput, model_output
     ) -> dict[int, EngineCoreOutputs]:
-        """原生入账后消费云侧完成码(云侧权威的兜底终结)。
-
-        本批 token 已交付(含云侧判停请求的最后几行——所以终结必须在
-        super() 之后、且批仍需执行,跳过执行 = 丢最后 token)。云侧判停
-        而原生 check_stop 未触发的请求(如惩罚类停止)在此强制终结并
-        补一条带完成码的空输出,防云侧停发后请求挂死占名额;原生已停/
-        迟到的请求 requests 里已移除,自然跳过。"""
+        """原生入账后消费云侧完成码(兜底终结):云侧判停而原生
+        check_stop 未触发的请求在此终结并补带完成码的空输出。终结必须
+        在 super() 后(本批行含最后 token,批不能跳过执行);原生已停/
+        迟到的请求已出 requests,自然跳过。"""
         engine_core_outputs = super().update_from_output(
             scheduler_output, model_output
         )
@@ -321,19 +281,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         return engine_core_outputs
 
     def lwd_edge_max_num_seqs_check(self) -> bool:
-        """max_num_seqs 水位:running 是否还有名额,True=可开新请求。
-
-        decode 相位请求(等云结果)留在 running 占名额,计数即原生
-        语义。续传豁免不在本判断(相位选择按 running 直判放行收尾);
-        请求到达时的 announce 亦不受约束(云只登记不计算)。"""
+        """水位:running 是否还有名额(decode 相位请求占名额)。"""
         return len(self.running) < self.max_num_running_reqs
 
     def lwd_edge_add_request(self, request: Request) -> None:
-        """请求入口:边界校验 -> 云预告 -> 本地入队。
-
-        预告先于本地登记:云侧视图领先本地工作,云只能准备不能提前
-        计算(没有 chunk 预告就不会开算)。abort_immediately 请求走
-        finish + abort 出口,与原生语义一致。"""
+        """入口:校验 → 云侧元数据预告 → 原生入队(预告先行,云只能
+        准备不能开算)。abort_immediately 走 finish + abort 出口。"""
         self._lwd_validate_request(request)
         self.lwd_edge_notify_request(
             request_id=request.request_id,
@@ -353,21 +306,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         sampling_params: SamplingParams | None = None,
         block_hashes: list[bytes] | None = None,
     ) -> None:
-        """发 LwdRequestNotify(请求元数据预告)。
-
-        block_hashes = prompt 全量满块哈希链(自位置 0 起)。云侧
-        prompt token 是占位零值,本地算不出真实内容哈希,前缀缓存
-        命中只能靠这条链;缺省空链 = 不提供,云侧回退占位链。
-
-        sampling_params 只透传影响云侧 token 选择的字段(采样核/惩罚/
-        EOS 策略/min_tokens);stop 字符串等 detokenizer 层参数留在
-        边侧前端原生处理,不上 wire。
-
-        失败语义 fail-fast:发布队满时短退避重试(瞬态背压几乎必在
-        秒级窗口内腾出),耗尽即抛 RuntimeError——异常沿 add_request
-        调用链回前端 error 通道,用户立即得到失败;不做无限阻塞
-        重试(发布点在引擎主线程,云宕机会把整个引擎卡死在 add)。
-        此时请求未入队、云侧零残留,无需补发 abort。"""
+        """发 LwdRequestNotify:采样参数/满块哈希链透传(云侧占位
+        prompt 的前缀缓存只能靠边侧哈希链命中;stop 字符串等
+        detokenizer 层参数不上 wire)。队满短退避重试,耗尽抛
+        RuntimeError 回客户端(请求未入队,云侧零残留)。"""
         publisher = self.lwd_edge_publisher
         if publisher is None:
             return
@@ -410,8 +352,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         )
 
     def lwd_edge_abort(self, request_ids: list[str]) -> None:
-        """发 LwdAbortNotify;调度器内清理走原生路径(请求在三队列内,
-        原生 abort/finish_requests 直接可见)。"""
+        """发 LwdAbortNotify;本地清理走原生(请求在三队列内)。"""
         publisher = self.lwd_edge_publisher
         for request_id in request_ids:
             if publisher is None:
@@ -427,9 +368,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
     @staticmethod
     def _lwd_validate_request(request: Request) -> None:
-        """模式边界校验(入队前拒绝,错误回客户端):拒客户端自带
-        prompt_embeds(边是 embedding 属主)、拒结构化输出、拒不上
-        wire 的采样参数——后两者不拒会被云侧静默忽略,输出悄悄错。"""
+        """模式边界校验(入队前拒,错误回客户端):拒 prompt_embeds/
+        结构化输出/不上 wire 的采样参数——不拒会被云侧静默忽略。"""
         if request.prompt_embeds is not None:
             raise ValueError(
                 f"[LWD] prefill-only mode does not accept client-provided "

@@ -1,6 +1,5 @@
-"""云侧相位调度器:工作纯相位批次。prefill 步只算 prompt 工作(prefill 首块 +
-尾巴),decode 步只算已完结请求的 1-token 采样;prefill 批最多一个请求。
-步元数据(c2e)经 update_from_output 覆写在原生入账后发边。"""
+"""云侧相位调度器:纯相位批次(prefill 批最多一个请求);步元数据
+(c2e)经 update_from_output 覆写在原生入账后发边。"""
 
 from __future__ import annotations
 
@@ -36,7 +35,7 @@ logger = init_logger(__name__)
 _LWD_PHASE_PREFILL_FIRST = "prefill_first"
 _LWD_PHASE_DECODE_FIRST = "decode_first"
 
-# 步元数据队满重试小睡:元数据不可丢(边侧据此预挂精确尺寸 recv)
+# 步元数据队满重试小睡(元数据不可丢)
 _LWD_C2E_SEND_RETRY_SLEEP_S = 0.05
 
 
@@ -47,16 +46,14 @@ class LwdCloudScheduler(LwdBaseScheduler):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._lwd_prefill_first = self._lwd_resolve_phase()
-        # One-shot 翻转:某相位空步而另一相位有活时,强制下一步走后者;
-        # 双标志显式定向,按偏好取反会错翻,造成空步死循环。
+        # One-shot 翻转:某相位空步而另一相位有活时,强制下一步走后者
         self._force_prefill_once: bool = False
         self._force_decode_once: bool = False
-        # 上一个非空步是否为 prefill,驱动 schedule() 的禁连续 prefill 不变量
+        # 驱动禁连续 prefill 不变量
         self._last_step_was_prefill: bool = False
-        # prefill 通知队列:边侧范围预告(RangeNotify)逐条入队,每步取
-        # 队首点名其 request_id;预告自带 seqno 即本步 UP 链配对号
+        # prefill 通知队列:边侧范围预告逐条入队,一步弹一条点名
         self.prefill_notify_queue: deque[LwdRangeNotify] = deque()
-        # 步元数据发布面(引擎装配后回填);None 期间(装配前)步输出透传
+        # 步元数据发布面(引擎装配后回填);None 期间步输出透传
         self.lwd_cloud_publisher = None
         logger.info(
             "[Lwd] cloud scheduler: single-request prefill batches "
@@ -64,7 +61,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
         )
 
     def _lwd_resolve_phase(self) -> bool:
-        """返回 True=prefill_first;缺省/未知相位告警回退 prefill_first。"""
+        """返回 True=prefill_first;未知相位告警回退 prefill_first。"""
         phase = self.vllm_config.lwd_config.scheduler_name
         if phase == _LWD_PHASE_DECODE_FIRST:
             return False
@@ -79,8 +76,8 @@ class LwdCloudScheduler(LwdBaseScheduler):
         return True
 
     def schedule_decode(self) -> SchedulerOutput:
-        """纯 decode 步:收集三队列全部 decode 态请求(含被抢占回
-        waiting 的),可见集单独调度。"""
+        """收集三队列全部 decode 态请求(含被抢占回 waiting 的),
+        可见集单独调度。"""
         req_ids = [
             req.request_id
             for queue in (self.running, self.waiting, self.skipped_waiting)
@@ -92,12 +89,11 @@ class LwdCloudScheduler(LwdBaseScheduler):
         return self._lwd_schedule_for_visible_reqs(req_ids)
 
     def schedule_prefill(self) -> SchedulerOutput:
-        """纯 prefill 步:prefill_notify_queue 有预告则取队首 msg,单独
-        调度其请求(按原队列归位,waiting/skipped 来源走原生准入);没有则
-        空集进窗口,等价空步,三队列原样保留。"""
+        """弹一条范围预告点名其请求,可见集调度;空步(KV 压力未准入)
+        回塞队首重试,准入后挂 EMBED 批。"""
         notify = q.popleft() if (q := self.prefill_notify_queue) else None
         if notify is not None and notify.request_id not in self.requests:
-            # 请求已被 abort 释放:丢弃陈旧预告,本步按空集走
+            # 请求已被 abort 释放:丢弃陈旧预告
             notify = None
         if notify is not None:
             logger.info(
@@ -109,17 +105,10 @@ class LwdCloudScheduler(LwdBaseScheduler):
         if notify is None:
             return out
         if not out.num_scheduled_tokens:
-            # 未实际准入(典型 KV 压力空步):预告塞回队首原位,decode
-            # 泄压后重新点名;本步不挂 lwd_batch,不向 worker 预告配对号
             self.prefill_notify_queue.appendleft(notify)
             return out
-        # UP 链 seqno 随批下发云 worker(§9.12 数据面接缝):批配对号直接
-        # 取点名预告自带的 seqno(与边侧 EMBED 批派发号同源同值),worker
-        # 的 UP recv 以此配对边侧发来的 embeds 张量。batch_meta 承载
-        # worker 的 recv 尺寸与注入切行信息:req_ids 取预告请求(单请求
-        # 批),token_ids 为占位列表——长度必须等于边侧实际发送的 chunk
-        # token 数(= RangeNotify.num_tokens),recv numel 才能与边侧
-        # isend 严格相等(HCCL P2P 要求两端 numel 匹配)。
+        # 占位 token 行数必须等于边侧实际发送数(HCCL P2P 要求两端
+        # numel 匹配);seqno 为 UP 链配对号,与边侧 EMBED 批同源同值
         out.lwd_batch = LwdBatch(
             batch_type=LwdBatchType.LWD_EMBED,
             seqno=notify.seqno,
@@ -131,13 +120,9 @@ class LwdCloudScheduler(LwdBaseScheduler):
         return out
 
     def _lwd_select_phase(self) -> LwdReqPhase:
-        """相位选择:prefill_first 有 prefill 活即 prefill;decode_first
-        只要存在 decode 活就优先 decode。One-shot 强制标志与禁连续
-        prefill 不变量在此消费。
-
-        相位工作量直判:prefill 活 = waiting/running 存在 PREFILL 相位
-        请求(被抢占回 waiting 的 DECODE 请求不算 prefill 活,由纯
-        decode 步的三队列收集服务);decode 活 = running 存在 DECODE。"""
+        """相位选择:prefill_first 有 prefill 活即 prefill,decode_first
+        有 decode 活即 decode;消费 One-shot 强制标志与禁连续 prefill
+        不变量(被抢占回 waiting 的 decode 请求不算 prefill 活)。"""
         has_prefill_work = any(
             self._lwd_the_phase_of_req(req) is LwdReqPhase.PREFILL
             for queue in (self.waiting, self.running)
@@ -156,20 +141,17 @@ class LwdCloudScheduler(LwdBaseScheduler):
         elif self._force_decode_once:
             self._force_decode_once = False
             prefer_prefill = False
-        # 不变量:prefill 不连续执行两步;仅当中间的 decode 步为空时才允许
-        # 连续,空 decode 步经 _force_prefill_once 翻回。
+        # 不变量:prefill 不连续两步,空 decode 步经 _force_prefill_once 翻回
         if prefer_prefill and self._last_step_was_prefill and self.running:
             prefer_prefill = False
         return LwdReqPhase.PREFILL if prefer_prefill else LwdReqPhase.DECODE
 
     def _lwd_after_phase(self, phase: LwdReqPhase, out: SchedulerOutput) -> None:
-        """空步翻转与禁连续 prefill 簿记。
-
-        decode 步不会改变 PREFILL 相位的成员(可见集只含 decode 态,
-        被抢占者回 waiting 后相位不变),翻转条件就地重扫与选择时直判等价。"""
+        """空步翻转与 last_prefill 簿记(decode 步不改变 PREFILL 相位
+        成员,翻转条件就地重扫与选择时等价)。"""
         if phase is LwdReqPhase.PREFILL:
             if not out.total_num_scheduled_tokens and self.running:
-                # prefill 受 KV 压力阻塞:放行空步,下一步转 decode 泄压
+                # prefill 受 KV 压力阻塞:下一步转 decode 泄压
                 self._force_decode_once = True
             else:
                 self._last_step_was_prefill = True
@@ -180,28 +162,21 @@ class LwdCloudScheduler(LwdBaseScheduler):
             for queue in (self.waiting, self.running)
             for req in queue
         ):
-            # decode 无活但有 prefill 活:翻回 prefill(不变量的空步出口)
+            # decode 无活但有 prefill 活:翻回 prefill
             self._force_prefill_once = True
 
-    # ------------------------------------------------------------------ #
-    # 步输出:原生入账后把步元数据(c2e)发边                          #
-    # ------------------------------------------------------------------ #
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
         model_output: "ModelRunnerOutput",
     ) -> "dict[int, EngineCoreOutputs]":
-        """原生入账(token 追加/判停/finish)后,解 pinned 载荷组 c2e 通告
-        经 POST_OUT 发边——边侧据此预挂 DOWN recv 并驱动 decode 步。
-
-        carrier 缺席(空步/无 LWD 步)或发布面未就绪(引擎装配前)仅透传。
-        pinned 布局:[ranks(各调度段行)..., counts(accepted/请求)...,
-        seg_lens(段长/请求)...];top_id_ths 按段长切,被拒行一并携带,
-        边侧按 num_accepted 取有效前缀。"""
+        """原生入账后解 pinned 载荷组 c2e 发边(边侧据此预挂 DOWN
+        recv);carrier 缺席或发布面未就绪仅透传。"""
         engine_core_outputs = super().update_from_output(scheduler_output, model_output)
         carrier = getattr(model_output, "lwd_down_carrier", None)
         if carrier is None or self.lwd_cloud_publisher is None:
             return engine_core_outputs
+        # pinned 布局:[ranks(各段行)..., counts(accepted/请求)..., seg_lens(段长/请求)...]
         pinned, req_ids, hidden_numel, seqno = carrier
         n_req = len(req_ids)
         vals = pinned.tolist()
@@ -233,9 +208,8 @@ class LwdCloudScheduler(LwdBaseScheduler):
         meta: "LwdC2eMeta",
         engine_core_outputs: "dict[int, EngineCoreOutputs]",
     ) -> list[int]:
-        """req_ids 对齐的逐请求完成码:本步任一 EngineCoreOutputs 里带
-        finish_reason 的输出取其码;仅进 finished_requests 的缺口按 ABORT
-        兜底;其余 LWD_NOT_FINISHED(边侧保持 decode 相位,由后续步通告收口)。"""
+        """req_ids 对齐的完成码:带 finish_reason 的输出取其码,仅进
+        finished_requests 的缺口按 ABORT 兜底,其余 NOT_FINISHED。"""
         reasons: dict[str, int] = {}
         for outputs in engine_core_outputs.values():
             for out in outputs.outputs:
@@ -249,8 +223,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
         ]
 
     def _lwd_publish_c2e(self, meta: "LwdC2eMeta", finish_reasons: list[int]) -> None:
-        """步元数据(含逐请求 finish_reasons 完成码)发边:队满小睡重试
-        (元数据不可丢),关停(closed)退出。"""
+        """步元数据(含逐请求完成码)发边:队满小睡重试,关停退出。"""
         notify = LwdC2eNotify(
             hidden_num_elements=meta.hidden_num_elements,
             top_id_ths=meta.top_id_ths,
