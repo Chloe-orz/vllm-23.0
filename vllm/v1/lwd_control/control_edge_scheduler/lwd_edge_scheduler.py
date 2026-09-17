@@ -146,17 +146,59 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         return self.waiting.peek_request().request_id if self.waiting else None
 
     def schedule_prefill(self) -> SchedulerOutput:
-        """单请求组批:picker 选一个工作单元,经基类可见集机制单独调度。
+        """单请求组批:picker 选一个工作单元,经基类可见集机制单独调度,
+        发布 RangeNotify 成功后挂 EMBED 批(与云侧 schedule_prefill 尾部
+        挂批对称——发布点随调度,seqno 与发布成功绑定)。
 
         选择规则见 _lwd_pick_prefill_req_id;队列剔除/隔离/拼回复用基类
         _lwd_schedule_for_visible_reqs(waiting/skipped 来源走原生准入
-        窗口,running 来源走续跑)。语义注记:与旧手写容器交换不同,
-        本步被抢占的请求回 waiting 尾部、被跳过的回 skipped 队首,均取
-        基类统一语义,不再做队首回插。"""
+        窗口,running 来源走续跑)。发布失败返回空步:进度已按排程乐观
+        推进,该 chunk 随 SO 废弃即永久丢失,由发布通道不丢消息保证
+        不发生(弃批语义与 dispatch 期失败一致)。"""
         req_id = self._lwd_pick_prefill_req_id()
         if req_id is not None:
             logger.info("[Lwd][edge-sched] pick req=%s", req_id)
-        return self._lwd_schedule_for_visible_reqs([req_id] if req_id else [])
+        out = self._lwd_schedule_for_visible_reqs([req_id] if req_id else [])
+        scheduled = out.num_scheduled_tokens
+        if not scheduled:
+            return out
+        publisher = self.lwd_edge_publisher
+        for request_id, num_tokens in scheduled.items():
+            request = self.requests.get(request_id)
+            if request is None:
+                continue
+            # _update_after_schedule 已乐观推进 num_computed,起点回退本步量
+            offset = request.num_computed_tokens - num_tokens
+            seqno = self._lwd_seqno
+            if publisher is None or not publisher.publish(
+                LwdRangeNotify(
+                    request_id=request_id,
+                    offset=offset,
+                    num_tokens=num_tokens,
+                    seqno=seqno,
+                )
+            ):
+                return SchedulerOutput.make_empty()
+            self._lwd_seqno = seqno + 1
+            logger.info(
+                "[Lwd][edge-notify] req=%s offset=%d num=%d seqno=%d",
+                request_id, offset, num_tokens, seqno,
+            )
+            # 发布成功即组 EMBED 批挂 SO:seqno 是数据面发云张量的配对键
+            # (与云侧 RangeNotify 登记同值),embed 载荷为本 chunk 片段
+            out.lwd_batch = LwdBatch(
+                batch_type=LwdBatchType.LWD_EMBED,
+                seqno=seqno,
+                batch_meta=LwdEmbedBatch(
+                    req_ids=[request_id],
+                    token_ids=[
+                        list(
+                            request.prompt_token_ids[offset : offset + num_tokens]
+                        )
+                    ],
+                ),
+            )
+        return out
 
     def schedule_decode(self) -> SchedulerOutput:
         """纯 decode 步(输出位置阶段):弹一条 c2e 点名,arm 欠账后经
@@ -256,62 +298,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         if request.abort_immediately:
             self.finish_requests([request.request_id], RequestStatus.FINISHED_ABORTED)
             self.lwd_edge_abort([request.request_id])
-
-    def lwd_edge_notify(self, scheduler_output: SchedulerOutput) -> bool:
-        """对新调度的 prefill 块发 LwdRangeNotify(seqno 先行)。
-
-        seqno 无空洞契约:UP 数据通道按连续号序配对(通道层对超前号
-        扣留等待,一个空洞即永久挂死整条链),因此号只能分配给真正
-        上 wire 的块:
-        - peek-then-advance:发布成功才进位计数器;
-        - 单 notify 前提:本方法每步至多发一条,依赖单请求组批
-          约束。若放开多请求组批,部分成功的 notify 已上 wire 而
-          整步不派发,会同时产生号空洞与张量失配,届时必须改为按
-          已成功子集执行。
-
-        前提:控制面发布通道不丢消息,publish 恒成功——步末回退
-        对账已按此前提移除。若前提被破坏返回 False,调用方本步不
-        派发但进度不回退,该 chunk 永久丢失;重复预告在云侧按
-        (request_id, offset) 幂等登记。"""
-        publisher = self.lwd_edge_publisher
-        scheduled = scheduler_output.num_scheduled_tokens
-        for request_id, num_tokens in scheduled.items():
-            request = self.requests.get(request_id)
-            if request is None:
-                continue
-            # _update_after_schedule 已乐观推进 num_computed,起点需回退本步量
-            offset = request.num_computed_tokens - num_tokens
-            seqno = self._lwd_seqno
-            if not publisher.publish(
-                LwdRangeNotify(
-                    request_id=request_id,
-                    offset=offset,
-                    num_tokens=num_tokens,
-                    seqno=seqno,
-                )
-            ):
-                return False
-            self._lwd_seqno = seqno + 1
-            logger.info(
-                "[Lwd][edge-notify] req=%s offset=%d num=%d seqno=%d",
-                request_id, offset, num_tokens, seqno,
-            )
-            # 发布成功即组 EMBED 批挂 SO:seqno 是数据面发云张量的
-            # 配对键(与云侧 RangeNotify 登记同值),embed 载荷为本
-            # chunk 的 token 片段
-            scheduler_output.lwd_batch = LwdBatch(
-                batch_type=LwdBatchType.LWD_EMBED,
-                seqno=seqno,
-                batch_meta=LwdEmbedBatch(
-                    req_ids=[request_id],
-                    token_ids=[
-                        list(
-                            request.prompt_token_ids[offset : offset + num_tokens]
-                        )
-                    ],
-                ),
-            )
-        return True
 
     def lwd_edge_notify_request(
         self,

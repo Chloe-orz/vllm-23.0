@@ -30,7 +30,6 @@ _LWD_FILE_EXCEPTIONS = {
     "lwd_edge_engine.py": (
         r"from vllm\.v1\.engine import",
         r"from vllm\.v1\.engine\.core import",
-        r"from vllm\.v1\.core\.sched\.output import",
     ),
 }
 
