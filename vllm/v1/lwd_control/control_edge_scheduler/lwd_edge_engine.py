@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import threading
 from collections import deque
-from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequestType
@@ -48,10 +47,7 @@ from vllm.v1.lwd_control.control_communication.lwd_notify import (
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler import (
     LwdEdgeScheduler,
 )
-from vllm.v1.lwd_control.lwd_base_engine import LwdBaseEngineCore
-
-if TYPE_CHECKING:
-    from vllm.config.lwd import LwdConfig
+from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import LwdBaseEngineCore
 
 logger = init_logger(__name__)
 
@@ -81,7 +77,12 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         LwdLogBase.set_debug(config.debug)
         # 通信面:bind POST_OUT 订阅面 + 延迟连接的 PRE_OUT 发布面;
         # 云端点由 HELLO 通告决定(边不预知云地址)
-        self._subscriber = self._lwd_build_post_out(config)
+        # bind POST_OUT 订阅面;云经 master_addr 主动来连
+        self._subscriber = LwdControlSubscriber(
+            f"tcp://{config.post_out_bind}:{config.post_out_port}",
+            bind=True,
+            decoder=lwd_decode_cloud_notify,
+        )
         self._publisher = LwdControlPublisher(
             None, bind=False, queue_max=config.publish_queue_max
         )
@@ -111,14 +112,6 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     # ------------------------------------------------------------------ #
     # 通信面                                                              #
     # ------------------------------------------------------------------ #
-    def _lwd_build_post_out(self, config: LwdConfig) -> LwdControlSubscriber:
-        """bind POST_OUT 订阅面;云经 master_addr 主动来连。"""
-        return LwdControlSubscriber(
-            f"tcp://{config.post_out_bind}:{config.post_out_port}",
-            bind=True,
-            decoder=lwd_decode_cloud_notify,
-        )
-
     def _receive_thread(self, hello_event: threading.Event) -> None:
         """POST_OUT 接收线程体,按消息类型分发。
 

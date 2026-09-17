@@ -27,7 +27,7 @@ from vllm.v1.lwd_control.control_communication.lwd_notify import (
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_scheduler import (
     LwdCloudScheduler,
 )
-from vllm.v1.lwd_control.lwd_base_engine import LwdBaseEngineCore
+from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import LwdBaseEngineCore
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -63,11 +63,16 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         )
         # 步元数据发布面交付调度器(update_from_output 覆写消费)
         self.scheduler.lwd_cloud_publisher = self._publisher
-        self._lwd_hello = LwdHelloNotify(
+        # 首拍即通告(边侧可能已 bind 等待);队满不重试,由边侧
+        # 等待超时 fail-fast 兜底
+        hello = LwdHelloNotify(
             pre_out_host=config.pre_out_host, pre_out_port=config.pre_out_port
         )
-        # 首拍即通告(边侧可能已 bind 等待)
-        self._lwd_announce()
+        self._publisher.publish(hello)
+        logger.info(
+            "[Lwd][cloud] HELLO announced: pre_out=%s:%s",
+            config.pre_out_host, config.pre_out_port,
+        )
         # 门池:元数据查重与暂存,到达即构建放行;仅接收线程独占
         self._lwd_gate_pending: dict[str, LwdRequestNotify] = {}
         logger.info(
@@ -89,14 +94,6 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
                     break
                 continue
             self._lwd_dispatch(msg)
-
-    def _lwd_announce(self) -> None:
-        """首拍 HELLO 通告一次;队满不重试,由边侧等待超时 fail-fast 兜底。"""
-        self._publisher.publish(self._lwd_hello)
-        logger.info(
-            "[Lwd][cloud] HELLO announced: pre_out=%s:%s",
-            self._lwd_hello.pre_out_host, self._lwd_hello.pre_out_port,
-        )
 
     def _lwd_dispatch(self, msg) -> None:
         """PRE_OUT 三类分派(本 IO 线程):元数据转 Request / abort 终结 /

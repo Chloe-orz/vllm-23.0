@@ -1,7 +1,6 @@
-"""控制面调度/执行层:边/云调度器与配置支撑。
+"""控制面公共层:边/云调度器与引擎的基类。
 
-依赖方向:本包单向依赖 control_communication;继承例外 2 个
-(lwd_edge_scheduler / lwd_cloud_scheduler 均继承本包
-LwdBaseScheduler,即 AsyncScheduler 子类);内核不继承 EngineCore,
-引擎触达收在两侧引擎子类(lwd_edge_engine / lwd_cloud_engine)。
+依赖方向:本包单向依赖 control_communication。继承关系 4 条:
+lwd_edge/cloud_scheduler 继承 LwdBaseScheduler(AsyncScheduler 子类),
+lwd_edge/cloud_engine 继承 LwdBaseEngineCore(EngineCoreProc 子类)。
 """

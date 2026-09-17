@@ -1,16 +1,11 @@
 """Lwd 控制面通知:仅依赖 msgspec,不携带 tensor,只承载调度决策预告。
-上游输出类型经本模块 re-export,其余内核文件不得直接 import vllm.v1.engine。"""
+边云双向通知结构体与编解码;数据面批型定义在 core/sched/output.py。"""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Union
+from typing import Optional, Union
 
 import msgspec
-
-if TYPE_CHECKING:
-    # 上游输出类型 re-export:step 载体的返回注解共用,避免各文件直连上游
-    from vllm.v1.engine import EngineCoreOutputs  # noqa: F401
-
 
 class LwdRangeNotify(msgspec.Struct, gc=False, tag=True):
     """边->云调度范围预告(PRE_OUT);offset/num_tokens 取自原生调度决策,
