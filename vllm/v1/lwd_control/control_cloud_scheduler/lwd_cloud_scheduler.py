@@ -15,6 +15,7 @@ from vllm.v1.core.sched.output import (
 from vllm.v1.lwd_control.control_communication.lwd_notify import LwdRangeNotify
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     LwdBaseScheduler,
+    LwdReqPhase,
 )
 
 logger = init_logger(__name__)
@@ -60,10 +61,16 @@ class LwdCloudScheduler(LwdBaseScheduler):
         return True
 
     def _lwd_has_prefill_tails(self) -> bool:
-        return any(not self._lwd_the_phase_of_req(r) for r in self.running)
+        return any(
+            self._lwd_the_phase_of_req(r) is LwdReqPhase.PREFILL
+            for r in self.running
+        )
 
     def _lwd_has_decode_ready(self) -> bool:
-        return any(self._lwd_the_phase_of_req(r) for r in self.running)
+        return any(
+            self._lwd_the_phase_of_req(r) is LwdReqPhase.DECODE
+            for r in self.running
+        )
 
     def _lwd_collect_decode_requests(self) -> list[str]:
         """收集所有 decode 态(prompt 已算完)请求的 req_id。
@@ -74,7 +81,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
             req.request_id
             for queue in (self.running, self.waiting, self.skipped_waiting)
             for req in queue
-            if self._lwd_the_phase_of_req(req)
+            if self._lwd_the_phase_of_req(req) is LwdReqPhase.DECODE
         ]
 
     # ------------------------------------------------------------------ #

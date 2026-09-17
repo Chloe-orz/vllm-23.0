@@ -41,6 +41,7 @@ from vllm.v1.lwd_control.control_communication.lwd_notify import (
 )
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     LwdBaseScheduler,
+    LwdReqPhase,
 )
 from vllm.v1.request import RequestStatus
 
@@ -107,7 +108,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         优先(断点续传,先收尾再开新),否则 waiting 队首(FCFS 到达序);
         两处皆无返回 None。"""
         running_prefill = next(
-            (r for r in self.running if not self._lwd_the_phase_of_req(r)),
+            (r for r in self.running
+             if self._lwd_the_phase_of_req(r) is LwdReqPhase.PREFILL),
             None,
         )
         if running_prefill is not None:
@@ -143,7 +145,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         与 picker 续传分支共用基类相位判据,闸门放行收尾的前提是
         picker 必然挑中该续传请求而非开新。"""
         return any(
-            not self._lwd_the_phase_of_req(req)
+            self._lwd_the_phase_of_req(req) is LwdReqPhase.PREFILL
             for req in self.running
         )
 
@@ -322,7 +324,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             if request is None:
                 # 本步内已终结(abort/更早完成):迟到的登记无对象
                 continue
-            if self._lwd_the_phase_of_req(request):
+            if self._lwd_the_phase_of_req(request) is LwdReqPhase.DECODE:
                 finished_ids.append(request_id)
         if finished_ids:
             self.finish_requests(finished_ids, RequestStatus.FINISHED_STOPPED)

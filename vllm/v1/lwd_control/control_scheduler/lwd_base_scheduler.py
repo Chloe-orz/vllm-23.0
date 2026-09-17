@@ -6,22 +6,40 @@
 
 from __future__ import annotations
 
+import enum
+
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
 from vllm.v1.request import Request
 
 
+class LwdReqPhase(enum.Enum):
+    """请求相位:只由请求本体决定,与所在队列无关。"""
+
+    PREFILL = "prefill"
+    DECODE = "decode"
+    FINISHED = "finished"
+
+
 class LwdBaseScheduler(AsyncScheduler):
     """边/云调度器公共基类(AsyncScheduler 子类)。"""
 
     @staticmethod
-    def _lwd_the_phase_of_req(request: Request) -> bool:
-        """请求相位判据,边云共用:True = decode 态(prompt 已算完),
-        False = prefill 未尽。勿与原生 Request.is_prefill_chunk 混淆
-        (那是排程记账标志,公式含 spec/占位项、每步重算、新请求初值
-        为 False,不能当相位谓词用)。"""
-        return request.num_computed_tokens >= request.num_prompt_tokens
+    def _lwd_the_phase_of_req(request: Request) -> LwdReqPhase:
+        """判定请求当前相位,边云共用:
+
+        - FINISHED 优先判定(已终结的请求账面可能同时满足 DECODE 判据);
+        - DECODE = prompt 已算完未终结;PREFILL = prompt 未算完
+          (waiting 新请求 computed=0 天然落在 PREFILL,被抢占/续跑的
+          decode 请求住回 waiting 也不影响判定——相位不读队列);
+        - 勿与原生 Request.is_prefill_chunk 混淆:那是排程记账标志
+          (公式含 spec/占位项、每步重算、新请求初值 False),非相位谓词。"""
+        if request.is_finished():
+            return LwdReqPhase.FINISHED
+        if request.num_computed_tokens >= request.num_prompt_tokens:
+            return LwdReqPhase.DECODE
+        return LwdReqPhase.PREFILL
 
     def _lwd_new_queue(self, reqs: list[Request]) -> RequestQueue:
         """新建调度策略队列并装入 reqs。"""
