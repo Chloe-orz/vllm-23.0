@@ -1,9 +1,12 @@
 """云侧相位调度器:工作纯相位批次。prefill 步只算 prompt 工作(prefill 首块 +
-尾巴),decode 步只算已完结请求的 1-token 采样;prefill 批最多一个请求。"""
+尾巴),decode 步只算已完结请求的 1-token 采样;prefill 批最多一个请求。
+步元数据(c2e)经 update_from_output 覆写在原生入账后发边。"""
 
 from __future__ import annotations
 
+import time
 from collections import deque
+from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import (
@@ -12,16 +15,29 @@ from vllm.v1.core.sched.output import (
     LwdEmbedBatch,
     SchedulerOutput,
 )
-from vllm.v1.lwd_control.control_communication.lwd_notify import LwdRangeNotify
+from vllm.v1.engine import FinishReason
+from vllm.v1.lwd_control.control_communication.lwd_notify import (
+    LWD_NOT_FINISHED,
+    LwdC2eNotify,
+    LwdRangeNotify,
+)
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     LwdBaseScheduler,
     LwdReqPhase,
 )
+from vllm.v1.lwd_debug import LwdDebug
+
+if TYPE_CHECKING:
+    from vllm.v1.engine import EngineCoreOutputs, ModelRunnerOutput
+    from vllm.v1.outputs import LwdC2eMeta
 
 logger = init_logger(__name__)
 
 _LWD_PHASE_PREFILL_FIRST = "prefill_first"
 _LWD_PHASE_DECODE_FIRST = "decode_first"
+
+# 步元数据队满重试小睡:元数据不可丢(边侧据此预挂精确尺寸 recv)
+_LWD_C2E_SEND_RETRY_SLEEP_S = 0.05
 
 
 class LwdCloudScheduler(LwdBaseScheduler):
@@ -40,6 +56,8 @@ class LwdCloudScheduler(LwdBaseScheduler):
         # prefill 通知队列:边侧范围预告(RangeNotify)逐条入队,每步取
         # 队首点名其 request_id;预告自带 seqno 即本步 UP 链配对号
         self.prefill_notify_queue: deque[LwdRangeNotify] = deque()
+        # 步元数据发布面(引擎装配后回填);None 期间(装配前)步输出透传
+        self.lwd_cloud_publisher = None
         logger.info(
             "[Lwd] cloud scheduler: single-request prefill batches "
             "enforced (edge/cloud chunk stream stays per-request contiguous)"
@@ -164,3 +182,92 @@ class LwdCloudScheduler(LwdBaseScheduler):
         ):
             # decode 无活但有 prefill 活:翻回 prefill(不变量的空步出口)
             self._force_prefill_once = True
+
+    # ------------------------------------------------------------------ #
+    # 步输出:原生入账后把步元数据(c2e)发边                          #
+    # ------------------------------------------------------------------ #
+    def update_from_output(
+        self,
+        scheduler_output: SchedulerOutput,
+        model_output: "ModelRunnerOutput",
+    ) -> "dict[int, EngineCoreOutputs]":
+        """原生入账(token 追加/判停/finish)后,解 pinned 载荷组 c2e 通告
+        经 POST_OUT 发边——边侧据此预挂 DOWN recv 并驱动 decode 步。
+
+        carrier 缺席(空步/无 LWD 步)或发布面未就绪(引擎装配前)仅透传。
+        pinned 布局:[ranks(各调度段行)..., counts(accepted/请求)...,
+        seg_lens(段长/请求)...];top_id_ths 按段长切,被拒行一并携带,
+        边侧按 num_accepted 取有效前缀。"""
+        engine_core_outputs = super().update_from_output(scheduler_output, model_output)
+        carrier = getattr(model_output, "lwd_down_carrier", None)
+        if carrier is None or self.lwd_cloud_publisher is None:
+            return engine_core_outputs
+        pinned, req_ids, hidden_numel, seqno = carrier
+        n_req = len(req_ids)
+        vals = pinned.tolist()
+        counts = vals[-2 * n_req : -n_req]
+        seg_lens = vals[-n_req:]
+        ranks_flat = vals[: -2 * n_req]
+        top_id_ths: list[list[int]] = []
+        off = 0
+        for seg_len in seg_lens:
+            top_id_ths.append(ranks_flat[off : off + seg_len])
+            off += seg_len
+        from vllm.v1.outputs import LwdC2eMeta
+
+        meta = LwdC2eMeta(
+            hidden_num_elements=hidden_numel,
+            top_id_ths=top_id_ths,
+            num_accepted_tokens=list(counts),
+            req_ids=list(req_ids),
+            down_seqno=seqno,
+        )
+        LwdDebug.cloud_step(self, meta, engine_core_outputs)  # [lwd-debug]
+        self._lwd_publish_c2e(
+            meta, self._lwd_c2e_finish_reasons(meta, engine_core_outputs)
+        )
+        return engine_core_outputs
+
+    @staticmethod
+    def _lwd_c2e_finish_reasons(
+        meta: "LwdC2eMeta",
+        engine_core_outputs: "dict[int, EngineCoreOutputs]",
+    ) -> list[int]:
+        """req_ids 对齐的逐请求完成码:本步任一 EngineCoreOutputs 里带
+        finish_reason 的输出取其码;仅进 finished_requests 的缺口按 ABORT
+        兜底;其余 LWD_NOT_FINISHED(边侧保持 decode 相位,由后续步通告收口)。"""
+        reasons: dict[str, int] = {}
+        for outputs in engine_core_outputs.values():
+            for out in outputs.outputs:
+                if out.finish_reason is not None:
+                    reasons.setdefault(out.request_id, int(out.finish_reason))
+            for request_id in outputs.finished_requests or ():
+                reasons.setdefault(request_id, int(FinishReason.ABORT))
+        return [
+            reasons.get(request_id, LWD_NOT_FINISHED)
+            for request_id in meta.req_ids
+        ]
+
+    def _lwd_publish_c2e(self, meta: "LwdC2eMeta", finish_reasons: list[int]) -> None:
+        """步元数据(含逐请求 finish_reasons 完成码)发边:队满小睡重试
+        (元数据不可丢),关停(closed)退出。"""
+        notify = LwdC2eNotify(
+            hidden_num_elements=meta.hidden_num_elements,
+            top_id_ths=meta.top_id_ths,
+            num_accepted_tokens=meta.num_accepted_tokens,
+            req_ids=meta.req_ids,
+            finish_reasons=finish_reasons,
+            down_seqno=meta.down_seqno,
+        )
+        while not self.lwd_cloud_publisher.closed:
+            if self.lwd_cloud_publisher.publish(notify):
+                logger.info(
+                    "[Lwd][cloud-ctrl] publish C2eNotify reqs=%d down_seqno=%s "
+                    "finish=%s hidden_elems=%s",
+                    len(notify.req_ids),
+                    notify.down_seqno,
+                    finish_reasons,
+                    notify.hidden_num_elements,
+                )
+                return
+            time.sleep(_LWD_C2E_SEND_RETRY_SLEEP_S)

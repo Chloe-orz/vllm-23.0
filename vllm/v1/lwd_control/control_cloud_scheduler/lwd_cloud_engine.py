@@ -4,15 +4,13 @@
 from __future__ import annotations
 
 import threading
-import time
-from typing import TYPE_CHECKING
 
 import torch
 
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
-from vllm.v1.engine import EngineCoreRequestType, FinishReason
+from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
     LwdControlPublisher,
@@ -21,31 +19,21 @@ from vllm.v1.lwd_control.control_communication.lwd_control_subscriber import (
     LwdControlSubscriber,
 )
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
-    LWD_NOT_FINISHED,
     LwdAbortNotify,
-    LwdC2eNotify,
     LwdHelloNotify,
     LwdRangeNotify,
     LwdRequestNotify,
     lwd_encode_cloud_notify,
 )
-from vllm.v1.lwd_debug import LwdDebug
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_scheduler import (
     LwdCloudScheduler,
 )
 from vllm.v1.request import Request
 
-if TYPE_CHECKING:
-    from vllm.v1.engine import EngineCoreOutputs
-    from vllm.v1.outputs import LwdC2eMeta, ModelRunnerOutput
-
 logger = init_logger(__name__)
 
 # PRE_OUT recv 超时拍:仅作关停响应上限(HELLO 首拍一次,无重发)
 LWD_PRE_OUT_RECV_TIMEOUT_MS = 5000
-
-# 步元数据队满重试小睡:元数据不可丢(边侧据此预挂精确尺寸 recv)
-_LWD_C2E_SEND_RETRY_SLEEP_S = 0.05
 
 
 class LwdCloudEngineCore(EngineCoreProc):
@@ -73,6 +61,8 @@ class LwdCloudEngineCore(EngineCoreProc):
             bind=False,
             encoder=lwd_encode_cloud_notify,
         )
+        # 步元数据发布面交付调度器(update_from_output 覆写消费)
+        self.scheduler.lwd_cloud_publisher = self._lwd_post_out
         self._lwd_hello = LwdHelloNotify(
             pre_out_host=config.pre_out_host, pre_out_port=config.pre_out_port
         )
@@ -250,94 +240,3 @@ class LwdCloudEngineCore(EngineCoreProc):
         )
         request.lwd_embeds_placeholder = True  # 同上:占位 embeds 不上 MQ
         return request
-
-    def lwd_handle_model_output(
-        self,
-        model_output: ModelRunnerOutput,
-        engine_core_outputs: dict[int, EngineCoreOutputs],
-    ) -> ModelRunnerOutput:
-        """rank-replay:解码 worker 主流末尾 pinned 物化的步 meta(就绪由
-        响应入队处的 event synchronize 保证),组 c2e 通告经 POST_OUT
-        先于 hidden 发边;finish 码取自 engine_core_outputs。
-
-        pinned 布局:[ranks(各调度段行)..., counts(accepted/请求)...,
-        seg_lens(段长/请求)...];top_id_ths 按段长切,被拒行一并携带,
-        边侧按 num_accepted 取有效前缀。"""
-        carrier = getattr(model_output, "lwd_down_carrier", None)
-        if carrier is not None:
-            pinned, req_ids, hidden_numel, seqno = carrier
-            n_req = len(req_ids)
-            vals = pinned.tolist()
-            counts = vals[-2 * n_req : -n_req]
-            seg_lens = vals[-n_req:]
-            ranks_flat = vals[: -2 * n_req]
-            top_id_ths: list[list[int]] = []
-            off = 0
-            for seg_len in seg_lens:
-                top_id_ths.append(ranks_flat[off : off + seg_len])
-                off += seg_len
-            from vllm.v1.outputs import LwdC2eMeta
-
-            meta = LwdC2eMeta(
-                hidden_num_elements=hidden_numel,
-                top_id_ths=top_id_ths,
-                num_accepted_tokens=list(counts),
-                req_ids=list(req_ids),
-                down_seqno=seqno,
-            )
-            logger.info(
-                "[Lwd][cloud-ctrl] publish c2e(rank-replay): reqs=%s "
-                "rows=%d seqno=%d",
-                meta.req_ids, off, seqno,
-            )
-            LwdDebug.cloud_step(self.scheduler, meta, engine_core_outputs)  # [lwd-debug]
-            self._lwd_publish_c2e(
-                meta, self._lwd_c2e_finish_reasons(meta, engine_core_outputs)
-            )
-        else:
-            logger.info(
-                "[Lwd][cloud-ctrl] handle_model_output: no down carrier this step"
-            )
-        return model_output
-
-    @staticmethod
-    def _lwd_c2e_finish_reasons(
-        meta: LwdC2eMeta,
-        engine_core_outputs: dict[int, EngineCoreOutputs],
-    ) -> list[int]:
-        """req_ids 对齐的逐请求完成码:本步任一 EngineCoreOutputs 里带
-        finish_reason 的输出取其码;仅进 finished_requests 的缺口按 ABORT
-        兜底;其余 LWD_NOT_FINISHED(边侧保持 awaiting,由后续步通告收口)。"""
-        reasons: dict[str, int] = {}
-        for outputs in engine_core_outputs.values():
-            for out in outputs.outputs:
-                if out.finish_reason is not None:
-                    reasons.setdefault(out.request_id, int(out.finish_reason))
-            for request_id in outputs.finished_requests or ():
-                reasons.setdefault(request_id, int(FinishReason.ABORT))
-        return [reasons.get(request_id, LWD_NOT_FINISHED)
-                for request_id in meta.req_ids]
-
-    def _lwd_publish_c2e(self, meta: LwdC2eMeta, finish_reasons: list[int]) -> None:
-        """步元数据(含逐请求 finish_reasons 完成码)发边:队满小睡重试
-        (元数据不可丢),关停(closed)退出。"""
-        notify = LwdC2eNotify(
-            hidden_num_elements=meta.hidden_num_elements,
-            top_id_ths=meta.top_id_ths,
-            num_accepted_tokens=meta.num_accepted_tokens,
-            req_ids=meta.req_ids,
-            finish_reasons=finish_reasons,
-            down_seqno=meta.down_seqno,
-        )
-        while not self._lwd_post_out.closed:
-            if self._lwd_post_out.publish(notify):
-                logger.info(
-                    "[Lwd][cloud-ctrl] publish C2eNotify reqs=%d down_seqno=%s "
-                    "finish=%s hidden_elems=%s",
-                    len(notify.req_ids),
-                    notify.down_seqno,
-                    finish_reasons,
-                    notify.hidden_num_elements,
-                )
-                return
-            time.sleep(_LWD_C2E_SEND_RETRY_SLEEP_S)
