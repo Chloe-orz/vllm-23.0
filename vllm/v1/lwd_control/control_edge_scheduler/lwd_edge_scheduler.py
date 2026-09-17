@@ -153,13 +153,13 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         notify = self._lwd_pop_unembed_notify()
         if notify is None:
             return SchedulerOutput.make_empty()
-        targets = self._lwd_alive_decode_reqs(notify)
+        targets = self._lwd_decode_targets(notify)
         if not targets:
             return SchedulerOutput.make_empty()
-        row_deltas = self._lwd_reserve_rows(notify, targets)
+        adjustments = self._lwd_reserve_reqs_state(notify, targets)
         out = self._lwd_schedule_for_visible_reqs(targets)
         if not out.num_scheduled_tokens:
-            self._lwd_release_rows(row_deltas)
+            self._lwd_release_reqs_state(adjustments)
             self.unembed_notify_queue.appendleft(notify)
             return out
         self._lwd_assert_rows_match_notify(out, notify, targets)
@@ -170,7 +170,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         """弹队首通告;空队返回 None。"""
         return q.popleft() if (q := self.unembed_notify_queue) else None
 
-    def _lwd_alive_decode_reqs(self, notify: LwdC2eNotify) -> list[str]:
+    def _lwd_decode_targets(self, notify: LwdC2eNotify) -> list[str]:
         """通告里仍可调度的请求(存在、未终结、decode 相位);其余行
         由收割期原生跳过,批仍带全量通告行集保 worker 行切分对齐。"""
         return [
@@ -179,30 +179,31 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             and self._lwd_the_phase_of_req(req) is LwdReqPhase.DECODE
         ]
 
-    def _lwd_reserve_rows(
+    def _lwd_reserve_reqs_state(
         self, notify: LwdC2eNotify, targets: list[str]
     ) -> dict[str, int]:
-        """把目标请求的欠条(占位数)校准到通告行数,返回增量供退还。"""
+        """把目标请求的待算行数(占位欠条)校准到通告行数,返回
+        {request_id: 调整量} 供未准入时回退。"""
         rows_by_req = dict(zip(notify.req_ids, notify.num_accepted_tokens))
-        row_deltas: dict[str, int] = {}
+        adjustments: dict[str, int] = {}
         for rid in targets:
             request = self.requests[rid]
-            owed = (
+            pending_rows = (
                 request.num_tokens_with_spec
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
-            delta = rows_by_req[rid] - owed
-            request.num_output_placeholders += delta
-            row_deltas[rid] = delta
-        return row_deltas
+            adjustment = rows_by_req[rid] - pending_rows
+            request.num_output_placeholders += adjustment
+            adjustments[rid] = adjustment
+        return adjustments
 
-    def _lwd_release_rows(self, row_deltas: dict[str, int]) -> None:
-        """退还欠条(未准入回退,防同条通告双重欠账)。"""
-        for rid, delta in row_deltas.items():
+    def _lwd_release_reqs_state(self, adjustments: dict[str, int]) -> None:
+        """回退占位欠条(未准入路径,防同条通告双重欠账)。"""
+        for rid, adjustment in adjustments.items():
             req = self.requests.get(rid)
             if req is not None:
-                req.num_output_placeholders -= delta
+                req.num_output_placeholders -= adjustment
 
     @staticmethod
     def _lwd_assert_rows_match_notify(
@@ -270,10 +271,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                         reason, RequestStatus.FINISHED_STOPPED
                     )
                 )
-                outputs = engine_core_outputs.setdefault(
+                client_outputs = engine_core_outputs.setdefault(
                     request.client_index, EngineCoreOutputs()
                 )
-                outputs.outputs.append(
+                client_outputs.outputs.append(
                     EngineCoreOutput(rid, [], finish_reason=reason)
                 )
         return engine_core_outputs
