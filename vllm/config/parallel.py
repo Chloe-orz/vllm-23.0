@@ -882,6 +882,13 @@ class ParallelConfig:
             self.world_size = sum(len(e["ranks"]) for e in _reg["edges"]) + sum(
                 len(c["ranks"]) for c in _reg["clouds"]
             )
+            # rendezvous master 优先级:registry world > CLI(--master-addr/
+            # --master-port)> 默认值——yaml 为全场唯一事实源,三机免重复传
+            _world = _reg.get("world") or {}
+            if _world.get("master_addr"):
+                self.master_addr = str(_world["master_addr"])
+            if _world.get("master_port"):
+                self.master_port = int(_world["master_port"])
         elif (
             self.lwd_config.edge_npu_count > 0
             and self.lwd_config.cloud_npu_count > 0

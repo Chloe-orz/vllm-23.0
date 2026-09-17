@@ -913,6 +913,17 @@ class VllmConfig:
                 self.parallel_config.world_size = sum(
                     len(r) for r in parallel_lwd.edge_ranks_layout.values()
                 ) + sum(len(r) for r in parallel_lwd.cloud_ranks_layout.values())
+                # rendezvous master 优先级:registry world > CLI(--master-
+                # addr/--master-port)> 默认值。registry 仅经 additional_config
+                # 给出时,ParallelConfig.__post_init__ 看不到路径,须在此补
+                # 覆盖(与该处同值幂等)。
+                _world = _reg.get("world") or {}
+                if _world.get("master_addr"):
+                    self.parallel_config.master_addr = str(
+                        _world["master_addr"]
+                    )
+                if _world.get("master_port"):
+                    self.parallel_config.master_port = int(_world["master_port"])
                 # 边云模式并行度由拓扑推导;PP 恒为 2(prefill_only 下运行
                 # 期中性化,组构成见 parallel_state LWD 分支)
                 self.parallel_config.pipeline_parallel_size = 2
