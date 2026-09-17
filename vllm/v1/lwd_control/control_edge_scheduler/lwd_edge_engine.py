@@ -28,10 +28,12 @@ UNEMBED 批在 schedule_decode 内挂 c2e 载荷),收割与 update_from_output
 from __future__ import annotations
 
 import threading
+import time
 from collections import deque
+from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
-from vllm.v1.engine import EngineCoreRequestType
+from vllm.v1.engine import EngineCoreRequestType, RequestStatus
 from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
     LwdControlPublisher,
 )
@@ -40,8 +42,11 @@ from vllm.v1.lwd_control.control_communication.lwd_control_subscriber import (
 )
 from vllm.v1.lwd_debug import LwdLogBase
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
+    LWD_WIRE_SAMPLING_FIELDS,
+    LwdAbortNotify,
     LwdC2eNotify,
     LwdHelloNotify,
+    LwdRequestNotify,
     lwd_decode_cloud_notify,
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler import (
@@ -49,10 +54,17 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler import (
 )
 from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import LwdBaseEngineCore
 
+if TYPE_CHECKING:
+    from vllm.sampling_params import SamplingParams
+
 logger = init_logger(__name__)
 
 # 步进流水深度:对齐旧手搓批队列的深度,由原生 batch_queue 机制承担
 LWD_EDGE_BATCH_DEPTH = 4
+
+# 请求元数据预告发布重试:次数 x 递增间隔(共约 3s),耗尽即请求级报错
+_LWD_ADD_RETRY_STEPS = 5
+_LWD_ADD_RETRY_INTERVAL_S = 0.2
 
 
 class LwdEdgeEngineCore(LwdBaseEngineCore):
@@ -142,13 +154,75 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             logger.warning("[Lwd] drop unexpected POST_OUT frame %r", type(msg))
 
     def add_request(self, request, _request_wave: int = 0) -> None:
-        """边校验 + 云预告 + 本地入队。
+        """云侧元数据预告 → 原生入队(预告先行,云只能准备不能开算)。
+        abort_immediately 走 finish + abort 出口。
 
         _request_wave:原生主循环按位置传入(core.py ADD 分发),本模式
         无 DP wave 语义,仅保形参契约,不消费。"""
-        self.scheduler.lwd_edge_add_request(request)
+        self._lwd_notify_request_meta(
+            request_id=request.request_id,
+            num_prompt_tokens=len(request.prompt_token_ids),
+            sampling_params=request.sampling_params,
+            block_hashes=list(request.block_hashes),
+        )
+        self.scheduler.add_request(request)
+        if request.abort_immediately:
+            self.scheduler.finish_requests(
+                [request.request_id], RequestStatus.FINISHED_ABORTED
+            )
+            self._lwd_abort_notify([request.request_id])
 
     def abort_requests(self, request_ids: list[str]) -> None:
         """abort 信号先出云,再走原生本地清理。"""
-        self.scheduler.lwd_edge_abort(request_ids)
+        self._lwd_abort_notify(request_ids)
         super().abort_requests(request_ids)
+
+    def _lwd_notify_request_meta(
+        self,
+        request_id: str,
+        num_prompt_tokens: int,
+        sampling_params: SamplingParams,
+        block_hashes: list[bytes] | None = None,
+    ) -> None:
+        """发 LwdRequestNotify:采样参数/满块哈希链透传(云侧占位
+        prompt 的前缀缓存只能靠边侧哈希链命中;stop 字符串等
+        detokenizer 层参数不上 wire)。队满短退避重试,耗尽抛
+        RuntimeError 回客户端(请求未入队,云侧零残留)。"""
+        sp = sampling_params
+        message = LwdRequestNotify(
+            request_id=request_id,
+            num_prompt_tokens=num_prompt_tokens,
+            max_tokens=sp.max_tokens if sp.max_tokens is not None else 16,
+            block_hashes=block_hashes if block_hashes is not None else [],
+            eos_token_id=sp.eos_token_id,
+            stop_token_ids=list(sp.stop_token_ids or []),
+            **{f: getattr(sp, f) for f in LWD_WIRE_SAMPLING_FIELDS},
+        )
+        for attempt in range(_LWD_ADD_RETRY_STEPS):
+            if self._publisher.publish(message):
+                logger.info(
+                    "[Lwd][edge-notify] request meta announced: req=%s "
+                    "prompt=%d",
+                    request_id, num_prompt_tokens,
+                )
+                return
+            time.sleep(_LWD_ADD_RETRY_INTERVAL_S * (attempt + 1))
+        raise RuntimeError(
+            f"[LWD] add-request notify for {request_id} dropped: publish "
+            f"queue full after {_LWD_ADD_RETRY_STEPS} retries "
+            f"(cloud PRE_OUT consumption stalled?)"
+        )
+
+    def _lwd_abort_notify(self, request_ids: list[str]) -> None:
+        """发 LwdAbortNotify;本地清理走原生(请求在三队列内)。"""
+        for request_id in request_ids:
+            if not self._publisher.publish(
+                LwdAbortNotify(request_id=request_id)
+            ):
+                logger.warning(
+                    "[LWD] drop abort signal for %s: publish queue full", request_id
+                )
+            else:
+                logger.info(
+                    "[Lwd][edge-notify] AbortNotify req=%s", request_id
+                )
