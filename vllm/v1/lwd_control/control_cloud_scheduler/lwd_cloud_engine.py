@@ -1,5 +1,5 @@
-"""云侧 EngineCore 子类:覆写 socket IO 线程入口,PRE_OUT 循环独立成线程,
-边侧预告与步内元数据经 input_queue 走原生分发;仅 prefill_only 云角色启用。"""
+"""云侧 EngineCore 子类:构造期建 ZMQ 双面并起 PRE_OUT 接收线程,边侧
+预告与步内元数据经 input_queue 走原生分发;仅 prefill_only 云角色启用。"""
 
 from __future__ import annotations
 
@@ -37,20 +37,22 @@ LWD_PRE_OUT_RECV_TIMEOUT_MS = 5000
 
 
 class LwdCloudEngineCore(EngineCoreProc):
-    """云 PO 引擎:覆写 socket IO 线程入口,其余全走原生。"""
+    """云 PO 引擎:构造期建 ZMQ 双面 + 起 PRE_OUT 接收线程,其余全走原生。"""
 
     def __init__(self, *args, **kwargs) -> None:
-        # 调度器自注入须赶在 super() 之前(与边侧 LwdEdgeEngineCore 同款):
-        # super 构建 self.scheduler 时一次性消费 scheduler_cls,后设无效;
-        # 引擎构造是唯一注入点,缺注入会让 IO 线程把 RangeNotify 写进裸
-        # AsyncScheduler 而崩溃。
+        # 调度器自注入须赶在 super() 之前:super 构建 self.scheduler 时
+        # 一次性消费 scheduler_cls,后设无效
         vllm_config = kwargs["vllm_config"]
         vllm_config.scheduler_config.scheduler_cls = LwdCloudScheduler
         super().__init__(*args, **kwargs)
+        self._lwd_setup_zmq()
+        threading.Thread(
+            target=self._lwd_pre_out_loop, daemon=True, name="lwd-pre-out"
+        ).start()
 
     def _lwd_setup_zmq(self) -> None:
-        """介入 ZMQ 双面:PRE_OUT bind 收边;POST_OUT connect 边,承载首拍
-        HELLO 通告与步内元数据。建站失败走 EXECUTOR_FAILED 升级。"""
+        """建 ZMQ 双面:PRE_OUT bind 收边;POST_OUT connect 边,承载
+        HELLO 通告与步元数据。建站失败即构造失败(fail-fast)。"""
         config = self.vllm_config.lwd_config
         self._lwd_subscriber = LwdControlSubscriber(
             f"tcp://{config.pre_out_host}:{config.pre_out_port}", bind=True
@@ -68,7 +70,7 @@ class LwdCloudEngineCore(EngineCoreProc):
         )
         # 首拍即通告(边侧可能已 bind 等待)
         self._lwd_announce()
-        # 门池:元数据查重与暂存,到达即构建放行;仅本 IO 线程独占
+        # 门池:元数据查重与暂存,到达即构建放行;仅接收线程独占
         self._lwd_gate_pending: dict[str, LwdRequestNotify] = {}
         logger.info(
             "[Lwd] cloud engine assembled: PRE_OUT bind %s, POST_OUT announce -> "
@@ -79,30 +81,9 @@ class LwdCloudEngineCore(EngineCoreProc):
             master_addr,
         )
 
-    def process_input_sockets(
-        self,
-        input_addresses: list[str],
-        coord_input_address: str | None,
-        identity: bytes,
-        ready_event: threading.Event,
-    ) -> None:
-        """父线程照跑父类原版,PRE_OUT 循环独立成线程,两生产者共用 input_queue。"""
-        threading.Thread(
-            target=self._lwd_pre_out_loop, daemon=True, name="lwd-pre-out"
-        ).start()
-        super().process_input_sockets(
-            input_addresses, coord_input_address, identity, ready_event
-        )
-
     def _lwd_pre_out_loop(self) -> None:
-        """PRE_OUT 接收循环:socket 与门状态在本线程内先建后用(zmq 单线程
-        亲和);recv 挂超时拍仅作关停响应上限,关停(closed)退出。"""
-        try:
-            self._lwd_setup_zmq()
-        except Exception:
-            logger.exception("[Lwd] cloud PRE_OUT setup failed")
-            self.input_queue.put_nowait((EngineCoreRequestType.EXECUTOR_FAILED, b""))
-            return
+        """PRE_OUT 接收循环(本线程独占 recv;socket 构造期建立后移交,
+        与边侧同款模式)。recv 超时拍仅作关停响应上限,closed 退出。"""
         while True:
             msg = self._lwd_subscriber.recv(timeout_ms=LWD_PRE_OUT_RECV_TIMEOUT_MS)
             if msg is None:
