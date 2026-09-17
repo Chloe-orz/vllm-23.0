@@ -33,7 +33,6 @@ from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequestType
-from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
     LwdControlPublisher,
 )
@@ -49,6 +48,7 @@ from vllm.v1.lwd_control.control_communication.lwd_notify import (
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler import (
     LwdEdgeScheduler,
 )
+from vllm.v1.lwd_control.lwd_base_engine import LwdBaseEngineCore
 
 if TYPE_CHECKING:
     from vllm.config.lwd import LwdConfig
@@ -59,18 +59,16 @@ logger = init_logger(__name__)
 LWD_EDGE_BATCH_DEPTH = 4
 
 
-class LwdEdgeEngineCore(EngineCoreProc):
-    """边 PO 引擎:通信面装配 + 调度器注入 + add/abort/shutdown 覆写。
+class LwdEdgeEngineCore(LwdBaseEngineCore):
+    """边 PO 引擎:通信面装配 + add/abort 覆写。
 
     步进全走父类(schedule → execute → update_from_output):调度器
     相位模板出 EMBED/UNEMBED 批并自带载荷,worker 契约不变;流水深度
     强制 4,由原生 batch_queue 机制承担。"""
 
+    lwd_scheduler_cls = LwdEdgeScheduler
+
     def __init__(self, *args, **kwargs) -> None:
-        vllm_config = kwargs["vllm_config"]
-        # 调度器注入须赶在 super() 之前:super 内构建 self.scheduler 时
-        # 一次性消费 scheduler_cls,后设无效(注入失效,首请求即崩)
-        vllm_config.scheduler_config.scheduler_cls = LwdEdgeScheduler
         super().__init__(*args, **kwargs)
         # 流水深度强制 4:切换到原生 batch_queue 异步调度路径(worker 侧
         # non_block 提交契约与旧手搓流水线一致;原生 async_scheduling 标志
@@ -78,7 +76,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
         self.batch_queue_size = LWD_EDGE_BATCH_DEPTH
         self.batch_queue = deque(maxlen=LWD_EDGE_BATCH_DEPTH)
         self.step_fn = self.step_with_batch_queue
-        config = vllm_config.lwd_config
+        config = self.lwd_config
         # 层日志总开关:env 已开则不动,config 段开则补开(仅本进程)
         LwdLogBase.set_debug(config.debug)
         # 通信面:bind POST_OUT 订阅面 + 延迟连接的 PRE_OUT 发布面;
@@ -166,15 +164,6 @@ class LwdEdgeEngineCore(EngineCoreProc):
             else:
                 logger.warning("[Lwd] drop unexpected POST_OUT frame %r", type(msg))
 
-    def _lwd_shutdown_planes(self) -> None:
-        """两面关停(幂等):receiver 先关断输入,publisher 收尾。"""
-        receiver = getattr(self, "_subscriber", None)
-        if receiver is not None:
-            receiver.shutdown()
-        publisher = getattr(self, "_publisher", None)
-        if publisher is not None:
-            publisher.shutdown()
-
     # ------------------------------------------------------------------ #
     # 引擎接口覆写                                                        #
     # ------------------------------------------------------------------ #
@@ -189,8 +178,3 @@ class LwdEdgeEngineCore(EngineCoreProc):
         """abort 信号先出云,再走原生本地清理。"""
         self.scheduler.lwd_edge_abort(request_ids)
         super().abort_requests(request_ids)
-
-    def shutdown(self) -> None:
-        """两面关停后走原生;初始化失败路径两面可能未建,容忍缺省。"""
-        self._lwd_shutdown_planes()
-        super().shutdown()

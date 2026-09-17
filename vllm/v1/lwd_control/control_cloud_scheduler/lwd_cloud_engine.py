@@ -11,7 +11,6 @@ from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 from vllm.v1.engine import EngineCoreRequestType
-from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
     LwdControlPublisher,
 )
@@ -28,6 +27,7 @@ from vllm.v1.lwd_control.control_communication.lwd_notify import (
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_scheduler import (
     LwdCloudScheduler,
 )
+from vllm.v1.lwd_control.lwd_base_engine import LwdBaseEngineCore
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -36,14 +36,12 @@ logger = init_logger(__name__)
 LWD_PRE_OUT_RECV_TIMEOUT_MS = 5000
 
 
-class LwdCloudEngineCore(EngineCoreProc):
+class LwdCloudEngineCore(LwdBaseEngineCore):
     """云 PO 引擎:构造期建 ZMQ 双面 + 起 PRE_OUT 接收线程,其余全走原生。"""
 
+    lwd_scheduler_cls = LwdCloudScheduler
+
     def __init__(self, *args, **kwargs) -> None:
-        # 调度器自注入须赶在 super() 之前:super 构建 self.scheduler 时
-        # 一次性消费 scheduler_cls,后设无效
-        vllm_config = kwargs["vllm_config"]
-        vllm_config.scheduler_config.scheduler_cls = LwdCloudScheduler
         super().__init__(*args, **kwargs)
         self._lwd_setup_zmq()
         threading.Thread(
@@ -53,7 +51,7 @@ class LwdCloudEngineCore(EngineCoreProc):
     def _lwd_setup_zmq(self) -> None:
         """建 ZMQ 双面:PRE_OUT bind 收边;POST_OUT connect 边,承载
         HELLO 通告与步元数据。建站失败即构造失败(fail-fast)。"""
-        config = self.vllm_config.lwd_config
+        config = self.lwd_config
         self._subscriber = LwdControlSubscriber(
             f"tcp://{config.pre_out_host}:{config.pre_out_port}", bind=True
         )
@@ -99,16 +97,6 @@ class LwdCloudEngineCore(EngineCoreProc):
             "[Lwd][cloud] HELLO announced: pre_out=%s:%s",
             self._lwd_hello.pre_out_host, self._lwd_hello.pre_out_port,
         )
-
-    def shutdown(self) -> None:
-        """两面关停后走原生(幂等;装配失败路径两面可能未建,容忍缺省)。"""
-        subscriber = getattr(self, "_subscriber", None)
-        if subscriber is not None:
-            subscriber.shutdown()
-        publisher = getattr(self, "_publisher", None)
-        if publisher is not None:
-            publisher.shutdown()
-        super().shutdown()
 
     def _lwd_dispatch(self, msg) -> None:
         """PRE_OUT 三类分派(本 IO 线程):元数据转 Request / abort 终结 /
