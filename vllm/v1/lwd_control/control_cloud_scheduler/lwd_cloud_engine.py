@@ -250,26 +250,6 @@ class LwdCloudEngineCore(EngineCoreProc):
         )
         request.lwd_embeds_placeholder = True  # 同上:占位 embeds 不上 MQ
         return request
-    
-    def step_with_batch_queue(self):
-        """步骤执行时长打点(开始执行→执行结束;不含引擎空等)。"""
-        _t0 = time.monotonic()
-        out = super().step_with_batch_queue()
-        logger.info(
-            "[Lwd][perf] cloud-step exec=%.2fms",
-            (time.monotonic() - _t0) * 1000,
-        )
-        return out
-
-    def step(self):
-        """同步步路径同款打点。"""
-        _t0 = time.monotonic()
-        out = super().step()
-        logger.info(
-            "[Lwd][perf] cloud-step exec=%.2fms",
-            (time.monotonic() - _t0) * 1000,
-        )
-        return out
 
     def lwd_handle_model_output(
         self,
@@ -283,8 +263,6 @@ class LwdCloudEngineCore(EngineCoreProc):
         pinned 布局:[ranks(各调度段行)..., counts(accepted/请求)...,
         seg_lens(段长/请求)...];top_id_ths 按段长切,被拒行一并携带,
         边侧按 num_accepted 取有效前缀。"""
-        # [Lwd][perf] cloud-step dt 已由 exec 时长替代(见 step_with_batch_queue
-        # 覆写):开始执行→执行结束,不含无请求的空等。
         carrier = getattr(model_output, "lwd_down_carrier", None)
         if carrier is not None:
             pinned, req_ids, hidden_numel, seqno = carrier
@@ -313,14 +291,8 @@ class LwdCloudEngineCore(EngineCoreProc):
                 meta.req_ids, off, seqno,
             )
             LwdDebug.cloud_step(self.scheduler, meta, engine_core_outputs)  # [lwd-debug]
-            _t = time.monotonic()
             self._lwd_publish_c2e(
                 meta, self._lwd_c2e_finish_reasons(meta, engine_core_outputs)
-            )
-            # [Lwd][perf] 云侧 LWD 税:finish 码推导 + ZMQ publish
-            logger.info(
-                "[Lwd][perf] publish reqs=%d dur=%.2fms",
-                len(meta.req_ids), (time.monotonic() - _t) * 1000,
             )
         else:
             logger.info(

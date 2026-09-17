@@ -461,11 +461,6 @@ class EngineCore:
             model_output = future.result()
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
-            logger.info(
-                "[Lwd][trace] engine got model_output: type=%s c2e_meta=%s",
-                type(model_output).__name__,
-                getattr(getattr(model_output, "lwd_c2e_meta", None), "req_ids", None),
-            )
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -566,11 +561,6 @@ class EngineCore:
             self.log_iteration_details(scheduler_output),
         ):
             model_output = future.result()
-            logger.info(
-                "[Lwd][trace] engine got model_output (batch_queue): type=%s c2e_meta=%s",
-                type(model_output).__name__,
-                getattr(getattr(model_output, "lwd_c2e_meta", None), "req_ids", None),
-            )
             if model_output is None:
                 # None from sample_tokens() implies that the original execute_model()
                 # call failed - raise that exception.
@@ -623,7 +613,6 @@ class EngineCore:
         """Lwd model-output 扩展接口(步内输出接缝):接收步内 model_output 与
         update_from_output 产物 engine_core_outputs,调用子类覆写的处理方法;
         接口自身承载固定编排。"""
-        logger.info("start lwd_process_model_output  ----  ")
         return self.lwd_handle_model_output(model_output, engine_core_outputs)
 
     def lwd_handle_model_output(
@@ -634,7 +623,6 @@ class EngineCore:
         """子类继承 EngineCore 后覆写本方法以消费步内输出;engine_core_outputs
         携带本步逐请求 finish_reason(原生停止条件判定),父类默认原样透传,
         未覆写时原生行为不变。"""
-        logger.info("11111")
         return model_output
 
     def _process_aborts_queue(self):

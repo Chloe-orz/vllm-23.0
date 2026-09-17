@@ -42,7 +42,6 @@ from vllm.v1.lwd_control.control_communication.lwd_notify import (
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     LwdBaseScheduler,
 )
-from vllm.v1.lwd_debug import LwdControlLog
 from vllm.v1.request import RequestStatus
 
 if TYPE_CHECKING:
@@ -96,7 +95,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         开新准入:云侧在途满员(lwd_edge_max_num_seqs_check 为 False)
         时本步空排、新开请求留 waiting 等云侧排水;running 尚有未发完
         embed 的续传不受闸门约束(先收尾再开新,亦防上限=1 时自锁)。"""
-        LwdControlLog.flight(len(self.running), len(self._lwd_awaiting))
         if (
             not self.lwd_edge_max_num_seqs_check()
             and not self._lwd_has_prefill_chunk_inflight()
