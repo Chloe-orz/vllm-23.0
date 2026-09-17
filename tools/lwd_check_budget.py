@@ -15,7 +15,10 @@ from pathlib import Path
 _LWD_FILE_EXCEPTIONS = {
     "lwd_notify.py": (r"from vllm\.v1\.engine import",),
     "lwd_edge_scheduler.py": (r"from vllm\.v1\.request import",),
-    "lwd_cloud_scheduler.py": (r"from vllm\.v1\.request import",),
+    "lwd_cloud_scheduler.py": (
+        r"from vllm\.v1\.engine import",
+        r"from vllm\.v1\.outputs import",
+    ),
     "lwd_cloud_engine.py": (
         r"from vllm\.v1\.core\.kv_cache_utils import",
         r"from vllm\.v1\.request import",
@@ -27,6 +30,7 @@ _LWD_FILE_EXCEPTIONS = {
     "lwd_edge_engine.py": (
         r"from vllm\.v1\.engine import",
         r"from vllm\.v1\.engine\.core import",
+        r"from vllm\.v1\.core\.sched\.output import",
     ),
 }
 
@@ -75,6 +79,11 @@ def check_import_whitelist(lwd_root: Path) -> list[str]:
         if path.name not in _LWD_SCHEDULER_FILES:
             for match in _LWD_SCHED_ONLY_IMPORT.finditer(source):
                 snippet = source[match.start() :].splitlines()[0]
+                # 例外同 _LWD_FILE_EXCEPTIONS(前缀匹配)
+                if any(
+                    re.match(allow, snippet.strip()) for allow in allowed
+                ):
+                    continue
                 violations.append(
                     f"{path.name}: scheduler-only import -> {snippet.strip()}"
                 )
@@ -82,6 +91,8 @@ def check_import_whitelist(lwd_root: Path) -> list[str]:
 
 
 _LWD_GETATTR_TOLERANT_FILES = {
+    # update_from_output 嗅探 worker 动态挂载的 lwd_down_carrier
+    "lwd_cloud_scheduler.py",
     "lwd_cloud_engine.py",
     "lwd_edge_engine.py",
 }

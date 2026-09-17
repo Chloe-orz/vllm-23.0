@@ -99,6 +99,11 @@ class LwdBaseScheduler(AsyncScheduler):
         self.waiting.remove_requests(from_waiting)
         self.skipped_waiting.remove_requests(from_skipped)
         saved = (self.running, self.waiting, self.skipped_waiting)
+        # 隐藏的 running 对原生并发准入不可见,名额按隐藏数扣减,防止
+        # 隔离调用期间超发(超发崩溃记录 §6:prefill 步闸门失明准入第
+        # N+1 个,decode 全员可见时撞原生断言)
+        saved_cap = self.max_num_running_reqs
+        self.max_num_running_reqs = max(0, saved_cap - len(saved[0]))
         # 被剔除的请求按原队列归位成可见集,单独调度
         self.running = from_running
         self.waiting = self._lwd_new_queue(from_waiting)
@@ -106,8 +111,9 @@ class LwdBaseScheduler(AsyncScheduler):
         try:
             out = super().schedule()
         finally:
-            # 按原队列拼回:running 存活者接尾,waiting 被抢占者排队尾,
+            # 先恢复名额再拼回:running 存活者接尾,waiting 被抢占者排队尾,
             # skipped 被跳过者排队首
+            self.max_num_running_reqs = saved_cap
             post = (self.running, self.waiting, self.skipped_waiting)
             self.running, self.waiting, self.skipped_waiting = saved
             self.running += post[0]
