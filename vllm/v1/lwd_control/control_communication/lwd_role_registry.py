@@ -123,6 +123,17 @@ class LwdRoleRegistry:
         }
         if not edges or not clouds:
             raise ValueError("role registry requires at least one edge and one cloud")
+        empty_ranks = [
+            f"{role}.{peer_id}"
+            for role, peers in (("edge", edges), ("cloud", clouds))
+            for peer_id, peer in peers.items()
+            if not peer.ranks
+        ]
+        if empty_ranks:
+            raise ValueError(
+                "role registry peers must declare non-empty ranks: "
+                + ", ".join(empty_ranks)
+            )
         return cls(edges, clouds)
 
     @classmethod
