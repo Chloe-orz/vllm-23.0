@@ -80,10 +80,13 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         """embed 优先:有 prefill 活走 prefill,否则看 unembed 通告,
         皆无返回 None。不做禁连续 prefill——边侧 decode 活要等全部
         chunk 发完云侧才产,不变量会拦死 chunk 发送(单请求死锁)。"""
+        # prefill 活 = running 续传(不受水位约束,先收尾)或水位有余且
+        # waiting 非空(decode 相位请求占 running 名额,原生语义计数)
         has_prefill_work = any(
             self._lwd_the_phase_of_req(req) is LwdReqPhase.PREFILL
             for req in self.running
-        ) or (self.lwd_edge_max_num_seqs_check() and bool(self.waiting))
+        ) or (len(self.running) < self.max_num_running_reqs
+              and bool(self.waiting))
         if has_prefill_work:
             return LwdReqPhase.PREFILL
         if self.unembed_notify_queue:
@@ -292,14 +295,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 )
         return engine_core_outputs
 
-    def lwd_edge_max_num_seqs_check(self) -> bool:
-        """水位:running 是否还有名额(decode 相位请求占名额)。"""
-        return len(self.running) < self.max_num_running_reqs
-
     def lwd_edge_add_request(self, request: Request) -> None:
         """入口:校验 → 云侧元数据预告 → 原生入队(预告先行,云只能
         准备不能开算)。abort_immediately 走 finish + abort 出口。"""
-        self._lwd_validate_request(request)
         self.lwd_edge_notify_request(
             request_id=request.request_id,
             num_prompt_tokens=len(request.prompt_token_ids),
@@ -365,35 +363,3 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                     "[Lwd][edge-notify] AbortNotify req=%s", request_id
                 )
 
-    @staticmethod
-    def _lwd_validate_request(request: Request) -> None:
-        """模式边界校验(入队前拒,错误回客户端):拒 prompt_embeds/
-        结构化输出/不上 wire 的采样参数——不拒会被云侧静默忽略。"""
-        if request.prompt_embeds is not None:
-            raise ValueError(
-                f"[LWD] prefill-only mode does not accept client-provided "
-                f"prompt_embeds (request {request.request_id}); the edge "
-                "is the embedding owner"
-            )
-        if request.use_structured_output:
-            raise ValueError(
-                "[LWD] prefill-only mode does not support structured output "
-                f"(request {request.request_id})"
-            )
-        sp = request.sampling_params
-        unsupported = [
-            name
-            for name, value in (
-                ("logit_bias", sp.logit_bias),
-                ("allowed_token_ids", sp.allowed_token_ids),
-                ("logprobs", sp.logprobs),
-            )
-            if value is not None
-        ]
-        if unsupported:
-            raise ValueError(
-                "[LWD] prefill-only mode does not support sampling "
-                f"param(s) {', '.join(unsupported)} "
-                f"(request {request.request_id}): not carried on the "
-                "edge->cloud wire, cloud would silently sample without them"
-            )
