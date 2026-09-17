@@ -194,6 +194,17 @@ class LwdRoleRegistry:
             raise ValueError(
                 "[lwd] role registry requires at least one edge and one cloud"
             )
+        empty_ranks = [
+            f"{role}.{peer_id}"
+            for role, peers in (("edge", edges), ("cloud", clouds))
+            for peer_id, peer in peers.items()
+            if not peer.ranks
+        ]
+        if empty_ranks:
+            raise ValueError(
+                "role registry peers must declare non-empty ranks: "
+                + ", ".join(empty_ranks)
+            )
         for cloud_id, cloud in clouds.items():
             if cloud.zmq_port <= 0:
                 raise ValueError(
