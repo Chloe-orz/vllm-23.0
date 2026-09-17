@@ -1201,11 +1201,23 @@ class EngineCoreProc(EngineCore):
                 parallel_config.data_parallel_size = 1
                 parallel_config.data_parallel_size_local = 1
                 parallel_config.data_parallel_rank = 0
-                # Lwd prefill-only engine selection (edge/cloud): no-op
-                # unless the mode is enabled (vanilla EngineCoreProc).
-                from vllm.v1.lwd_control import lwd_resolve_engine_cls
+                # Lwd prefill-only engine selection (edge/cloud): falls back
+                # to vanilla EngineCoreProc unless the mode is enabled.
+                lwd = vllm_config.lwd_config
+                engine_cls = EngineCoreProc
+                if lwd is not None and lwd.enabled and lwd.mode == "prefill_only":
+                    if lwd.is_edge:
+                        from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_engine import (
+                            LwdEdgeEngineCore,
+                        )
 
-                engine_cls = lwd_resolve_engine_cls(vllm_config) or EngineCoreProc
+                        engine_cls = LwdEdgeEngineCore
+                    else:
+                        from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_engine import (
+                            LwdCloudEngineCore,
+                        )
+
+                        engine_cls = LwdCloudEngineCore
                 engine_core = engine_cls(*args, engine_index=dp_rank, **kwargs)
 
             assert engine_core is not None

@@ -26,6 +26,12 @@ if TYPE_CHECKING:
     CUDA_VISIBLE_DEVICES: str | None = None
     VLLM_ENGINE_ITERATION_TIMEOUT_S: int = 60
     VLLM_ENGINE_READY_TIMEOUT_S: int = 600
+    VLLM_ASCEND_LWD_PRE_OUT_HOST: str | None = None
+    VLLM_ASCEND_LWD_PRE_OUT_PORT: int | None = None
+    VLLM_ASCEND_LWD_POST_OUT_PORT: int | None = None
+    VLLM_ASCEND_LWD_POST_OUT_BIND: str | None = None
+    VLLM_ASCEND_LWD_HELLO_TIMEOUT_S: float | None = None
+    VLLM_ASCEND_LWD_DEBUG: bool = False
     VLLM_API_KEY: str | None = None
     VLLM_DEBUG_LOG_API_SERVER_RESPONSE: bool = False
     S3_ACCESS_KEY_ID: str | None = None
@@ -651,6 +657,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
         )
     ),
     # ================== Runtime Env Vars ==================
+    # LWD prefill-only control plane overrides (applied in
+    # vllm/config/lwd.py LwdConfig.from_dict; invalid numbers fail fast)
+    "VLLM_ASCEND_LWD_PRE_OUT_HOST": lambda: os.getenv(
+        "VLLM_ASCEND_LWD_PRE_OUT_HOST"
+    ),
+    "VLLM_ASCEND_LWD_PRE_OUT_PORT": lambda: maybe_convert_int(
+        os.getenv("VLLM_ASCEND_LWD_PRE_OUT_PORT")
+    ),
+    "VLLM_ASCEND_LWD_POST_OUT_PORT": lambda: maybe_convert_int(
+        os.getenv("VLLM_ASCEND_LWD_POST_OUT_PORT")
+    ),
+    "VLLM_ASCEND_LWD_POST_OUT_BIND": lambda: os.getenv(
+        "VLLM_ASCEND_LWD_POST_OUT_BIND"
+    ),
+    "VLLM_ASCEND_LWD_HELLO_TIMEOUT_S": lambda: (
+        float(os.environ["VLLM_ASCEND_LWD_HELLO_TIMEOUT_S"])
+        if "VLLM_ASCEND_LWD_HELLO_TIMEOUT_S" in os.environ
+        else None
+    ),
+    "VLLM_ASCEND_LWD_DEBUG": lambda: os.getenv("VLLM_ASCEND_LWD_DEBUG", "0") == "1",
     # Root directory for vLLM cache files
     # Defaults to `~/.cache/vllm` unless `XDG_CACHE_HOME` is set
     "VLLM_CACHE_ROOT": lambda: os.path.expanduser(

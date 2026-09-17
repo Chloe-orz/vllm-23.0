@@ -29,6 +29,7 @@ import queue
 import threading
 import time
 from collections import deque
+from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
 from vllm.v1.engine import (
@@ -51,13 +52,13 @@ from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LwdHelloNotify,
     lwd_decode_cloud_notify,
 )
-from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import (
-    LwdConfig,
-)
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler import (
     LwdEdgeScheduler,
     lwd_build_unembed_batch,
 )
+
+if TYPE_CHECKING:
+    from vllm.config.lwd import LwdConfig
 
 logger = init_logger(__name__)
 
@@ -80,7 +81,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
         # 一次性消费 scheduler_cls,后设无效(注入失效,首请求即崩)
         vllm_config.scheduler_config.scheduler_cls = LwdEdgeScheduler
         super().__init__(*args, **kwargs)
-        config = LwdConfig.from_env_and_config(vllm_config)
+        config = vllm_config.lwd_config
         # 层日志总开关:env 已开则不动,config 段开则补开(仅本进程)
         LwdLogBase.set_debug(config.debug)
         # 通信面:bind POST_OUT 订阅面 + 延迟连接的 PRE_OUT 发布面;
@@ -112,14 +113,14 @@ class LwdEdgeEngineCore(EngineCoreProc):
             raise RuntimeError(
                 f"[Lwd] edge engine init failed: no cloud HELLO within "
                 f"{config.hello_timeout_s}s on POST_OUT "
-                f"(bind {config.lwd_post_out_bind_endpoint()}; check cloud "
-                f"master_addr connectivity and POST_OUT port)"
+                f"(bind tcp://{config.post_out_bind}:{config.post_out_port}; "
+                f"check cloud master_addr connectivity and POST_OUT port)"
             )
 
         self.scheduler.lwd_edge_publisher = self._edge_sender
         logger.info(
             "[Lwd] edge engine assembled: POST_OUT bind %s, PRE_OUT discovered",
-            config.lwd_post_out_bind_endpoint(),
+            f"tcp://{config.post_out_bind}:{config.post_out_port}",
         )
 
     # ------------------------------------------------------------------ #
@@ -128,7 +129,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
     def _lwd_build_post_out(self, config: LwdConfig) -> LwdControlSubscriber:
         """bind POST_OUT 订阅面;云经 master_addr 主动来连。"""
         return LwdControlSubscriber(
-            config.lwd_post_out_bind_endpoint(),
+            f"tcp://{config.post_out_bind}:{config.post_out_port}",
             bind=True,
             decoder=lwd_decode_cloud_notify,
         )

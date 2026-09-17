@@ -20,8 +20,10 @@ back-filled from it.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Sequence
+
+from vllm import envs
 
 _VALID_LWD_ROLES = ("edge", "cloud")
 _VALID_LWD_MODES = ("head_tail", "embedding_only", "prefill_only")
@@ -49,6 +51,14 @@ class LwdConfig:
     """Layer distribution mode: "head_tail", "embedding_only" or "prefill_only"."""
     edge_head_tail_layers: tuple[int, int] = (1, 1)
     """Fixed 2-element (head_k, tail_k) asymmetric splits allowed."""
+    pre_out_host: str = "127.0.0.1"
+    pre_out_port: int = 5558
+    post_out_port: int = 5559
+    post_out_bind: str = "*"
+    hello_timeout_s: float = 600.0
+    scheduler_name: str = "prefill_first"
+    publish_queue_max: int = 1000
+    debug: bool = False
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None) -> "LwdConfig":
@@ -57,9 +67,26 @@ class LwdConfig:
             role=str(raw.get("role", "edge")),
             mode=str(raw.get("mode", "head_tail")),
             edge_head_tail_layers=_parse_lwd_layer_split(raw.get("edge_head_tail_layers", [1, 1])),
+            pre_out_host=str(raw.get("pre_out_host", "127.0.0.1")),
+            pre_out_port=int(raw.get("pre_out_port", 5558)),
+            post_out_port=int(raw.get("post_out_port", 5559)),
+            post_out_bind=str(raw.get("post_out_bind", "*")),
+            hello_timeout_s=float(raw.get("hello_timeout_s", 600.0)),
+            scheduler_name=str(raw.get("scheduler", "prefill_first")),
+            publish_queue_max=int(raw.get("publish_queue_max", 1000)),
+            debug=bool(raw.get("debug", False)),
         )
         cfg.validate()
-        return cfg
+        env = {
+            "pre_out_host": envs.VLLM_ASCEND_LWD_PRE_OUT_HOST,
+            "pre_out_port": envs.VLLM_ASCEND_LWD_PRE_OUT_PORT,
+            "post_out_port": envs.VLLM_ASCEND_LWD_POST_OUT_PORT,
+            "post_out_bind": envs.VLLM_ASCEND_LWD_POST_OUT_BIND,
+            "hello_timeout_s": envs.VLLM_ASCEND_LWD_HELLO_TIMEOUT_S,
+            "debug": envs.VLLM_ASCEND_LWD_DEBUG,
+        }
+        env = {k: v for k, v in env.items() if v}
+        return replace(cfg, **env) if env else cfg
 
     @property
     def is_edge(self) -> bool:

@@ -24,7 +24,7 @@ _LWD_PHASE_PREFILL_FIRST = "prefill_first"
 _LWD_PHASE_DECODE_FIRST = "decode_first"
 
 
-class LwdCloudPhaseScheduler(LwdBaseScheduler):
+class LwdCloudScheduler(LwdBaseScheduler):
     """工作纯相位批次策略;相位(prefill_first/decode_first)构造期自解析。
     前置约束:不兼容 spec decode(eagle 会 shift num_computed_tokens,纯度判据失真)。"""
 
@@ -44,17 +44,13 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
         # PREFILL 步消费的间隔与中间插入的 decode 步数)
         self._lwd_sched_step = 0
         logger.info(
-            "[Lwd] cloud phase scheduler: single-request prefill batches "
+            "[Lwd] cloud scheduler: single-request prefill batches "
             "enforced (edge/cloud chunk stream stays per-request contiguous)"
         )
 
     def _lwd_resolve_phase(self) -> bool:
         """返回 True=prefill_first;缺省/未知相位告警回退 prefill_first。"""
-        from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import (
-            LwdConfig,
-        )
-
-        phase = LwdConfig.from_env_and_config(self.vllm_config).scheduler_name
+        phase = self.vllm_config.lwd_config.scheduler_name
         if phase == _LWD_PHASE_DECODE_FIRST:
             return False
         if phase != _LWD_PHASE_PREFILL_FIRST:

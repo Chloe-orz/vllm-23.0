@@ -181,12 +181,6 @@ def run_headless(args: argparse.Namespace):
         usage_context=usage_context, headless=True
     )
 
-    # Lwd prefill-only cloud entry guard: engines self-assemble in-process
-    # (vllm/v1/engine/core.py __init__ tail); runtime base wiring is deferred.
-    from vllm.v1.lwd_control import lwd_serve_guard
-
-    lwd_serve_guard(vllm_config)
-
     if engine_args.data_parallel_hybrid_lb:
         raise ValueError("data_parallel_hybrid_lb is not applicable in headless mode")
 

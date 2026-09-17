@@ -8,9 +8,9 @@ set_debug 置位。调用侧零装配(全类方法),生产路径零输出。
 
 from __future__ import annotations
 
-import os
 import time
 
+from vllm import envs
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -24,7 +24,7 @@ class LwdLogBase:
 
     LAYER = ""
 
-    DEBUG = os.getenv("VLLM_ASCEND_LWD_DEBUG", "0") == "1"
+    DEBUG = envs.VLLM_ASCEND_LWD_DEBUG
 
     @classmethod
     def set_debug(cls, enabled: bool) -> None:

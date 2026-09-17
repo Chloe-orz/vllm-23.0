@@ -29,10 +29,9 @@ from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LwdRequestNotify,
     lwd_encode_cloud_notify,
 )
-from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import LwdConfig
 from vllm.v1.lwd_debug import LwdDebug
-from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_phase_scheduler import (
-    LwdCloudPhaseScheduler,
+from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_scheduler import (
+    LwdCloudScheduler,
 )
 from vllm.v1.request import Request
 
@@ -54,20 +53,19 @@ class LwdCloudEngineCore(EngineCoreProc):
 
     def __init__(self, *args, **kwargs) -> None:
         # 调度器自注入须赶在 super() 之前(与边侧 LwdEdgeEngineCore 同款):
-        # super 构建 self.scheduler 时一次性消费 scheduler_cls,后设无效。
-        # 依赖 lwd_serve_guard 注入不可靠——guard 只在 headless serve 入口
-        # 执行,完整 serve 路径的 EngineCore 子进程不经 guard,缺注入会让
-        # IO 线程把 RangeNotify 写进裸 AsyncScheduler 而崩溃。
+        # super 构建 self.scheduler 时一次性消费 scheduler_cls,后设无效;
+        # 引擎构造是唯一注入点,缺注入会让 IO 线程把 RangeNotify 写进裸
+        # AsyncScheduler 而崩溃。
         vllm_config = kwargs["vllm_config"]
-        vllm_config.scheduler_config.scheduler_cls = LwdCloudPhaseScheduler
+        vllm_config.scheduler_config.scheduler_cls = LwdCloudScheduler
         super().__init__(*args, **kwargs)
 
     def _lwd_setup_zmq(self) -> None:
         """介入 ZMQ 双面:PRE_OUT bind 收边;POST_OUT connect 边,承载首拍
         HELLO 通告与步内元数据。建站失败走 EXECUTOR_FAILED 升级。"""
-        config = LwdConfig.from_env_and_config(self.vllm_config)
+        config = self.vllm_config.lwd_config
         self._lwd_subscriber = LwdControlSubscriber(
-            config.lwd_pre_out_endpoint(), bind=True
+            f"tcp://{config.pre_out_host}:{config.pre_out_port}", bind=True
         )
         master_addr = self.vllm_config.parallel_config.master_addr
         self._lwd_post_out = LwdControlPublisher(
@@ -92,7 +90,7 @@ class LwdCloudEngineCore(EngineCoreProc):
         logger.info(
             "[Lwd] cloud engine assembled: PRE_OUT bind %s, POST_OUT announce -> "
             "%s:%s via master %s",
-            config.lwd_pre_out_endpoint(),
+            f"tcp://{config.pre_out_host}:{config.pre_out_port}",
             config.pre_out_host,
             config.pre_out_port,
             master_addr,

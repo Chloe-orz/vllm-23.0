@@ -15,8 +15,7 @@ from pathlib import Path
 _LWD_FILE_EXCEPTIONS = {
     "lwd_notify.py": (r"from vllm\.v1\.engine import",),
     "lwd_edge_scheduler.py": (r"from vllm\.v1\.request import",),
-    "lwd_cloud_phase_scheduler.py": (r"from vllm\.v1\.request import",),
-    "lwd_edge_assemble.py": (),
+    "lwd_cloud_scheduler.py": (r"from vllm\.v1\.request import",),
     "lwd_cloud_engine.py": (
         r"from vllm\.v1\.core\.kv_cache_utils import",
         r"from vllm\.v1\.request import",
@@ -46,7 +45,7 @@ _LWD_BANNED_IMPORTS = (
 _LWD_SCHED_ONLY_IMPORT = re.compile(
     r"from vllm\.v1\.core\.sched\.(output|async_scheduler|request_queue) import"
 )
-_LWD_SCHEDULER_FILES = {"lwd_edge_scheduler.py", "lwd_cloud_phase_scheduler.py"}
+_LWD_SCHEDULER_FILES = {"lwd_edge_scheduler.py", "lwd_cloud_scheduler.py"}
 _LWD_ENV_PATTERN = re.compile(r"os\.environ|environ\[|os\.getenv")
 _LWD_GETATTR_PATTERN = re.compile(r"getattr\s*\(")
 _LWD_GETATTR_BUDGET = 10
@@ -83,7 +82,6 @@ def check_import_whitelist(lwd_root: Path) -> list[str]:
 
 
 _LWD_GETATTR_TOLERANT_FILES = {
-    "lwd_edge_assemble.py",
     "lwd_cloud_engine.py",
     "lwd_edge_engine.py",
 }
@@ -107,14 +105,12 @@ def check_getattr_budget(lwd_root: Path) -> list[str]:
 
 
 def check_env_parsing(lwd_root: Path) -> list[str]:
-    """内核 os.environ 读取 = 0(唯一入口 LwdConfig.from_env_and_config)。"""
+    """内核 os.environ 读取 = 0(唯一入口 vllm/envs.py,不在本扫描域)。"""
     violations: list[str] = []
     for path in _lwd_iter_files(lwd_root):
-        if path.name == "lwd_edge_assemble.py":
-            continue  # LwdConfig 定义处:唯一 env 入口(§7.3-C3/§10.3)
         if _LWD_ENV_PATTERN.search(path.read_text(encoding="utf-8")):
             violations.append(
-                f"{path.name}: env 解析越权(仅 lwd_edge_assemble.py 允许)"
+                f"{path.name}: env 解析越权(仅 vllm/envs.py 允许)"
             )
     return violations
 
