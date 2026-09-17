@@ -43,6 +43,8 @@ class LwdEmbedBatch:
     # 单边一云缺省 0,行为与原实现一致。
     edge_id: int = 0
     cloud_id: int = 0
+    # Absolute prompt offsets; cloud token_ids contain lengths-only placeholders.
+    token_offsets: list[int] = field(default_factory=list)
 
 
 @dataclass
