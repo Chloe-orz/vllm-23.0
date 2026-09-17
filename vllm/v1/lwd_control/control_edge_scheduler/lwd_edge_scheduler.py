@@ -191,10 +191,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         targets = self._lwd_alive_decode_reqs(notify)
         if not targets:
             return SchedulerOutput.make_empty()
-        arm_deltas = self._lwd_arm_row_debt(notify, targets)
+        row_deltas = self._lwd_reserve_rows(notify, targets)
         out = self._lwd_schedule_for_visible_reqs(targets)
         if not out.num_scheduled_tokens:
-            self._lwd_refund_row_debt(arm_deltas)
+            self._lwd_release_rows(row_deltas)
             self.unembed_notify_queue.appendleft(notify)
             return out
         self._lwd_assert_rows_match_notify(out, notify, targets)
@@ -215,13 +215,13 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             and self._lwd_the_phase_of_req(req) is LwdReqPhase.DECODE
         ]
 
-    def _lwd_arm_row_debt(
+    def _lwd_reserve_rows(
         self, notify: LwdC2eNotify, targets: list[str]
     ) -> dict[str, int]:
-        """把每个目标请求的欠账校准到通告行数(占位欠条加减),返回
+        """把每个目标请求的欠条(占位数)校准到通告行数,返回
         {request_id: 占位增量} 供未准入时全额退还。"""
         rows_by_req = dict(zip(notify.req_ids, notify.num_accepted_tokens))
-        arm_deltas: dict[str, int] = {}
+        row_deltas: dict[str, int] = {}
         for rid in targets:
             request = self.requests[rid]
             owed = (
@@ -231,12 +231,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             )
             delta = rows_by_req[rid] - owed
             request.num_output_placeholders += delta
-            arm_deltas[rid] = delta
-        return arm_deltas
+            row_deltas[rid] = delta
+        return row_deltas
 
-    def _lwd_refund_row_debt(self, arm_deltas: dict[str, int]) -> None:
-        """退还欠账(未准入回退路径,防下次弹同一条通告双重欠账)。"""
-        for rid, delta in arm_deltas.items():
+    def _lwd_release_rows(self, row_deltas: dict[str, int]) -> None:
+        """退还欠条(未准入回退路径,防下次弹同一条通告双重欠账)。"""
+        for rid, delta in row_deltas.items():
             req = self.requests.get(rid)
             if req is not None:
                 req.num_output_placeholders -= delta
