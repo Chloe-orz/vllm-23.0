@@ -882,6 +882,30 @@ class ParallelConfig:
             self.world_size = sum(len(e["ranks"]) for e in _reg["edges"]) + sum(
                 len(c["ranks"]) for c in _reg["clouds"]
             )
+            # torch world rendezvous 也收编到 registry:全员挂载同一份
+            # YAML,world.master_addr/master_port 是天然的全场一致源。
+            # YAML 存在即优先生效(覆盖 CLI/默认值)——三端一致性靠
+            # "读同一文件"保证,而不靠各端 CLI 传参对齐;缺省/缺字段时
+            # 保留 CLI 值并告警(跨机部署必须补齐)。
+            _world = _reg.get("world") or {}
+            if _world.get("master_addr"):
+                if self.master_addr != _world["master_addr"]:
+                    logger.info(
+                        "Lwd role registry overrides master_addr: %s -> %s",
+                        self.master_addr, _world["master_addr"],
+                    )
+                self.master_addr = str(_world["master_addr"])
+                if _world.get("master_port"):
+                    self.master_port = int(_world["master_port"])
+            else:
+                logger.warning(
+                    "Lwd role registry %s has no world.master_addr; falling "
+                    "back to CLI/default master %s:%s. Multi-host edge/cloud "
+                    "deployments MUST set world.master_addr/master_port in "
+                    "the registry (one shared rendezvous for all instances).",
+                    self.lwd_config.role_registry,
+                    self.master_addr, self.master_port,
+                )
         elif (
             self.lwd_config.edge_npu_count > 0
             and self.lwd_config.cloud_npu_count > 0
