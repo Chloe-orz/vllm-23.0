@@ -38,34 +38,18 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self._lwd_setup_zmq()
-        self._subscriber.start(self._lwd_on_message)
-
-    def _lwd_setup_zmq(self) -> None:
-        """建 ZMQ 双面:PRE_OUT bind 收边;POST_OUT connect 边,承载
-        HELLO 通告与步元数据。建站失败即构造失败(fail-fast)。"""
+        self._lwd_setup_planes()
+        # 首拍即通告(边侧可能已 bind 等待);队满不重试,由边侧等待
+        # 超时 fail-fast 兜底
         config = self.lwd_config
-        self._subscriber = LwdControlSubscriber(
-            f"tcp://{config.pre_out_host}:{config.pre_out_port}", bind=True
-        )
-        master_addr = self.vllm_config.parallel_config.master_addr
-        self._publisher = LwdControlPublisher(
-            f"tcp://{master_addr}:{config.post_out_port}",
-            bind=False,
-            encoder=lwd_encode_cloud_notify,
-        )
-        # 步元数据发布面交付调度器(update_from_output 覆写消费)
-        self.scheduler.lwd_cloud_publisher = self._publisher
-        # 首拍即通告(边侧可能已 bind 等待);队满不重试,由边侧
-        # 等待超时 fail-fast 兜底
-        hello = LwdHelloNotify(
+        self._publisher.publish(LwdHelloNotify(
             pre_out_host=config.pre_out_host, pre_out_port=config.pre_out_port
-        )
-        self._publisher.publish(hello)
+        ))
         logger.info(
             "[Lwd][cloud] HELLO announced: pre_out=%s:%s",
             config.pre_out_host, config.pre_out_port,
         )
+        master_addr = self.vllm_config.parallel_config.master_addr
         logger.info(
             "[Lwd] cloud engine assembled: PRE_OUT bind %s, POST_OUT announce -> "
             "%s:%s via master %s",
@@ -73,6 +57,23 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
             config.pre_out_host,
             config.pre_out_port,
             master_addr,
+        )
+
+    def _lwd_build_subscriber(self) -> LwdControlSubscriber:
+        """PRE_OUT bind 收边。"""
+        config = self.lwd_config
+        return LwdControlSubscriber(
+            f"tcp://{config.pre_out_host}:{config.pre_out_port}", bind=True
+        )
+
+    def _lwd_build_publisher(self) -> LwdControlPublisher:
+        """POST_OUT connect 边(master_addr),承载 HELLO 与步元数据。"""
+        config = self.lwd_config
+        master_addr = self.vllm_config.parallel_config.master_addr
+        return LwdControlPublisher(
+            f"tcp://{master_addr}:{config.post_out_port}",
+            bind=False,
+            encoder=lwd_encode_cloud_notify,
         )
 
     def _lwd_on_message(self, msg) -> None:

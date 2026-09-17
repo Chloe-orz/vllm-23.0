@@ -54,7 +54,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
         # prefill 通知队列:边侧范围预告逐条入队,一步弹一条点名
         self.prefill_notify_queue: deque[LwdRangeNotify] = deque()
         # 步元数据发布面(引擎装配后回填);None 期间步输出透传
-        self.lwd_cloud_publisher = None
+        self.lwd_publisher = None
         logger.info(
             "[Lwd] cloud scheduler: single-request prefill batches "
             "enforced (edge/cloud chunk stream stays per-request contiguous)"
@@ -174,7 +174,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
         recv);carrier 缺席或发布面未就绪仅透传。"""
         engine_core_outputs = super().update_from_output(scheduler_output, model_output)
         carrier = getattr(model_output, "lwd_down_carrier", None)
-        if carrier is None or self.lwd_cloud_publisher is None:
+        if carrier is None or self.lwd_publisher is None:
             return engine_core_outputs
         # pinned 布局:[ranks(各段行)..., counts(accepted/请求)..., seg_lens(段长/请求)...]
         pinned, req_ids, hidden_numel, seqno = carrier
@@ -232,8 +232,8 @@ class LwdCloudScheduler(LwdBaseScheduler):
             finish_reasons=finish_reasons,
             down_seqno=meta.down_seqno,
         )
-        while not self.lwd_cloud_publisher.closed:
-            if self.lwd_cloud_publisher.publish(notify):
+        while not self.lwd_publisher.closed:
+            if self.lwd_publisher.publish(notify):
                 logger.info(
                     "[Lwd][cloud-ctrl] publish C2eNotify reqs=%d down_seqno=%s "
                     "finish=%s hidden_elems=%s",

@@ -75,32 +75,36 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         config = self.lwd_config
         # 层日志总开关:env 已开则不动,config 段开则补开(仅本进程)
         LwdLogBase.set_debug(config.debug)
-        # 通信面:bind POST_OUT 订阅面 + 延迟连接的 PRE_OUT 发布面;
-        # 云端点由 HELLO 通告决定(边不预知云地址)
-        # bind POST_OUT 订阅面;云经 master_addr 主动来连
-        self._subscriber = LwdControlSubscriber(
-            f"tcp://{config.post_out_bind}:{config.post_out_port}",
-            bind=True,
-            decoder=lwd_decode_cloud_notify,
-        )
-        self._publisher = LwdControlPublisher(
-            None, bind=False, queue_max=config.publish_queue_max
-        )
+        # HELLO 首拍一次、无重发,不考虑任一侧重启自愈:重启即整组重拉,
+        # 构造期等待是边侧唯一的发现窗口
         self._hello_event = threading.Event()
-        self._subscriber.start(self._lwd_on_message)
+        self._lwd_setup_planes()
         if not self._hello_event.wait(config.hello_timeout_s):
             self._lwd_shutdown_planes()
             raise RuntimeError(
-                f"[Lwd] edge engine init failed: no cloud HELLO within "
+                f"[LWD] edge engine init failed: no cloud HELLO within "
                 f"{config.hello_timeout_s}s on POST_OUT "
                 f"(bind tcp://{config.post_out_bind}:{config.post_out_port}; "
                 f"check cloud master_addr connectivity and POST_OUT port)"
             )
-
-        self.scheduler.lwd_edge_publisher = self._publisher
         logger.info(
             "[Lwd] edge engine assembled: POST_OUT bind %s, PRE_OUT discovered",
             f"tcp://{config.post_out_bind}:{config.post_out_port}",
+        )
+
+    def _lwd_build_subscriber(self) -> LwdControlSubscriber:
+        """bind POST_OUT 订阅面;云经 master_addr 主动来连。"""
+        config = self.lwd_config
+        return LwdControlSubscriber(
+            f"tcp://{config.post_out_bind}:{config.post_out_port}",
+            bind=True,
+            decoder=lwd_decode_cloud_notify,
+        )
+
+    def _lwd_build_publisher(self) -> LwdControlPublisher:
+        """PRE_OUT 延迟连接:端点由 HELLO 通告后 retarget。"""
+        return LwdControlPublisher(
+            None, bind=False, queue_max=self.lwd_config.publish_queue_max
         )
 
     # ------------------------------------------------------------------ #

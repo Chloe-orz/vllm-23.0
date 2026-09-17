@@ -32,12 +32,30 @@ class LwdBaseEngineCore(EngineCoreProc):
         super().__init__(*args, **kwargs)
         self.lwd_config: LwdConfig = kwargs["vllm_config"].lwd_config
 
-    def shutdown(self) -> None:
-        """收发两面关停后走原生(幂等;装配失败路径两面可能未建)。"""
+    def _lwd_setup_planes(self) -> None:
+        """建收发两面,发布面回填调度器,起接收线程;端点/编解码由
+        子类的两个构建钩子指定。"""
+        self._subscriber = self._lwd_build_subscriber()
+        self._publisher = self._lwd_build_publisher()
+        self.scheduler.lwd_publisher = self._publisher
+        self._subscriber.start(self._lwd_on_message)
+
+    def _lwd_build_subscriber(self) -> LwdControlSubscriber:
+        raise NotImplementedError
+
+    def _lwd_build_publisher(self) -> LwdControlPublisher:
+        raise NotImplementedError
+
+    def _lwd_shutdown_planes(self) -> None:
+        """收发两面关停(幂等;装配失败路径两面可能未建)。"""
         if self._subscriber is not None:
             self._subscriber.shutdown()
         if self._publisher is not None:
             self._publisher.shutdown()
+
+    def shutdown(self) -> None:
+        """收发两面关停后走原生(幂等)。"""
+        self._lwd_shutdown_planes()
         super().shutdown()
 
     def _lwd_on_message(self, msg) -> None:

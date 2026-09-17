@@ -66,7 +66,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
     ) -> None:
         """publisher 经构造注入(与调度器同生命周期)。"""
         super().__init__(*args, **kwargs)
-        self.lwd_edge_publisher = publisher
+        self.lwd_publisher = publisher
         self._lwd_seqno = 0
         # 命中必须关(命中会跳过 token 排程,首条 RangeNotify 的
         # offset != 0,云侧首块识别失效);配置级保留使能以产出哈希链
@@ -111,7 +111,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         scheduled = out.num_scheduled_tokens
         if not scheduled:
             return out
-        publisher = self.lwd_edge_publisher
+        publisher = self.lwd_publisher
         for request_id, num_tokens in scheduled.items():
             request = self.requests.get(request_id)
             if request is None:
@@ -310,7 +310,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         prompt 的前缀缓存只能靠边侧哈希链命中;stop 字符串等
         detokenizer 层参数不上 wire)。队满短退避重试,耗尽抛
         RuntimeError 回客户端(请求未入队,云侧零残留)。"""
-        publisher = self.lwd_edge_publisher
+        publisher = self.lwd_publisher
         if publisher is None:
             return
         sp = sampling_params
@@ -353,7 +353,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
     def lwd_edge_abort(self, request_ids: list[str]) -> None:
         """发 LwdAbortNotify;本地清理走原生(请求在三队列内)。"""
-        publisher = self.lwd_edge_publisher
+        publisher = self.lwd_publisher
         for request_id in request_ids:
             if publisher is None:
                 continue
