@@ -95,10 +95,14 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
         开新准入:云侧在途满员(lwd_edge_max_num_seqs_check 为 False)
         时本步空排、新开请求留 waiting 等云侧排水;running 尚有未发完
-        embed 的续传不受闸门约束(先收尾再开新,亦防上限=1 时自锁)。"""
+        embed 的续传不受闸门约束(先收尾再开新,亦防上限=1 时自锁;
+        放行续传的前提是 picker 必然挑中该续传请求而非开新)。"""
         if (
             not self.lwd_edge_max_num_seqs_check()
-            and not self._lwd_has_prefill_chunk_inflight()
+            and not any(
+                self._lwd_the_phase_of_req(req) is LwdReqPhase.PREFILL
+                for req in self.running
+            )
         ):
             return SchedulerOutput.make_empty()
         return self._lwd_schedule_single()
@@ -136,18 +140,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         awaiting 请求已清出调度器,原生准入只数 running(边侧恒≤1)
         永远拦不住;以 running+awaiting 对账云侧在途数,达到
         max_num_running_reqs 即满员。续传豁免不在本判断(schedule
-        闸门经 _lwd_has_prefill_chunk_inflight 放行收尾);请求到达
-        时的 announce 亦不受约束(云只登记不计算)。"""
+        闸门按相位直判放行收尾);请求到达时的 announce 亦不受约束
+        (云只登记不计算)。"""
         return len(self.running) + len(self._lwd_awaiting) < self.max_num_running_reqs
-
-    def _lwd_has_prefill_chunk_inflight(self) -> bool:
-        """running 中是否存在未发完的 embed 请求(续传收尾中)。
-        与 picker 续传分支共用基类相位判据,闸门放行收尾的前提是
-        picker 必然挑中该续传请求而非开新。"""
-        return any(
-            self._lwd_the_phase_of_req(req) is LwdReqPhase.PREFILL
-            for req in self.running
-        )
 
     def lwd_edge_add_request(self, request: Request) -> None:
         """请求入口:边界校验 -> 云预告 -> 本地入队。

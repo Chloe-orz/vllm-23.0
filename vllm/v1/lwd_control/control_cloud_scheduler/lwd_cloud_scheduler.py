@@ -60,33 +60,19 @@ class LwdCloudScheduler(LwdBaseScheduler):
             )
         return True
 
-    def _lwd_has_prefill_tails(self) -> bool:
-        return any(
-            self._lwd_the_phase_of_req(r) is LwdReqPhase.PREFILL
-            for r in self.running
-        )
-
-    def _lwd_has_decode_ready(self) -> bool:
-        return any(
-            self._lwd_the_phase_of_req(r) is LwdReqPhase.DECODE
-            for r in self.running
-        )
-
-    def _lwd_collect_decode_requests(self) -> list[str]:
-        """收集所有 decode 态(prompt 已算完)请求的 req_id。
-
-        按 running/waiting/skipped 顺序遍历三队列,输出可直接作为
-        _lwd_schedule_for_visible_reqs 的入参。"""
-        return [
+    def _schedule_pure_decode(self) -> SchedulerOutput:
+        """纯 decode 步:收集三队列全部 decode 态请求(含被抢占回
+        waiting 的),可见集单独调度。"""
+        req_ids = [
             req.request_id
             for queue in (self.running, self.waiting, self.skipped_waiting)
             for req in queue
             if self._lwd_the_phase_of_req(req) is LwdReqPhase.DECODE
         ]
+        if req_ids:
+            logger.info("[Lwd][cloud-sched] decode reqs=%s", req_ids)
+        return self._lwd_schedule_for_visible_reqs(req_ids)
 
-    # ------------------------------------------------------------------ #
-    # Phase primitives(容器交换;原生 schedule() 零改动)                  #
-    # ------------------------------------------------------------------ #
     def _schedule_pure_prefill(self) -> SchedulerOutput:
         """纯 prefill 步:prefill_notify_queue 有预告则取队首 msg,单独
         调度其请求(按原队列归位,waiting/skipped 来源走原生准入);没有则
@@ -126,29 +112,25 @@ class LwdCloudScheduler(LwdBaseScheduler):
         )
         return out
 
-    def _schedule_pure_decode(self) -> SchedulerOutput:
-        """纯 decode 步:收集全部 decode 态请求,剔除单独调度后按落点拼回。"""
-        req_ids = self._lwd_collect_decode_requests()
-        if req_ids:
-            logger.info("[Lwd][cloud-sched] decode reqs=%s", req_ids)
-        return self._lwd_schedule_for_visible_reqs(req_ids)
-
-    @staticmethod
-    def _is_empty(out: SchedulerOutput) -> bool:
-        return out.total_num_scheduled_tokens == 0
-
-    def _prefer_prefill(self) -> bool:
-        """相位选择:prefill_first 有等待/尾巴即 prefill;
-        decode_first 只要存在纯 decode 活就优先 decode。"""
-        if self._lwd_prefill_first:
-            return bool(self.waiting) or self._lwd_has_prefill_tails()
-        return not self._lwd_has_decode_ready()
-
     def schedule(self) -> SchedulerOutput:
         return self._schedule_impl()
 
     def _schedule_impl(self) -> SchedulerOutput:
-        prefer_prefill = self._prefer_prefill()
+        # 相位工作量直判:prefill 活 = waiting/running 存在 PREFILL 相位
+        # 请求(被抢占回 waiting 的 DECODE 请求不算 prefill 活,由纯
+        # decode 步的三队列收集服务);decode 活 = running 存在 DECODE。
+        has_prefill_work = any(
+            self._lwd_the_phase_of_req(req) is LwdReqPhase.PREFILL
+            for queue in (self.waiting, self.running)
+            for req in queue
+        )
+        has_decode_work = any(
+            self._lwd_the_phase_of_req(req) is LwdReqPhase.DECODE
+            for req in self.running
+        )
+        prefer_prefill = (
+            has_prefill_work if self._lwd_prefill_first else not has_decode_work
+        )
         if self._force_prefill_once:
             self._force_prefill_once = False
             prefer_prefill = True
@@ -163,14 +145,14 @@ class LwdCloudScheduler(LwdBaseScheduler):
 
         if prefer_prefill:
             out = self._schedule_pure_prefill()
-            if self._is_empty(out) and self.running:
+            if not out.total_num_scheduled_tokens and self.running:
                 # prefill 受 KV 压力阻塞:放行空步,下一步转 decode 泄压
                 self._force_decode_once = True
             else:
                 self._last_step_was_prefill = True
             return out
         out = self._schedule_pure_decode()
-        if self._is_empty(out) and (self.waiting or self._lwd_has_prefill_tails()):
-            # decode 无活但有 waiting/尾巴:翻回 prefill(不变量的空步出口)
+        if not out.total_num_scheduled_tokens and has_prefill_work:
+            # decode 无活但有 prefill 活:翻回 prefill(不变量的空步出口)
             self._force_prefill_once = True
         return out
