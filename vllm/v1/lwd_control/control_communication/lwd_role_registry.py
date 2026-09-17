@@ -142,6 +142,16 @@ class LwdRoleRegistry:
         """云端点 rank(= 云 TP0 首卡)。"""
         return self._clouds[cloud_id].ranks[0]
 
+    def cloud_endpoint_rank(self, edge_id: int, cloud_id: int) -> int:
+        """云端点 rank:随 edge_id 在该云各 rank 间轮转。
+
+        edge 0 -> ranks[0], edge 1 -> ranks[1], ... 取模回到 ranks[0],
+        把不同边的跨机 P2P 分摊到云内不同卡,避免全部压在 TP0 首卡。
+        单卡云(单边一云退化域) len(ranks)==1 恒取 ranks[0],与原行为一致。
+        """
+        ranks = self._clouds[cloud_id].ranks
+        return ranks[edge_id % len(ranks)]
+
     def pairs(self) -> list[tuple[int, int]]:
         return [(e, c) for e in self.edge_ids for c in self.cloud_ids]
 
