@@ -87,7 +87,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             None, bind=False, queue_max=config.publish_queue_max
         )
         self._hello_event = threading.Event()
-        self._lwd_start_receiver("lwd-post-in")
+        self._subscriber.start(self._lwd_on_message)
         if not self._hello_event.wait(config.hello_timeout_s):
             self._lwd_shutdown_planes()
             raise RuntimeError(

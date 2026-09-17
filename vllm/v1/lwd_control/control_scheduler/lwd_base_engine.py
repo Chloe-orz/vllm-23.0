@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import threading
 from typing import TYPE_CHECKING
 
 from vllm.v1.engine.core import EngineCoreProc
@@ -15,9 +14,6 @@ from vllm.v1.lwd_control.control_communication.lwd_control_subscriber import (
 
 if TYPE_CHECKING:
     from vllm.config.lwd import LwdConfig
-
-# 接收 recv 超时拍:仅作关停响应上限
-_LWD_RECV_TIMEOUT_MS = 5000
 
 
 class LwdBaseEngineCore(EngineCoreProc):
@@ -44,21 +40,6 @@ class LwdBaseEngineCore(EngineCoreProc):
             self._publisher.shutdown()
         super().shutdown()
 
-    def _lwd_start_receiver(self, name: str) -> None:
-        """起接收线程:循环骨架在基类,closed 退出,消息处理由子类
-        _lwd_on_message 实现。"""
-        threading.Thread(
-            target=self._lwd_receive_loop, daemon=True, name=name
-        ).start()
-
-    def _lwd_receive_loop(self) -> None:
-        while True:
-            msg = self._subscriber.recv(timeout_ms=_LWD_RECV_TIMEOUT_MS)
-            if msg is None:
-                if self._subscriber.closed:
-                    break
-                continue
-            self._lwd_on_message(msg)
-
     def _lwd_on_message(self, msg) -> None:
+        """接收线程消息路由钩子(循环骨架与线程在 Subscriber.start)。"""
         raise NotImplementedError

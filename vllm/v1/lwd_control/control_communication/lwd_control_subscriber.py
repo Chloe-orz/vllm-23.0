@@ -1,8 +1,10 @@
-"""传输层方向原语:INBOUND 订阅端(side-agnostic);无线程,阻塞 recv 由调用方
-线程驱动,收到即解码(坏包丢弃),关停返回 None;decoder 经构造注入。"""
+"""传输层方向原语:INBOUND 订阅端(side-agnostic);收到即解码(坏包丢弃),
+关停返回 None;decoder 经构造注入。可经 start(handler) 起自有接收线程
+(消息路由由 handler 承担),不 start 则由调用方线程驱动 recv。"""
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
 from typing import Any
 
@@ -19,6 +21,9 @@ from vllm.v1.lwd_control.control_communication.lwd_notify import (
 
 logger = init_logger(__name__)
 
+# 接收 recv 超时拍:仅作关停响应上限
+_LWD_RECV_TIMEOUT_MS = 5000
+
 
 class LwdControlSubscriber:
     """控制面订阅端;recv 超时与关停都返回 None,以 closed 属性区分,
@@ -34,6 +39,24 @@ class LwdControlSubscriber:
         self._closed = False
         self._decoder = decoder
         self._socket = LwdControlCommunicator(endpoint, zmq.PULL, bind=bind)
+
+    def start(self, handler: Callable[[Any], None]) -> None:
+        """起接收线程(lwd-subscriber):循环 recv,消息交 handler 路由,
+        closed 退出。显式启动而非构造自启:handler 通常引用引擎侧状态
+        (发布面/调度器),须待其就绪。"""
+        threading.Thread(
+            target=self._recv_loop, args=(handler,), daemon=True,
+            name="lwd-subscriber",
+        ).start()
+
+    def _recv_loop(self, handler: Callable[[Any], None]) -> None:
+        while True:
+            msg = self.recv(timeout_ms=_LWD_RECV_TIMEOUT_MS)
+            if msg is None:
+                if self._closed:
+                    break
+                continue
+            handler(msg)
 
     @property
     def closed(self) -> bool:

@@ -39,7 +39,7 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._lwd_setup_zmq()
-        self._lwd_start_receiver("lwd-pre-out")
+        self._subscriber.start(self._lwd_on_message)
 
     def _lwd_setup_zmq(self) -> None:
         """建 ZMQ 双面:PRE_OUT bind 收边;POST_OUT connect 边,承载
