@@ -26,7 +26,9 @@ from vllm.v1.core.sched.output import (
     LwdUnembedBatch,
     SchedulerOutput,
 )
+from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
+    LWD_NOT_FINISHED,
     LwdAbortNotify,
     LwdC2eNotify,
     LwdRangeNotify,
@@ -50,6 +52,13 @@ logger = init_logger(__name__)
 # add 预告发布重试:次数 x 递增间隔(共约 3s),耗尽即请求级报错
 _LWD_ADD_RETRY_STEPS = 5
 _LWD_ADD_RETRY_INTERVAL_S = 0.2
+
+# 云侧完成码 -> 边侧内部终态(前端拿到的 reason 走输出通道,不用此映射)
+_LWD_FINISH_STATUS = {
+    FinishReason.LENGTH: RequestStatus.FINISHED_LENGTH_CAPPED,
+    FinishReason.ABORT: RequestStatus.FINISHED_ABORTED,
+    FinishReason.ERROR: RequestStatus.FINISHED_ABORTED,
+}
 
 
 class LwdEdgeScheduler(LwdBaseScheduler):
@@ -79,58 +88,25 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # decode 通告队列:云侧步元数据(C2eNotify)逐条入队,decode 步
         # 弹队首点名其请求(跨线程单操作原子:接收线程 append/主步
         # popleft);一步一条,行集与通告严格对齐
-        self.decode_notify_queue: deque[LwdC2eNotify] = deque()
-        # One-shot 翻转与禁连续 prefill 不变量(与云侧同款镜像簿记)
-        self._force_prefill_once: bool = False
-        self._force_decode_once: bool = False
-        self._last_step_was_prefill: bool = False
+        self.unembed_notify_queue: deque[LwdC2eNotify] = deque()
 
     def _lwd_select_phase(self) -> LwdReqPhase | None:
-        """embed 优先的相位选择(镜像云侧簿记)。
+        """embed 优先直判(与旧引擎步序同语义):有 prefill 活走 prefill,
+        否则看 unembed 通告,皆无返回 None(空排)。
 
-        prefill 活 = running 有未发完的续传(不受闸门约束,先收尾再开新,
-        亦防上限=1 时自锁)或水位有余且 waiting 非空;decode 活 = 云侧
-        c2e 通告在队。无活返回 None(空排)。"""
+        不做云侧的禁连续 prefill/强制翻转,原因见云侧对照:云侧 decode
+        活本地自产、两相位随时有活,不变量防 prefill 独占;边侧 decode
+        活要等本请求全部 chunk 发完云侧才产,不变量会把 chunk 发送本身
+        拦死(单请求多 chunk 死锁)。"""
         has_prefill_work = any(
             self._lwd_the_phase_of_req(req) is LwdReqPhase.PREFILL
             for req in self.running
         ) or (self.lwd_edge_max_num_seqs_check() and bool(self.waiting))
-        prefer_prefill = has_prefill_work
-        if self._force_prefill_once:
-            self._force_prefill_once = False
-            prefer_prefill = True
-        elif self._force_decode_once:
-            self._force_decode_once = False
-            prefer_prefill = False
-        # 不变量(与云侧同款):prefill 不连续执行两步,防连续 chunk
-        # 挤占 decode 交付;空 decode 步经 _force_prefill_once 翻回。
-        if prefer_prefill and self._last_step_was_prefill and self.running:
-            prefer_prefill = False
-        if prefer_prefill:
+        if has_prefill_work:
             return LwdReqPhase.PREFILL
-        if self.decode_notify_queue:
+        if self.unembed_notify_queue:
             return LwdReqPhase.DECODE
         return None
-
-    def _lwd_after_phase(
-        self, phase: LwdReqPhase, out: SchedulerOutput
-    ) -> None:
-        """空步翻转与禁连续 prefill 簿记(镜像云侧)。"""
-        if phase is LwdReqPhase.PREFILL:
-            if not out.total_num_scheduled_tokens and self.running:
-                self._force_decode_once = True
-            else:
-                self._last_step_was_prefill = True
-            return
-        self._last_step_was_prefill = False
-        if not out.total_num_scheduled_tokens and (
-            bool(self.waiting)
-            or any(
-                self._lwd_the_phase_of_req(req) is LwdReqPhase.PREFILL
-                for req in self.running
-            )
-        ):
-            self._force_prefill_once = True
 
     def _lwd_pick_prefill_req_id(self) -> str | None:
         """选下一步 embed 工作单元:running 中第一个未发完的 prefill
@@ -201,54 +177,92 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         return out
 
     def schedule_decode(self) -> SchedulerOutput:
-        """纯 decode 步(输出位置阶段):弹一条 c2e 点名,arm 欠账后经
-        可见集调度,行数与通告逐请求对齐后挂 UNEMBED 批。
+        """纯 decode 步(输出位置阶段):弹一条 unembed 通告点名请求,
+        校准欠账后经可见集调度,行数对齐挂 UNEMBED 批。
 
-        arm = 把每请求的待算行数(占位欠账)校准到 c2e 的行数:原生
-        RUNNING 循环按欠账排 n 行,worker 收 DOWN hidden 做 unembed,
-        真实 token 由原生 update_from_output 入账销欠。行数欠账由
-        c2e 收据决定(边侧不自产 token、不预支未来);全部未准入时
-        还原欠账、通告回塞队首重试;部分排程 = DOWN 行无法对齐,
-        fail-loud。迟到行交给原生跳过,通告批保留全量行集(worker
-        按 DOWN 张量实际到达的行切分,recv 尺寸以整条通告为准)。"""
-        notify = q.popleft() if (q := self.decode_notify_queue) else None
+        欠账(占位数)是"这请求有 n 行活要算"的账面表达,由通告收据
+        设定(边侧不自产 token);原生 RUNNING 循环按欠账排 n 行,worker
+        收 DOWN hidden 做 unembed,真实 token 由原生 update_from_output
+        入账销欠。全部迟到则丢弃通告;全部未准入则还原欠账、通告回塞
+        重试;部分排程 = DOWN 行无法对齐,fail-loud。"""
+        notify = self._lwd_pop_unembed_notify()
         if notify is None:
             return SchedulerOutput.make_empty()
-        rows = dict(zip(notify.req_ids, notify.num_accepted_tokens))
-        live = [
+        targets = self._lwd_alive_decode_reqs(notify)
+        if not targets:
+            return SchedulerOutput.make_empty()
+        arm_deltas = self._lwd_arm_row_debt(notify, targets)
+        out = self._lwd_schedule_for_visible_reqs(targets)
+        if not out.num_scheduled_tokens:
+            self._lwd_refund_row_debt(arm_deltas)
+            self.unembed_notify_queue.appendleft(notify)
+            return out
+        self._lwd_assert_rows_match_notify(out, notify, targets)
+        self._lwd_attach_unembed_batch(out, notify)
+        return out
+
+    def _lwd_pop_unembed_notify(self) -> LwdC2eNotify | None:
+        """弹队首通告;空队返回 None。"""
+        return q.popleft() if (q := self.unembed_notify_queue) else None
+
+    def _lwd_alive_decode_reqs(self, notify: LwdC2eNotify) -> list[str]:
+        """通告里仍可调度的请求:存在、未终结、处于 decode 相位。
+        其余(已 abort/已原生终结的)行交给收割期原生跳过,不影响
+        worker 的 DOWN 行切分(批仍带全量通告行集)。"""
+        return [
             rid for rid in notify.req_ids
             if (req := self.requests.get(rid)) is not None
             and self._lwd_the_phase_of_req(req) is LwdReqPhase.DECODE
         ]
-        if not live:
-            return SchedulerOutput.make_empty()
-        armed: dict[str, int] = {}
-        for rid in live:
+
+    def _lwd_arm_row_debt(
+        self, notify: LwdC2eNotify, targets: list[str]
+    ) -> dict[str, int]:
+        """把每个目标请求的欠账校准到通告行数(占位欠条加减),返回
+        {request_id: 占位增量} 供未准入时全额退还。"""
+        rows_by_req = dict(zip(notify.req_ids, notify.num_accepted_tokens))
+        arm_deltas: dict[str, int] = {}
+        for rid in targets:
             request = self.requests[rid]
-            cur = (
+            owed = (
                 request.num_tokens_with_spec
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
-            delta = rows[rid] - cur
+            delta = rows_by_req[rid] - owed
             request.num_output_placeholders += delta
-            armed[rid] = delta
-        out = self._lwd_schedule_for_visible_reqs(live)
+            arm_deltas[rid] = delta
+        return arm_deltas
+
+    def _lwd_refund_row_debt(self, arm_deltas: dict[str, int]) -> None:
+        """退还欠账(未准入回退路径,防下次弹同一条通告双重欠账)。"""
+        for rid, delta in arm_deltas.items():
+            req = self.requests.get(rid)
+            if req is not None:
+                req.num_output_placeholders -= delta
+
+    @staticmethod
+    def _lwd_assert_rows_match_notify(
+        out: SchedulerOutput, notify: LwdC2eNotify, targets: list[str]
+    ) -> None:
+        """排程行集/行数必须与通告的目标集逐请求相等(迟到行不参与
+        排程):部分排程会让 worker 的 DOWN 行切分错位,当场报错。"""
+        rows_by_req = dict(zip(notify.req_ids, notify.num_accepted_tokens))
         scheduled = out.num_scheduled_tokens
-        if not scheduled:
-            for rid, delta in armed.items():
-                req = self.requests.get(rid)
-                if req is not None:
-                    req.num_output_placeholders -= delta
-            self.decode_notify_queue.appendleft(notify)
-            return out
-        if set(scheduled) != set(live) or any(
-            scheduled[rid] != rows[rid] for rid in scheduled
+        if set(scheduled) != set(targets) or any(
+            scheduled[rid] != rows_by_req[rid] for rid in targets
         ):
             raise RuntimeError(
                 f"[LWD] edge decode batch mismatch vs c2e: "
-                f"scheduled={dict(scheduled)} notify={rows}"
+                f"scheduled={dict(scheduled)} notify={rows_by_req}"
             )
+
+    @staticmethod
+    def _lwd_attach_unembed_batch(
+        out: SchedulerOutput, notify: LwdC2eNotify
+    ) -> None:
+        """挂 UNEMBED 批:行集取全量通告(worker 按 DOWN 张量实际到达
+        的行切分,recv 尺寸以整条通告为准),迟到行收割期原生跳过。"""
         out.lwd_batch = LwdBatch(
             batch_type=LwdBatchType.LWD_UNEMBED,
             seqno=notify.down_seqno,
@@ -261,7 +275,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             ),
         )
         out.lwd_c2e_notify = [notify]
-        return out
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         """原生排程后抑制 decode 行的自动 +1 占位:边侧不自产 token,
@@ -272,6 +285,40 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             request = self.requests.get(req_id)
             if request is not None and not request.is_prefill_chunk:
                 request.num_output_placeholders -= 1
+
+    def update_from_output(
+        self, scheduler_output: SchedulerOutput, model_output
+    ) -> dict[int, EngineCoreOutputs]:
+        """原生入账后消费云侧完成码(云侧权威的兜底终结)。
+
+        本批 token 已交付(含云侧判停请求的最后几行——所以终结必须在
+        super() 之后、且批仍需执行,跳过执行 = 丢最后 token)。云侧判停
+        而原生 check_stop 未触发的请求(如惩罚类停止)在此强制终结并
+        补一条带完成码的空输出,防云侧停发后请求挂死占名额;原生已停/
+        迟到的请求 requests 里已移除,自然跳过。"""
+        engine_core_outputs = super().update_from_output(
+            scheduler_output, model_output
+        )
+        for notify in getattr(scheduler_output, "lwd_c2e_notify", None) or ():
+            for rid, code in zip(notify.req_ids, notify.finish_reasons):
+                if code == LWD_NOT_FINISHED:
+                    continue
+                request = self.requests.get(rid)
+                if request is None or request.is_finished():
+                    continue
+                reason = FinishReason(code)
+                self.finish_requests(
+                    [rid], _LWD_FINISH_STATUS.get(
+                        reason, RequestStatus.FINISHED_STOPPED
+                    )
+                )
+                outputs = engine_core_outputs.setdefault(
+                    request.client_index, EngineCoreOutputs()
+                )
+                outputs.outputs.append(
+                    EngineCoreOutput(rid, [], finish_reason=reason)
+                )
+        return engine_core_outputs
 
     def lwd_edge_max_num_seqs_check(self) -> bool:
         """max_num_seqs 水位:running 是否还有名额,True=可开新请求。
@@ -380,23 +427,14 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
     @staticmethod
     def _lwd_validate_request(request: Request) -> None:
-        """模式边界校验;违规抛 ValueError,在入队之前拒绝,错误经
-        add_request 调用链回到客户端 error 路径。
-
-        边界 = 边侧能力面:边是 embedding 属主(拒绝客户端自带
-        prompt_embeds),只处理纯文本补全(拒 pooling/结构化
-        输出),prompt 非空;不上 wire 的采样参数(logit_bias/
-        allowed_token_ids/logprobs)缺省即拒,不静默丢约束。"""
+        """模式边界校验(入队前拒绝,错误回客户端):拒客户端自带
+        prompt_embeds(边是 embedding 属主)、拒结构化输出、拒不上
+        wire 的采样参数——后两者不拒会被云侧静默忽略,输出悄悄错。"""
         if request.prompt_embeds is not None:
             raise ValueError(
                 f"[LWD] prefill-only mode does not accept client-provided "
                 f"prompt_embeds (request {request.request_id}); the edge "
                 "is the embedding owner"
-            )
-        if request.pooling_params is not None:
-            raise ValueError(
-                "[LWD] prefill-only mode does not support pooling requests "
-                f"(request {request.request_id})"
             )
         if request.use_structured_output:
             raise ValueError(

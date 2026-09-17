@@ -14,7 +14,10 @@ from pathlib import Path
 # 台账例外:文件名 -> 允许的额外 import 片段(正则);布局依 §10.3/§10.7
 _LWD_FILE_EXCEPTIONS = {
     "lwd_notify.py": (r"from vllm\.v1\.engine import",),
-    "lwd_edge_scheduler.py": (r"from vllm\.v1\.request import",),
+    "lwd_edge_scheduler.py": (
+        r"from vllm\.v1\.request import",
+        r"from vllm\.v1\.engine import",
+    ),
     "lwd_cloud_scheduler.py": (
         r"from vllm\.v1\.engine import",
         r"from vllm\.v1\.outputs import",
@@ -90,8 +93,10 @@ def check_import_whitelist(lwd_root: Path) -> list[str]:
 
 
 _LWD_GETATTR_TOLERANT_FILES = {
-    # update_from_output 嗅探 worker 动态挂载的 lwd_down_carrier
+    # 云:update_from_output 嗅探 worker 动态挂载的 lwd_down_carrier;
+    # 边:update_from_output 嗅探 schedule_decode 动态挂的 lwd_c2e_notify
     "lwd_cloud_scheduler.py",
+    "lwd_edge_scheduler.py",
     "lwd_cloud_engine.py",
     "lwd_edge_engine.py",
 }

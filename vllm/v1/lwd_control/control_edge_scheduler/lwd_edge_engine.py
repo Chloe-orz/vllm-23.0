@@ -21,7 +21,7 @@
 步进全走父类(core.py step / step_with_batch_queue):调度器相位模板
 出批并自带载荷(EMBED 批在 schedule_prefill 内发布 RangeNotify 后挂载,
 UNEMBED 批在 schedule_decode 内挂 c2e 载荷),收割与 update_from_output
-均原生。c2e 通告由接收线程直入调度器 decode_notify_queue,WAKEUP 唤醒
+均原生。c2e 通告由接收线程直入调度器 unembed_notify_queue,WAKEUP 唤醒
 主循环;异步调度深度由原生 batch_queue 机制承担。
 """
 
@@ -151,7 +151,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 )
                 # decode 通告入调度器队列(decode 步弹队首点名);
                 # WAKEUP 打断主循环的阻塞 get
-                self.scheduler.decode_notify_queue.append(msg)
+                self.scheduler.unembed_notify_queue.append(msg)
                 self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
             else:
                 logger.warning("[Lwd] drop unexpected POST_OUT frame %r", type(msg))
