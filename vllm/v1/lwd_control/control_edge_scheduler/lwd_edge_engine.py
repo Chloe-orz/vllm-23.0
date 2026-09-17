@@ -83,8 +83,8 @@ class LwdEdgeEngineCore(EngineCoreProc):
         LwdLogBase.set_debug(config.debug)
         # 通信面:bind POST_OUT 订阅面 + 延迟连接的 PRE_OUT 发布面;
         # 云端点由 HELLO 通告决定(边不预知云地址)
-        self._edge_receiver = self._lwd_build_post_out(config)
-        self._edge_sender = LwdControlPublisher(
+        self._subscriber = self._lwd_build_post_out(config)
+        self._publisher = LwdControlPublisher(
             None, bind=False, queue_max=config.publish_queue_max
         )
         hello_event = threading.Event()
@@ -104,7 +104,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 f"check cloud master_addr connectivity and POST_OUT port)"
             )
 
-        self.scheduler.lwd_edge_publisher = self._edge_sender
+        self.scheduler.lwd_edge_publisher = self._publisher
         logger.info(
             "[Lwd] edge engine assembled: POST_OUT bind %s, PRE_OUT discovered",
             f"tcp://{config.post_out_bind}:{config.post_out_port}",
@@ -134,8 +134,8 @@ class LwdEdgeEngineCore(EngineCoreProc):
         消息体,数据与唤醒分离,多投无害(空 drain 一步即返回)。
         其余帧(坏帧已被订阅层丢弃后仍不认识的类型)告警丢弃。
         """
-        receiver = self._edge_receiver
-        publisher = self._edge_sender
+        receiver = self._subscriber
+        publisher = self._publisher
         while not receiver.closed:
             msg = receiver.recv(timeout_ms=5000)
             if msg is None:
@@ -168,10 +168,10 @@ class LwdEdgeEngineCore(EngineCoreProc):
 
     def _lwd_shutdown_planes(self) -> None:
         """两面关停(幂等):receiver 先关断输入,publisher 收尾。"""
-        receiver = getattr(self, "_edge_receiver", None)
+        receiver = getattr(self, "_subscriber", None)
         if receiver is not None:
             receiver.shutdown()
-        publisher = getattr(self, "_edge_sender", None)
+        publisher = getattr(self, "_publisher", None)
         if publisher is not None:
             publisher.shutdown()
 

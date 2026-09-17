@@ -54,17 +54,17 @@ class LwdCloudEngineCore(EngineCoreProc):
         """建 ZMQ 双面:PRE_OUT bind 收边;POST_OUT connect 边,承载
         HELLO 通告与步元数据。建站失败即构造失败(fail-fast)。"""
         config = self.vllm_config.lwd_config
-        self._lwd_subscriber = LwdControlSubscriber(
+        self._subscriber = LwdControlSubscriber(
             f"tcp://{config.pre_out_host}:{config.pre_out_port}", bind=True
         )
         master_addr = self.vllm_config.parallel_config.master_addr
-        self._lwd_post_out = LwdControlPublisher(
+        self._publisher = LwdControlPublisher(
             f"tcp://{master_addr}:{config.post_out_port}",
             bind=False,
             encoder=lwd_encode_cloud_notify,
         )
         # 步元数据发布面交付调度器(update_from_output 覆写消费)
-        self.scheduler.lwd_cloud_publisher = self._lwd_post_out
+        self.scheduler.lwd_cloud_publisher = self._publisher
         self._lwd_hello = LwdHelloNotify(
             pre_out_host=config.pre_out_host, pre_out_port=config.pre_out_port
         )
@@ -85,16 +85,16 @@ class LwdCloudEngineCore(EngineCoreProc):
         """PRE_OUT 接收循环(本线程独占 recv;socket 构造期建立后移交,
         与边侧同款模式)。recv 超时拍仅作关停响应上限,closed 退出。"""
         while True:
-            msg = self._lwd_subscriber.recv(timeout_ms=LWD_PRE_OUT_RECV_TIMEOUT_MS)
+            msg = self._subscriber.recv(timeout_ms=LWD_PRE_OUT_RECV_TIMEOUT_MS)
             if msg is None:
-                if self._lwd_subscriber.closed:
+                if self._subscriber.closed:
                     break
                 continue
             self._lwd_dispatch(msg)
 
     def _lwd_announce(self) -> None:
         """首拍 HELLO 通告一次;队满不重试,由边侧等待超时 fail-fast 兜底。"""
-        self._lwd_post_out.publish(self._lwd_hello)
+        self._publisher.publish(self._lwd_hello)
         logger.info(
             "[Lwd][cloud] HELLO announced: pre_out=%s:%s",
             self._lwd_hello.pre_out_host, self._lwd_hello.pre_out_port,
@@ -102,10 +102,10 @@ class LwdCloudEngineCore(EngineCoreProc):
 
     def shutdown(self) -> None:
         """两面关停后走原生(幂等;装配失败路径两面可能未建,容忍缺省)。"""
-        subscriber = getattr(self, "_lwd_subscriber", None)
+        subscriber = getattr(self, "_subscriber", None)
         if subscriber is not None:
             subscriber.shutdown()
-        publisher = getattr(self, "_lwd_post_out", None)
+        publisher = getattr(self, "_publisher", None)
         if publisher is not None:
             publisher.shutdown()
         super().shutdown()
