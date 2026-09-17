@@ -156,13 +156,13 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         targets = self._lwd_decode_targets(notify)
         if not targets:
             return SchedulerOutput.make_empty()
-        adjustments = self._lwd_reserve_reqs_state(notify, targets)
+        saved = self._lwd_set_pending_tokens(notify, targets)
         out = self._lwd_schedule_for_visible_reqs(targets)
         if not out.num_scheduled_tokens:
-            self._lwd_release_reqs_state(adjustments)
+            self._lwd_restore_pending_tokens(saved)
             self.unembed_notify_queue.appendleft(notify)
             return out
-        self._lwd_assert_rows_match_notify(out, notify, targets)
+        self._lwd_assert_tokens_match_notify(out, notify, targets)
         self._lwd_attach_unembed_batch(out, notify)
         return out
 
@@ -179,46 +179,45 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             and self._lwd_the_phase_of_req(req) is LwdReqPhase.DECODE
         ]
 
-    def _lwd_reserve_reqs_state(
+    def _lwd_set_pending_tokens(
         self, notify: LwdC2eNotify, targets: list[str]
     ) -> dict[str, int]:
-        """把目标请求的待算行数(占位欠条)校准到通告行数,返回
-        {request_id: 调整量} 供未准入时回退。"""
-        rows_by_req = dict(zip(notify.req_ids, notify.num_accepted_tokens))
-        adjustments: dict[str, int] = {}
+        """登记"本步每请求待产出 token 数":把占位数设为使账面差
+        (num_tokens_with_spec + 占位 - computed)恰等于通告的
+        num_accepted_tokens;返回原占位值供未准入时恢复。"""
+        tokens_by_req = dict(zip(notify.req_ids, notify.num_accepted_tokens))
+        saved: dict[str, int] = {}
         for rid in targets:
             request = self.requests[rid]
-            pending_rows = (
-                request.num_tokens_with_spec
-                + request.num_output_placeholders
-                - request.num_computed_tokens
+            saved[rid] = request.num_output_placeholders
+            request.num_output_placeholders = (
+                tokens_by_req[rid]
+                + request.num_computed_tokens
+                - request.num_tokens_with_spec
             )
-            adjustment = rows_by_req[rid] - pending_rows
-            request.num_output_placeholders += adjustment
-            adjustments[rid] = adjustment
-        return adjustments
+        return saved
 
-    def _lwd_release_reqs_state(self, adjustments: dict[str, int]) -> None:
-        """回退占位欠条(未准入路径,防同条通告双重欠账)。"""
-        for rid, adjustment in adjustments.items():
+    def _lwd_restore_pending_tokens(self, saved: dict[str, int]) -> None:
+        """恢复登记前的占位值(未准入回退,防同条通告重复登记)。"""
+        for rid, placeholders in saved.items():
             req = self.requests.get(rid)
             if req is not None:
-                req.num_output_placeholders -= adjustment
+                req.num_output_placeholders = placeholders
 
     @staticmethod
-    def _lwd_assert_rows_match_notify(
+    def _lwd_assert_tokens_match_notify(
         out: SchedulerOutput, notify: LwdC2eNotify, targets: list[str]
     ) -> None:
-        """排程行集/行数须与通告目标集逐请求相等,否则 worker 的
-        DOWN 行切分错位,当场报错。"""
-        rows_by_req = dict(zip(notify.req_ids, notify.num_accepted_tokens))
+        """本步排程的 token 数须与通告逐请求相等,否则 worker 的
+        DOWN 数据切分错位,当场报错。"""
+        tokens_by_req = dict(zip(notify.req_ids, notify.num_accepted_tokens))
         scheduled = out.num_scheduled_tokens
         if set(scheduled) != set(targets) or any(
-            scheduled[rid] != rows_by_req[rid] for rid in targets
+            scheduled[rid] != tokens_by_req[rid] for rid in targets
         ):
             raise RuntimeError(
                 f"[LWD] edge decode batch mismatch vs c2e: "
-                f"scheduled={dict(scheduled)} notify={rows_by_req}"
+                f"scheduled={dict(scheduled)} notify={tokens_by_req}"
             )
 
     @staticmethod
