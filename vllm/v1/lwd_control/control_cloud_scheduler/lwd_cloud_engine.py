@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import threading
 
 import torch
 
@@ -32,10 +31,6 @@ from vllm.v1.request import Request
 
 logger = init_logger(__name__)
 
-# PRE_OUT recv 超时拍:仅作关停响应上限(HELLO 首拍一次,无重发)
-LWD_PRE_OUT_RECV_TIMEOUT_MS = 5000
-
-
 class LwdCloudEngineCore(LwdBaseEngineCore):
     """云 PO 引擎:构造期建 ZMQ 双面 + 起 PRE_OUT 接收线程,其余全走原生。"""
 
@@ -44,9 +39,7 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._lwd_setup_zmq()
-        threading.Thread(
-            target=self._lwd_pre_out_loop, daemon=True, name="lwd-pre-out"
-        ).start()
+        self._lwd_start_receiver("lwd-pre-out")
 
     def _lwd_setup_zmq(self) -> None:
         """建 ZMQ 双面:PRE_OUT bind 收边;POST_OUT connect 边,承载
@@ -73,8 +66,6 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
             "[Lwd][cloud] HELLO announced: pre_out=%s:%s",
             config.pre_out_host, config.pre_out_port,
         )
-        # 门池:元数据查重与暂存,到达即构建放行;仅接收线程独占
-        self._lwd_gate_pending: dict[str, LwdRequestNotify] = {}
         logger.info(
             "[Lwd] cloud engine assembled: PRE_OUT bind %s, POST_OUT announce -> "
             "%s:%s via master %s",
@@ -84,52 +75,27 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
             master_addr,
         )
 
-    def _lwd_pre_out_loop(self) -> None:
-        """PRE_OUT 接收循环(本线程独占 recv;socket 构造期建立后移交,
-        与边侧同款模式)。recv 超时拍仅作关停响应上限,closed 退出。"""
-        while True:
-            msg = self._subscriber.recv(timeout_ms=LWD_PRE_OUT_RECV_TIMEOUT_MS)
-            if msg is None:
-                if self._subscriber.closed:
-                    break
-                continue
-            self._lwd_dispatch(msg)
-
-    def _lwd_dispatch(self, msg) -> None:
-        """PRE_OUT 三类分派(本 IO 线程):元数据转 Request / abort 终结 /
-        范围预告入队。"""
+    def _lwd_on_message(self, msg) -> None:
+        """PRE_OUT 三类分派:范围预告入调度器队列 / abort 终结 /
+        元数据即时建 Request 投 ADD(重复元数据不会到达:发布重试仅
+        发生在未入队时)。"""
         if isinstance(msg, LwdRangeNotify):
             logger.info(
                 "[Lwd][cloud-ctrl] RangeNotify req=%s num=%s seqno=%s",
                 msg.request_id, msg.num_tokens, msg.seqno,
             )
-            # 每条预告都整条入队(重复预告即重复点名,剔除-调度-拼回幂等,
-            # 无副作用;PRE_OUT 只 append,调度主线程单独 popleft,deque
-            # 单操作原子;预告自带 seqno,出批时作 UP 链配对号)
+            # 整条入队,一步一条点名;预告自带 seqno 即 UP 链配对号
             self.scheduler.prefill_notify_queue.append(msg)
             return
         if isinstance(msg, LwdAbortNotify):
             logger.info("[Lwd][cloud-ctrl] AbortNotify req=%s", msg.request_id)
-            self._lwd_gate_pending.pop(msg.request_id, None)
             # 双队列与原生 ABORT 同款:eager 处理 + 保持 input_queue 次序
             self.aborts_queue.put_nowait([msg.request_id])
             self.input_queue.put_nowait((EngineCoreRequestType.ABORT, [msg.request_id]))
             return
-        rid = msg.request_id
-        if rid in self._lwd_gate_pending:
-            logger.warning("[Lwd] duplicate request metadata %s ignored", rid)
-            return
-        logger.info("[Lwd][cloud-ctrl] RequestNotify req=%s", rid)
-        self._lwd_gate_pending[rid] = msg
-        self._lwd_promote(rid)
-
-    def _lwd_promote(self, request_id: str) -> None:
-        """过门:门池取 wire,转 Request 投 input_queue 走原生 ADD 分发。"""
-        wire = self._lwd_gate_pending.pop(request_id, None)
-        if wire is not None:
-            request = self._lwd_build_request(wire)
-            self.input_queue.put_nowait((EngineCoreRequestType.ADD, (request, 0)))
-            logger.info("[Lwd] cloud request %s admitted via gate", request_id)
+        logger.info("[Lwd][cloud-ctrl] RequestNotify req=%s", msg.request_id)
+        request = self._lwd_build_request(msg)
+        self.input_queue.put_nowait((EngineCoreRequestType.ADD, (request, 0)))
 
     def _lwd_build_request(self, wire: LwdRequestNotify) -> Request:
         """请求构建(唯一建请求点,Request/SamplingParams 留 L3)。

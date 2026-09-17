@@ -86,15 +86,9 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         self._publisher = LwdControlPublisher(
             None, bind=False, queue_max=config.publish_queue_max
         )
-        hello_event = threading.Event()
-        discovery = threading.Thread(
-            target=self._receive_thread,
-            args=(hello_event,),
-            name="lwd-post-in",
-            daemon=True,
-        )
-        discovery.start()
-        if not hello_event.wait(config.hello_timeout_s):
+        self._hello_event = threading.Event()
+        self._lwd_start_receiver("lwd-post-in")
+        if not self._hello_event.wait(config.hello_timeout_s):
             self._lwd_shutdown_planes()
             raise RuntimeError(
                 f"[Lwd] edge engine init failed: no cloud HELLO within "
@@ -112,54 +106,37 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     # ------------------------------------------------------------------ #
     # 通信面                                                              #
     # ------------------------------------------------------------------ #
-    def _receive_thread(self, hello_event: threading.Event) -> None:
-        """POST_OUT 接收线程体,按消息类型分发。
+    def _lwd_on_message(self, msg) -> None:
+        """云消息路由:HELLO 发现(retarget + 放行构造等待)→ c2e 入
+        调度器通告队列并 WAKEUP → 其余告警丢弃。
 
-        HELLO -> retarget PRE_OUT:云端点唯一事实源,首拍一次通告;
-        retarget 队满时无下条 HELLO 可等,须本线程自旋重试到成功
-        (构造期发布队列必空,该路径仅防御性保活)。
-        LwdC2eNotify(云->边唯一载荷)-> 载荷队列(阻塞 put,不可丢)
-        + WAKEUP 唤醒主循环:prefill 全部完成后请求转入 awaiting,
-        引擎无排程工作、阻塞在 input_queue.get(),载荷只进队列不会
-        唤醒任何线程,必须向 input_queue 敲门;WAKEUP 原生语义即丢弃
-        消息体,数据与唤醒分离,多投无害(空 drain 一步即返回)。
-        其余帧(坏帧已被订阅层丢弃后仍不认识的类型)告警丢弃。
-        """
-        receiver = self._subscriber
-        publisher = self._publisher
-        while not receiver.closed:
-            msg = receiver.recv(timeout_ms=5000)
-            if msg is None:
-                continue
-            if isinstance(msg, LwdHelloNotify):
-                endpoint = f"tcp://{msg.pre_out_host}:{msg.pre_out_port}"
-                if not hello_event.is_set():
-                    logger.info(
-                        "[Lwd] cloud discovered via HELLO: PRE_OUT -> %s", endpoint
-                    )
-                while not publisher.retarget(endpoint):
-                    if receiver.closed:
-                        break
-                    logger.warning(
-                        "[Lwd] PRE_OUT retarget deferred (queue full), retrying"
-                    )
-                    threading.Event().wait(0.05)
-                hello_event.set()
-            elif isinstance(msg, LwdC2eNotify):
+        retarget 队满时无下条 HELLO 可等,须自旋重试到成功(构造期
+        发布队列必空,该路径仅防御性保活);WAKEUP 原生语义即丢弃
+        消息体,多投无害(空 drain 一步即返回)。"""
+        if isinstance(msg, LwdHelloNotify):
+            endpoint = f"tcp://{msg.pre_out_host}:{msg.pre_out_port}"
+            if not self._hello_event.is_set():
                 logger.info(
-                    "[Lwd][edge-ctrl] C2eNotify reqs=%d down_seqno=%s",
-                    len(msg.req_ids), msg.down_seqno,
+                    "[Lwd] cloud discovered via HELLO: PRE_OUT -> %s", endpoint
                 )
-                # decode 通告入调度器队列(decode 步弹队首点名);
-                # WAKEUP 打断主循环的阻塞 get
-                self.scheduler.unembed_notify_queue.append(msg)
-                self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
-            else:
-                logger.warning("[Lwd] drop unexpected POST_OUT frame %r", type(msg))
+            while not self._publisher.retarget(endpoint):
+                if self._subscriber.closed:
+                    break
+                logger.warning(
+                    "[Lwd] PRE_OUT retarget deferred (queue full), retrying"
+                )
+                threading.Event().wait(0.05)
+            self._hello_event.set()
+        elif isinstance(msg, LwdC2eNotify):
+            logger.info(
+                "[Lwd][edge-ctrl] C2eNotify reqs=%d down_seqno=%s",
+                len(msg.req_ids), msg.down_seqno,
+            )
+            self.scheduler.unembed_notify_queue.append(msg)
+            self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
+        else:
+            logger.warning("[Lwd] drop unexpected POST_OUT frame %r", type(msg))
 
-    # ------------------------------------------------------------------ #
-    # 引擎接口覆写                                                        #
-    # ------------------------------------------------------------------ #
     def add_request(self, request, _request_wave: int = 0) -> None:
         """边校验 + 云预告 + 本地入队。
 
