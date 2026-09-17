@@ -59,16 +59,11 @@ class LwdCloudScheduler(LwdBaseScheduler):
             )
         return True
 
-    @staticmethod
-    def _lwd_is_decode(request) -> bool:
-        """prompt 已算完 = decode 态(可采样);未算完的是 prefill 尾巴。"""
-        return request.num_computed_tokens >= request.num_prompt_tokens
-
     def _lwd_has_prefill_tails(self) -> bool:
-        return any(not self._lwd_is_decode(r) for r in self.running)
+        return any(not self._lwd_the_phase_of_req(r) for r in self.running)
 
     def _lwd_has_decode_ready(self) -> bool:
-        return any(self._lwd_is_decode(r) for r in self.running)
+        return any(self._lwd_the_phase_of_req(r) for r in self.running)
 
     def _lwd_collect_decode_requests(self) -> list[str]:
         """收集所有 decode 态(prompt 已算完)请求的 req_id。
@@ -79,7 +74,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
             req.request_id
             for queue in (self.running, self.waiting, self.skipped_waiting)
             for req in queue
-            if self._lwd_is_decode(req)
+            if self._lwd_the_phase_of_req(req)
         ]
 
     # ------------------------------------------------------------------ #

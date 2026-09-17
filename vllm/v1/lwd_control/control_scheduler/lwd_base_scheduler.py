@@ -15,6 +15,14 @@ from vllm.v1.request import Request
 class LwdBaseScheduler(AsyncScheduler):
     """边/云调度器公共基类(AsyncScheduler 子类)。"""
 
+    @staticmethod
+    def _lwd_the_phase_of_req(request: Request) -> bool:
+        """请求相位判据,边云共用:True = decode 态(prompt 已算完),
+        False = prefill 未尽。勿与原生 Request.is_prefill_chunk 混淆
+        (那是排程记账标志,公式含 spec/占位项、每步重算、新请求初值
+        为 False,不能当相位谓词用)。"""
+        return request.num_computed_tokens >= request.num_prompt_tokens
+
     def _lwd_new_queue(self, reqs: list[Request]) -> RequestQueue:
         """新建调度策略队列并装入 reqs。"""
         queue = create_request_queue(self.policy)

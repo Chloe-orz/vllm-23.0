@@ -107,7 +107,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         优先(断点续传,先收尾再开新),否则 waiting 队首(FCFS 到达序);
         两处皆无返回 None。"""
         running_prefill = next(
-            (r for r in self.running if r.num_computed_tokens < r.num_prompt_tokens),
+            (r for r in self.running if not self._lwd_the_phase_of_req(r)),
             None,
         )
         if running_prefill is not None:
@@ -140,11 +140,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
     def _lwd_has_prefill_chunk_inflight(self) -> bool:
         """running 中是否存在未发完的 embed 请求(续传收尾中)。
-
-        与 _lwd_pick_prefill_req_id 的续传分支同判据,两处需保持一致:
-        闸门放行收尾的前提是 picker 必然挑中该续传请求而非开新。"""
+        与 picker 续传分支共用基类相位判据,闸门放行收尾的前提是
+        picker 必然挑中该续传请求而非开新。"""
         return any(
-            req.num_computed_tokens < req.num_prompt_tokens
+            not self._lwd_the_phase_of_req(req)
             for req in self.running
         )
 
@@ -323,7 +322,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             if request is None:
                 # 本步内已终结(abort/更早完成):迟到的登记无对象
                 continue
-            if request.num_computed_tokens >= request.num_prompt_tokens:
+            if self._lwd_the_phase_of_req(request):
                 finished_ids.append(request_id)
         if finished_ids:
             self.finish_requests(finished_ids, RequestStatus.FINISHED_STOPPED)
