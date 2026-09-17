@@ -150,10 +150,16 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         """弹一条 unembed 通告:登账行数(欠条)→ 可见集调度 → 行数断言
         → 挂 UNEMBED 批。全部未准入则退还欠条、通告回塞;部分排程
         (DOWN 行无法对齐)当场报错。"""
-        notify = self._lwd_pop_unembed_notify()
+        notify = q.popleft() if (q := self.unembed_notify_queue) else None
         if notify is None:
             return SchedulerOutput.make_empty()
-        targets = self._lwd_decode_targets(notify)
+        # 通告里仍可调度的请求(存在、未终结、decode 相位);其余行
+        # 由收割期原生跳过,批仍带全量通告行集保 worker 切分对齐
+        targets = [
+            rid for rid in notify.req_ids
+            if (req := self.requests.get(rid)) is not None
+            and self._lwd_the_phase_of_req(req) is LwdReqPhase.DECODE
+        ]
         if not targets:
             return SchedulerOutput.make_empty()
         saved = self._lwd_set_pending_tokens(notify, targets)
@@ -165,19 +171,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self._lwd_assert_tokens_match_notify(out, notify, targets)
         self._lwd_attach_unembed_batch(out, notify)
         return out
-
-    def _lwd_pop_unembed_notify(self) -> LwdC2eNotify | None:
-        """弹队首通告;空队返回 None。"""
-        return q.popleft() if (q := self.unembed_notify_queue) else None
-
-    def _lwd_decode_targets(self, notify: LwdC2eNotify) -> list[str]:
-        """通告里仍可调度的请求(存在、未终结、decode 相位);其余行
-        由收割期原生跳过,批仍带全量通告行集保 worker 行切分对齐。"""
-        return [
-            rid for rid in notify.req_ids
-            if (req := self.requests.get(rid)) is not None
-            and self._lwd_the_phase_of_req(req) is LwdReqPhase.DECODE
-        ]
 
     def _lwd_set_pending_tokens(
         self, notify: LwdC2eNotify, targets: list[str]
