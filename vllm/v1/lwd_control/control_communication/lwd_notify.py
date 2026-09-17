@@ -83,6 +83,15 @@ class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):
     缺省 -1 = 旧版云侧未携带(msgspec 带默认字段,线上 additive 兼容)。"""
 
 
+# 采样参数 wire 字段表:边侧打包/云侧重建共用(名字与 SamplingParams
+# 一致);max_tokens(缺省 16)/stop_token_ids(None→[])/eos_token_id
+# (构造外回填)三个特例单独处理,不进表
+LWD_WIRE_SAMPLING_FIELDS = (
+    "temperature", "top_p", "top_k", "min_p", "seed",
+    "repetition_penalty", "presence_penalty", "frequency_penalty",
+    "ignore_eos", "min_tokens",
+)
+
 # typing.Union 而非 PEP 604 `|`:msgspec 解码器的全版本支持路径
 LwdNotify = Union[LwdRangeNotify, LwdRequestNotify, LwdAbortNotify]  # noqa: UP007
 # 云->边方向(POST_OUT):HELLO 发现 + 步元数据(唯一载荷,兼结果回传

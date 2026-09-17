@@ -17,6 +17,7 @@ from vllm.v1.lwd_control.control_communication.lwd_control_subscriber import (
     LwdControlSubscriber,
 )
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
+    LWD_WIRE_SAMPLING_FIELDS,
     LwdAbortNotify,
     LwdHelloNotify,
     LwdRangeNotify,
@@ -105,17 +106,8 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         min_tokens),云侧按客户端真实参数采样,不再落默认值。"""
         sampling_params = SamplingParams(
             max_tokens=wire.max_tokens,
-            temperature=wire.temperature,
-            top_p=wire.top_p,
-            top_k=wire.top_k,
-            min_p=wire.min_p,
-            seed=wire.seed,
-            repetition_penalty=wire.repetition_penalty,
-            presence_penalty=wire.presence_penalty,
-            frequency_penalty=wire.frequency_penalty,
-            ignore_eos=wire.ignore_eos,
             stop_token_ids=list(wire.stop_token_ids),
-            min_tokens=wire.min_tokens,
+            **{f: getattr(wire, f) for f in LWD_WIRE_SAMPLING_FIELDS},
         )
         # eos_token_id 非构造入参,走原生回填入口(同边侧前端
         # input_processor):设 _eos_token_id 并计入 _all_stop_token_ids

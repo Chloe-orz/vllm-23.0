@@ -119,15 +119,20 @@ class LwdCloudScheduler(LwdBaseScheduler):
         )
         return out
 
-    def _lwd_select_phase(self) -> LwdReqPhase:
-        """相位选择:prefill_first 有 prefill 活即 prefill,decode_first
-        有 decode 活即 decode;消费 One-shot 强制标志与禁连续 prefill
-        不变量(被抢占回 waiting 的 decode 请求不算 prefill 活)。"""
-        has_prefill_work = any(
+    def _lwd_has_prefill_work(self) -> bool:
+        """waiting/running 存在 PREFILL 相位请求(被抢占回 waiting 的
+        decode 请求不算,由纯 decode 步的三队列收集服务)。"""
+        return any(
             self._lwd_the_phase_of_req(req) is LwdReqPhase.PREFILL
             for queue in (self.waiting, self.running)
             for req in queue
         )
+
+    def _lwd_select_phase(self) -> LwdReqPhase:
+        """相位选择:prefill_first 有 prefill 活即 prefill,decode_first
+        有 decode 活即 decode;消费 One-shot 强制标志与禁连续 prefill
+        不变量(被抢占回 waiting 的 decode 请求不算 prefill 活)。"""
+        has_prefill_work = self._lwd_has_prefill_work()
         has_decode_work = any(
             self._lwd_the_phase_of_req(req) is LwdReqPhase.DECODE
             for req in self.running
@@ -157,11 +162,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 self._last_step_was_prefill = True
             return
         self._last_step_was_prefill = False
-        if not out.total_num_scheduled_tokens and any(
-            self._lwd_the_phase_of_req(req) is LwdReqPhase.PREFILL
-            for queue in (self.waiting, self.running)
-            for req in queue
-        ):
+        if not out.total_num_scheduled_tokens and self._lwd_has_prefill_work():
             # decode 无活但有 prefill 活:翻回 prefill
             self._force_prefill_once = True
 
@@ -176,7 +177,19 @@ class LwdCloudScheduler(LwdBaseScheduler):
         carrier = getattr(model_output, "lwd_down_carrier", None)
         if carrier is None or self.lwd_publisher is None:
             return engine_core_outputs
-        # pinned 布局:[ranks(各段行)..., counts(accepted/请求)..., seg_lens(段长/请求)...]
+        meta = self._lwd_carrier_to_meta(carrier)
+        LwdDebug.cloud_step(self, meta, engine_core_outputs)  # [lwd-debug]
+        self._lwd_publish_c2e(
+            meta, self._lwd_c2e_finish_reasons(meta, engine_core_outputs)
+        )
+        return engine_core_outputs
+
+    @staticmethod
+    def _lwd_carrier_to_meta(carrier) -> "LwdC2eMeta":
+        """pinned 载荷解包为步元数据;布局 [ranks(各段行)...,
+        counts(accepted/请求)..., seg_lens(段长/请求)...]。"""
+        from vllm.v1.outputs import LwdC2eMeta
+
         pinned, req_ids, hidden_numel, seqno = carrier
         n_req = len(req_ids)
         vals = pinned.tolist()
@@ -188,20 +201,13 @@ class LwdCloudScheduler(LwdBaseScheduler):
         for seg_len in seg_lens:
             top_id_ths.append(ranks_flat[off : off + seg_len])
             off += seg_len
-        from vllm.v1.outputs import LwdC2eMeta
-
-        meta = LwdC2eMeta(
+        return LwdC2eMeta(
             hidden_num_elements=hidden_numel,
             top_id_ths=top_id_ths,
             num_accepted_tokens=list(counts),
             req_ids=list(req_ids),
             down_seqno=seqno,
         )
-        LwdDebug.cloud_step(self, meta, engine_core_outputs)  # [lwd-debug]
-        self._lwd_publish_c2e(
-            meta, self._lwd_c2e_finish_reasons(meta, engine_core_outputs)
-        )
-        return engine_core_outputs
 
     @staticmethod
     def _lwd_c2e_finish_reasons(

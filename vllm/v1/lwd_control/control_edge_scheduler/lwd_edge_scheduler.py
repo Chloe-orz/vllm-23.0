@@ -23,6 +23,7 @@ from vllm.v1.core.sched.output import (
 from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LWD_NOT_FINISHED,
+    LWD_WIRE_SAMPLING_FIELDS,
     LwdAbortNotify,
     LwdC2eNotify,
     LwdRangeNotify,
@@ -113,40 +114,51 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             return out
         publisher = self.lwd_publisher
         for request_id, num_tokens in scheduled.items():
-            request = self.requests.get(request_id)
-            if request is None:
-                continue
-            # num_computed 已被乐观推进,起点回退本步量
-            offset = request.num_computed_tokens - num_tokens
-            seqno = self._lwd_seqno
-            if publisher is None or not publisher.publish(
-                LwdRangeNotify(
-                    request_id=request_id,
-                    offset=offset,
-                    num_tokens=num_tokens,
-                    seqno=seqno,
-                )
+            if not self._lwd_publish_embed_chunk(
+                publisher, out, request_id, num_tokens
             ):
                 return SchedulerOutput.make_empty()
-            self._lwd_seqno = seqno + 1
-            logger.info(
-                "[Lwd][edge-notify] req=%s offset=%d num=%d seqno=%d",
-                request_id, offset, num_tokens, seqno,
-            )
-            # seqno 是数据面发云张量的配对键,载荷为本 chunk 片段
-            out.lwd_batch = LwdBatch(
-                batch_type=LwdBatchType.LWD_EMBED,
-                seqno=seqno,
-                batch_meta=LwdEmbedBatch(
-                    req_ids=[request_id],
-                    token_ids=[
-                        list(
-                            request.prompt_token_ids[offset : offset + num_tokens]
-                        )
-                    ],
-                ),
-            )
         return out
+
+    def _lwd_publish_embed_chunk(
+        self, publisher, out: SchedulerOutput, request_id: str, num_tokens: int
+    ) -> bool:
+        """发布 chunk 的 RangeNotify 并挂 EMBED 批;seqno 与发布成功绑定
+        (peek-then-advance),失败返回 False(整步弃批)。"""
+        request = self.requests.get(request_id)
+        if request is None:
+            return True
+        # num_computed 已被乐观推进,起点回退本步量
+        offset = request.num_computed_tokens - num_tokens
+        seqno = self._lwd_seqno
+        if publisher is None or not publisher.publish(
+            LwdRangeNotify(
+                request_id=request_id,
+                offset=offset,
+                num_tokens=num_tokens,
+                seqno=seqno,
+            )
+        ):
+            return False
+        self._lwd_seqno = seqno + 1
+        logger.info(
+            "[Lwd][edge-notify] req=%s offset=%d num=%d seqno=%d",
+            request_id, offset, num_tokens, seqno,
+        )
+        # seqno 是数据面发云张量的配对键,载荷为本 chunk 片段
+        out.lwd_batch = LwdBatch(
+            batch_type=LwdBatchType.LWD_EMBED,
+            seqno=seqno,
+            batch_meta=LwdEmbedBatch(
+                req_ids=[request_id],
+                token_ids=[
+                    list(
+                        request.prompt_token_ids[offset : offset + num_tokens]
+                    )
+                ],
+            ),
+        )
+        return True
 
     def schedule_decode(self) -> SchedulerOutput:
         """弹一条 unembed 通告:登账行数(欠条)→ 可见集调度 → 行数断言
@@ -303,7 +315,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self,
         request_id: str,
         num_prompt_tokens: int,
-        sampling_params: SamplingParams | None = None,
+        sampling_params: SamplingParams,
         block_hashes: list[bytes] | None = None,
     ) -> None:
         """发 LwdRequestNotify:采样参数/满块哈希链透传(云侧占位
@@ -317,24 +329,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         message = LwdRequestNotify(
             request_id=request_id,
             num_prompt_tokens=num_prompt_tokens,
-            max_tokens=(
-                sp.max_tokens if sp is not None and sp.max_tokens is not None else 16
-            ),
+            max_tokens=sp.max_tokens if sp.max_tokens is not None else 16,
             block_hashes=block_hashes if block_hashes is not None else [],
-            temperature=sp.temperature if sp is not None else 1.0,
-            top_p=sp.top_p if sp is not None else 1.0,
-            top_k=sp.top_k if sp is not None else 0,
-            min_p=sp.min_p if sp is not None else 0.0,
-            seed=sp.seed if sp is not None else None,
-            repetition_penalty=sp.repetition_penalty if sp is not None else 1.0,
-            presence_penalty=sp.presence_penalty if sp is not None else 0.0,
-            frequency_penalty=sp.frequency_penalty if sp is not None else 0.0,
-            ignore_eos=sp.ignore_eos if sp is not None else False,
-            stop_token_ids=(
-                list(sp.stop_token_ids) if sp is not None and sp.stop_token_ids else []
-            ),
-            min_tokens=sp.min_tokens if sp is not None else 0,
-            eos_token_id=sp.eos_token_id if sp is not None else None,
+            eos_token_id=sp.eos_token_id,
+            stop_token_ids=list(sp.stop_token_ids or []),
+            **{f: getattr(sp, f) for f in LWD_WIRE_SAMPLING_FIELDS},
         )
         for attempt in range(_LWD_ADD_RETRY_STEPS):
             if publisher.publish(message):
