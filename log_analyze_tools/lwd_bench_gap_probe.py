@@ -46,7 +46,7 @@ RE_TS = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})[,.](\d{3})")
 
 RE_PHASE = re.compile(
     r"\[Lwd\]\[sched\] cloud step=\d+ phase=(\w+) seqno=\S+ "
-    r"reqs=\[.*?\] tokens=\d+ pending_notify=(\d+) decode_ready=\d+")
+    r"reqs=\[(.*?)\] tokens=(\d+) pending_notify=(\d+) decode_ready=\d+")
 RE_EXEC = re.compile(r"\[Lwd\]\[perf\] cloud-step exec=([\d.]+)ms")
 RE_CEXEC = re.compile(r"\[Lwd\]\[perf\] cloud-exec total=([\d.]+)ms")
 RE_PUB = re.compile(
@@ -90,7 +90,7 @@ def _rate(ts):
 
 def _scan(path: str, which: str) -> dict:
     """单遍流式扫描:逐行提取字段后立即丢弃原文。"""
-    phase: list[tuple[float, str, int]] = []    # (t, phase, pending_notify)
+    phase: list[tuple[float, str, int, float]] = []  # (t, phase, pending, tok/req)
     exec_ms: list[float] = []
     cexec_ms: list[float] = []
     pub: list[tuple[float, list[int]]] = []
@@ -117,7 +117,16 @@ def _scan(path: str, which: str) -> dict:
             if which == "云":
                 mm = RE_PHASE.search(line)
                 if mm:
-                    phase.append((t, mm.group(1), int(mm.group(2))))
+                    reqs_raw, toks = mm.group(2), int(mm.group(3))
+                    n = reqs_raw.count(",") + 1 if reqs_raw else 0
+                    if "+Nmore" in reqs_raw:  # 截断标记:近似用可见数+1
+                        pass
+                    import re as _re2
+                    m2 = _re2.search(r"\+(\d+)more", reqs_raw)
+                    if m2:
+                        n = n - 1 + int(m2.group(1))
+                    ratio = (toks / n) if n else 0.0
+                    phase.append((t, mm.group(1), int(mm.group(4)), ratio))
                     hits += 1
                     continue
                 mm = RE_EXEC.search(line)
@@ -180,16 +189,25 @@ def analyze(cloud_path: str, edge_path: str) -> dict:
 
     phases = c["phase"]
     n_by: dict[str, int] = {}
-    for _, ph, _ in phases:
+    for _, ph, _, _ in phases:
         n_by[ph] = n_by.get(ph, 0) + 1
-    dec_ts = [t for t, ph, _ in phases if ph == "DECODE"]
+    dec_ts = [t for t, ph, _, _ in phases if ph == "DECODE"]
     gaps = [(b - a) * 1000 for a, b in zip(dec_ts, dec_ts[1:]) if b > a]
+    # decode 步调度密度(tokens/请求数)按"上一步相位"分组:
+    # ≈1=spec 未被调度(调度侧病灶),≈4=调度了但验证被拒(对位病灶)
+    ratio_after: dict[str, list[float]] = {}
+    prev_ph = None
+    for _, ph, _, r in phases:
+        if ph == "DECODE" and prev_ph is not None:
+            ratio_after.setdefault(prev_ph, []).append(r)
+        if ph != "EMPTY":
+            prev_ph = ph
     # 相邻 PREFILL 串(连续 prefill 步合并)之间的 decode 步数
     interleave: list[int] = []
     run = 0
     seen_first = False
     in_run = False
-    for _, ph, _ in phases:
+    for _, ph, _, _ in phases:
         if ph == "PREFILL":
             if seen_first and not in_run:
                 interleave.append(run)
@@ -200,11 +218,12 @@ def analyze(cloud_path: str, edge_path: str) -> dict:
             in_run = False
             if ph == "DECODE":
                 run += 1
-    empty_starved = sum(1 for _, ph, pend in phases
+    empty_starved = sum(1 for _, ph, pend, _ in phases
                         if ph == "EMPTY" and pend > 0)
     rep["phase"] = {
         "n": len(phases), "by": n_by, "gaps": gaps,
         "interleave": interleave, "empty_starved": empty_starved,
+        "ratio_after": ratio_after,
     }
 
     disp_t = [t for t, _, _, _ in e["disp"]]
@@ -260,6 +279,13 @@ def print_report(rep: dict) -> None:
               f"p95={_f(_pct(g, 95))} max={_f(max(g)) if g else 'n/a'}")
         print(f"   相邻 PREFILL 串间 decode 步数: "
               f"min={min(it) if it else 'n/a'} p50={_f(_pct(it, 50))}")
+        ra = ph["ratio_after"]
+        for prev in ("PREFILL", "DECODE"):
+            g = ra.get(prev) or []
+            if g:
+                print(f"   decode 步调度密度 tokens/req(上一步={prev}): "
+                      f"n={len(g)} p50={_f(_pct(g, 50), 2)} "
+                      f"p95={_f(_pct(g, 95), 2)}")
     else:
         print("   无 cloud step 相位日志")
     a = rep["admit"]
@@ -295,6 +321,17 @@ def print_report(rep: dict) -> None:
         if g95 - g50 > 200 or pre > 0.3:
             vs.append(f"decode 间隔被拉长(p50 {_f(g50)}→p95 {_f(g95)}ms,"
                       f"PREFILL 占 {pre * 100:.0f}%)→【相位稀释显著】")
+        g_pre = (ph["ratio_after"].get("PREFILL") or [])
+        g_dec = (ph["ratio_after"].get("DECODE") or [])
+        if g_pre and g_dec and _pct(g_pre, 50) < 1.5 \
+                and _pct(g_dec, 50) > _pct(g_pre, 50) + 1.0:
+            vs.append(f"紧跟 PREFILL 的 decode 步调度密度≈1"
+                      f"(p50 {_f(_pct(g_pre, 50), 2)})而连跑 decode≈"
+                      f"{_f(_pct(g_dec, 50), 2)}→【交替后草稿未被调度】"
+                      f"病灶=调度侧 spec 链记账")
+        elif g_pre and _pct(g_pre, 50) >= 3.0:
+            vs.append("穿插窗口 decode 步调度密度≈4(草稿有调度)→"
+                      "病灶=验证对位(非调度),转 KV/位置记账核查")
         if ph["empty_starved"] > ph["n"] * 0.05:
             vs.append(f"EMPTY且pending>0 共 {ph['empty_starved']} 步→"
                       f"引擎有活没吃,存在停摆/等待段")
