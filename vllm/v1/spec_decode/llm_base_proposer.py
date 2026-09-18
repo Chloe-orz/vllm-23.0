@@ -578,12 +578,7 @@ class SpecDecodeBaseProposer:
         # Only apply this adjustment when we have rejected tokens
         # (i.e., not the first proposal).
         if self.num_speculative_tokens > 1 and num_rejected_tokens_gpu is not None:
-            # 重绑定而非原地减:metadata.seq_lens 是 runner 持久缓冲的
-            # 视图,原地减会把 drafter 的 padded-batch 修正写进跨步存活
-            # 的共享缓冲——同一步内其他元数据消费方(含相位交替下的
-            # 首趟路径)会读到被修正过的值
-            common_attn_metadata.seq_lens = (
-                common_attn_metadata.seq_lens - num_rejected_tokens_gpu)
+            common_attn_metadata.seq_lens -= num_rejected_tokens_gpu
             # Invalidate the CPU-side shadows to avoid H<>D sync.
             common_attn_metadata._seq_lens_cpu = None
             common_attn_metadata._num_computed_tokens_cpu = None
