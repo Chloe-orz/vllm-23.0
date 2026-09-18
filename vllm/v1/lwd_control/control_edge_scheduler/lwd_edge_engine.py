@@ -34,7 +34,6 @@ from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequestType
-from vllm.v1.request import RequestStatus
 from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
     LwdControlPublisher,
 )
@@ -170,14 +169,23 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         )
         self.scheduler.add_request(request)
         if request.abort_immediately:
-            self.scheduler.finish_requests(
-                [request.request_id], RequestStatus.FINISHED_ABORTED
-            )
-            self._lwd_abort_notify([request.request_id])
+            self.abort_requests([request.request_id])
 
     def abort_requests(self, request_ids: list[str]) -> None:
-        """abort 信号先出云,再走原生本地清理。"""
-        self._lwd_abort_notify(request_ids)
+        """abort 信号先出云(逐个发 AbortNotify,队满告警丢弃),
+        再走原生本地清理(终结+出队)。"""
+        for request_id in request_ids:
+            if not self._publisher.publish(
+                LwdAbortNotify(request_id=request_id)
+            ):
+                logger.warning(
+                    "[Lwd] drop abort signal for %s: publish queue full",
+                    request_id,
+                )
+            else:
+                logger.info(
+                    "[Lwd][edge-notify] AbortNotify req=%s", request_id
+                )
         super().abort_requests(request_ids)
 
     def _lwd_notify_request_meta(
@@ -216,16 +224,3 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             f"(cloud PRE_OUT consumption stalled?)"
         )
 
-    def _lwd_abort_notify(self, request_ids: list[str]) -> None:
-        """发 LwdAbortNotify;本地清理走原生(请求在三队列内)。"""
-        for request_id in request_ids:
-            if not self._publisher.publish(
-                LwdAbortNotify(request_id=request_id)
-            ):
-                logger.warning(
-                    "[LWD] drop abort signal for %s: publish queue full", request_id
-                )
-            else:
-                logger.info(
-                    "[Lwd][edge-notify] AbortNotify req=%s", request_id
-                )
