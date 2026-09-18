@@ -50,6 +50,14 @@ LWD_PRE_OUT_RECV_TIMEOUT_MS = 5000
 _LWD_C2E_SEND_RETRY_SLEEP_S = 0.05
 
 
+def _lwd_token_id_mode() -> bool:
+    """token_id 回传版总开关(VLLM_ASCEND_LWD_EDGE_SKIP_SAMPLE=1):
+    token 经 c2e 通告直付边侧,云侧跳过 DOWN 张量发送,边侧不再派
+    UNEMBED 批(收发通道代码保留,开关关闭即回 rank-replay 模式)。
+    诊断/实验用途,生产禁开(token id 不上网线的约束)。"""
+    return os.environ.get("VLLM_ASCEND_LWD_EDGE_SKIP_SAMPLE") == "1"
+
+
 class LwdCloudEngineCore(EngineCoreProc):
     """云 PO 引擎:覆写 socket IO 线程入口,其余全走原生。"""
 
@@ -334,13 +342,11 @@ class LwdCloudEngineCore(EngineCoreProc):
             # accepted token ids 捎带给边侧,边侧跳过 lm_head/rank-replay
             # 直接交付,用于把边侧 unembed 从 ITL 归因中剥离。
             token_ids: list[list[int]] = []
-            if os.environ.get("VLLM_ASCEND_LWD_EDGE_SKIP_SAMPLE") == "1":
-                ids_by_req: dict[str, list[int]] = {}
-                for outputs in engine_core_outputs.values():
-                    for out in outputs.outputs:
-                        if out.new_token_ids:
-                            ids_by_req[out.request_id] = list(out.new_token_ids)
-                token_ids = [ids_by_req.get(rid, []) for rid in meta.req_ids]
+            if _lwd_token_id_mode():
+                token_ids = [
+                    self._lwd_ids_by_req(engine_core_outputs).get(rid, [])
+                    for rid in meta.req_ids
+                ]
             self._lwd_publish_c2e(
                 meta,
                 self._lwd_c2e_finish_reasons(meta, engine_core_outputs),
@@ -351,11 +357,67 @@ class LwdCloudEngineCore(EngineCoreProc):
                 "[Lwd][perf] publish reqs=%d dur=%.2fms",
                 len(meta.req_ids), (time.monotonic() - _t) * 1000,
             )
+        elif _lwd_token_id_mode():
+            # token_id 回传版:无 carrier 的步也直发 tokens-only 通告——
+            # 交付不依赖"本步恰好有 DOWN payload"(收尾步/空步的 finish
+            # 不再丢车),云 worker 在本模式下已跳过 DOWN 发送
+            ids_by_req = self._lwd_ids_by_req(engine_core_outputs)
+            reasons = self._lwd_finish_reason_map(engine_core_outputs)
+            req_ids = list(dict.fromkeys(
+                list(ids_by_req.keys()) + list(reasons.keys())
+            ))
+            if req_ids:
+                self._lwd_send_notify(LwdC2eNotify(
+                    hidden_num_elements=0,
+                    top_id_ths=[[] for _ in req_ids],
+                    num_accepted_tokens=[
+                        len(ids_by_req.get(rid, [])) for rid in req_ids
+                    ],
+                    req_ids=req_ids,
+                    finish_reasons=[
+                        reasons.get(rid, LWD_NOT_FINISHED) for rid in req_ids
+                    ],
+                    down_seqno=-1,
+                    token_ids=[ids_by_req.get(rid, []) for rid in req_ids],
+                ))
+                logger.info(
+                    "[Lwd][cloud-ctrl] publish c2e(token-id): reqs=%d "
+                    "finish=%s", len(req_ids),
+                    [reasons.get(rid) for rid in req_ids],
+                )
         else:
             logger.info(
                 "[Lwd][cloud-ctrl] handle_model_output: no down carrier this step"
             )
         return model_output
+
+    @staticmethod
+    def _lwd_ids_by_req(
+        engine_core_outputs: dict[int, EngineCoreOutputs],
+    ) -> dict[str, list[int]]:
+        """本步逐请求 accepted token ids(host 侧现成,零 D2H):
+        EngineCoreOutputs.new_token_ids 按 req_id 汇聚。"""
+        ids_by_req: dict[str, list[int]] = {}
+        for outputs in engine_core_outputs.values():
+            for out in outputs.outputs:
+                if out.new_token_ids:
+                    ids_by_req[out.request_id] = list(out.new_token_ids)
+        return ids_by_req
+
+    @staticmethod
+    def _lwd_finish_reason_map(
+        engine_core_outputs: dict[int, EngineCoreOutputs],
+    ) -> dict[str, int]:
+        """本步逐请求完成码:任一 EngineCoreOutputs 带 finish_reason 的
+        输出取其码;仅进 finished_requests 的缺口按 ABORT 兜底。"""
+        reasons: dict[str, int] = {}
+        for outputs in engine_core_outputs.values():
+            for out in outputs.outputs:
+                if out.finish_reason is not None:
+                    reasons.setdefault(out.request_id, int(out.finish_reason))
+            for request_id in outputs.finished_requests or ():
+                reasons.setdefault(request_id, int(FinishReason.ABORT))
+        return reasons
 
     @staticmethod
     def _lwd_c2e_finish_reasons(
@@ -365,13 +427,7 @@ class LwdCloudEngineCore(EngineCoreProc):
         """req_ids 对齐的逐请求完成码:本步任一 EngineCoreOutputs 里带
         finish_reason 的输出取其码;仅进 finished_requests 的缺口按 ABORT
         兜底;其余 LWD_NOT_FINISHED(边侧保持 awaiting,由后续步通告收口)。"""
-        reasons: dict[str, int] = {}
-        for outputs in engine_core_outputs.values():
-            for out in outputs.outputs:
-                if out.finish_reason is not None:
-                    reasons.setdefault(out.request_id, int(out.finish_reason))
-            for request_id in outputs.finished_requests or ():
-                reasons.setdefault(request_id, int(FinishReason.ABORT))
+        reasons = LwdCloudEngineCore._lwd_finish_reason_map(engine_core_outputs)
         return [reasons.get(request_id, LWD_NOT_FINISHED)
                 for request_id in meta.req_ids]
 
@@ -384,7 +440,7 @@ class LwdCloudEngineCore(EngineCoreProc):
         """步元数据(含逐请求 finish_reasons 完成码)发边:队满小睡重试
         (元数据不可丢),关停(closed)退出。token_ids 仅诊断旁路
         (VLLM_ASCEND_LWD_EDGE_SKIP_SAMPLE)携带。"""
-        notify = LwdC2eNotify(
+        self._lwd_send_notify(LwdC2eNotify(
             hidden_num_elements=meta.hidden_num_elements,
             top_id_ths=meta.top_id_ths,
             num_accepted_tokens=meta.num_accepted_tokens,
@@ -392,7 +448,10 @@ class LwdCloudEngineCore(EngineCoreProc):
             finish_reasons=finish_reasons,
             down_seqno=meta.down_seqno,
             token_ids=token_ids or [],
-        )
+        ))
+
+    def _lwd_send_notify(self, notify: LwdC2eNotify) -> None:
+        """c2e 通告发边:队满小睡重试(元数据不可丢),关停退出。"""
         while not self._lwd_post_out.closed:
             if self._lwd_post_out.publish(notify):
                 logger.info(
@@ -400,7 +459,7 @@ class LwdCloudEngineCore(EngineCoreProc):
                     "finish=%s hidden_elems=%s",
                     len(notify.req_ids),
                     notify.down_seqno,
-                    finish_reasons,
+                    notify.finish_reasons,
                     notify.hidden_num_elements,
                 )
                 return
