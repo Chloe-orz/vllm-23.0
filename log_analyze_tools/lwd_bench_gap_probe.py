@@ -10,7 +10,9 @@
      集中式原生混批(chunked prefill 与 decode 同 forward)无此税。
   ② embed 准入:prefill 输入经"边侧嵌入→UP→云注入"绕行,bench 到达率
      高时在边侧排队,准入吞吐被钉死。
-  ③ MTP 接受率漂移:批组合变化使接受数下降,tokens/step 降低。
+  ③ MTP 接受率崩(重点核查 draft 首趟兜底污染):
+     请求扰动下 draft 首趟 LWD embeds 路径塌回 token-id 兜底,prompt
+     KV 被污染→接受率持续低迷;单请求正常而 bench 崩掉即指向此处。
 
 日志锚点(全部现有,无新增):
   云: [Lwd][sched] cloud step=N phase=P seqno=S reqs=[..] tokens=T
@@ -23,7 +25,9 @@
       [Lwd][sched] edge step harvest_emb=H deliver_unemb=U disp_emb=D
       queue=Qemb c2e_pending=P
       [Lwd][sched] edge deliver-unembed reqs=N tokens=[a,b,..]
-      c2e_wait=Wms c2e_pending=P
+
+流式解析:不缓存日志原文(GB 级日志不爆内存),进度打 stderr;
+报告头部打印各锚点命中数,全零时提示日志版本不匹配。
 
 用法:
   python lwd_bench_gap_probe.py --cloud 云日志 --edge 边日志
@@ -34,44 +38,36 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import os
 import re
 import sys
 
 RE_TS = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})[,.](\d{3})")
 
 RE_PHASE = re.compile(
-    r"\[Lwd\]\[sched\] cloud step=\d+ phase=(\w+) seqno=(\S+) "
-    r"reqs=\[(.*?)\] tokens=(\d+) pending_notify=(\d+) decode_ready=(\d+)")
+    r"\[Lwd\]\[sched\] cloud step=\d+ phase=(\w+) seqno=\S+ "
+    r"reqs=\[.*?\] tokens=\d+ pending_notify=(\d+) decode_ready=\d+")
 RE_EXEC = re.compile(r"\[Lwd\]\[perf\] cloud-step exec=([\d.]+)ms")
 RE_CEXEC = re.compile(r"\[Lwd\]\[perf\] cloud-exec total=([\d.]+)ms")
 RE_PUB = re.compile(
     r"\[Lwd\]\[cloud-ctrl\] publish c2e\(token-id\): reqs=(\d+) "
     r"tokens=\[([\d, ]*)\]")
-RE_RANGE = re.compile(r"\[Lwd\]\[cloud-ctrl\] RangeNotify req=\S+ num=\S+")
+RE_RANGE = re.compile(r"\[Lwd\]\[cloud-ctrl\] RangeNotify req=")
 RE_DISP_EMB = re.compile(
     r"\[Lwd\]\[sched\] edge dispatch-embed seqno=\d+ req=\S+ tokens=(\d+) "
     r"queue=(\d+)emb c2e_pending=(\d+)")
 RE_STEP = re.compile(
-    r"\[Lwd\]\[sched\] edge step harvest_emb=(\d+) deliver_unemb=(\d+) "
-    r"disp_emb=(\d+) queue=(\d+)emb c2e_pending=(\d+)")
+    r"\[Lwd\]\[sched\] edge step harvest_emb=\d+ deliver_unemb=\d+ "
+    r"disp_emb=\d+ queue=(\d+)emb c2e_pending=(\d+)")
 RE_DELIVER = re.compile(
     r"\[Lwd\]\[sched\] edge deliver-unembed reqs=(\d+) tokens=\[([\d, ]*)\]")
+
+_PROGRESS_EVERY = 5_000_000
 
 
 def _sec(ts: str, ms: str) -> float:
     return _dt.datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").timestamp() \
         + int(ms) / 1000.0
-
-
-def _parse(path: str):
-    out = []
-    with open(path, encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            m = RE_TS.match(line)
-            if m:
-                out.append((_sec(m.group(1), m.group(2)), line))
-    out.sort(key=lambda x: x[0])
-    return out
 
 
 def _pct(v, p):
@@ -92,122 +88,152 @@ def _rate(ts):
     return (len(inner) - 1) / (inner[-1] - inner[0])
 
 
-def analyze(cloud_path: str, edge_path: str) -> dict:
-    rep: dict = {}
-    phases: list[tuple[float, str, int, int]] = []  # (t, phase, tokens, pending)
+def _scan(path: str, which: str) -> dict:
+    """单遍流式扫描:逐行提取字段后立即丢弃原文。"""
+    phase: list[tuple[float, str, int]] = []    # (t, phase, pending_notify)
     exec_ms: list[float] = []
     cexec_ms: list[float] = []
-    pub_tokens: list[list[int]] = []
-    pub_t: list[float] = []
+    pub: list[tuple[float, list[int]]] = []
     range_t: list[float] = []
-    for t, line in _parse(cloud_path):
-        m = RE_PHASE.search(line)
-        if m:
-            phases.append((t, m.group(1), int(m.group(4)), int(m.group(5))))
-            continue
-        m = RE_EXEC.search(line)
-        if m:
-            exec_ms.append(float(m.group(1)))
-            continue
-        m = RE_CEXEC.search(line)
-        if m:
-            cexec_ms.append(float(m.group(1)))
-            continue
-        m = RE_PUB.search(line)
-        if m:
-            toks = [int(x) for x in m.group(2).split(",") if x.strip()]
-            pub_tokens.append(toks)
-            pub_t.append(t)
-            continue
-        if RE_RANGE.search(line):
-            range_t.append(t)
-
-    disp_t: list[float] = []
-    disp_tokens: list[int] = []
-    emb_queue: list[int] = []
-    step_c2e: list[int] = []
-    step_t: list[float] = []
+    disp: list[tuple[float, int, int, int]] = []  # (t, tokens, queue, c2e)
+    step_q: list[tuple[int, int]] = []            # (queue, c2e)
     deliv_rows: list[int] = []
-    for t, line in _parse(edge_path):
-        m = RE_DISP_EMB.search(line)
-        if m:
-            disp_t.append(t)
-            disp_tokens.append(int(m.group(1)))
-            emb_queue.append(int(m.group(2)))
-            step_c2e.append(int(m.group(3)))
-            continue
-        m = RE_STEP.search(line)
-        if m:
-            step_t.append(t)
-            emb_queue.append(int(m.group(4)))
-            step_c2e.append(int(m.group(5)))
-            continue
-        m = RE_DELIVER.search(line)
-        if m and m.group(2).strip():
-            deliv_rows.append(len(
-                [x for x in m.group(2).split(",") if x.strip()]))
+    n = hits = 0
+    size = os.path.getsize(path) if os.path.exists(path) else 0
+    print(f"[probe] 解析{which}日志 {path} ({size / 1e6:.1f} MB)...",
+          file=sys.stderr, flush=True)
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            n += 1
+            if n % _PROGRESS_EVERY == 0:
+                print(f"[probe]   {which}: 已扫描 {n:,} 行, 命中 {hits:,}",
+                      file=sys.stderr, flush=True)
+            if "[Lwd]" not in line:
+                continue  # 快速预过滤:绝大多数行非锚点,跳过全部正则
+            m = RE_TS.match(line)
+            if not m:
+                continue
+            t = _sec(m.group(1), m.group(2))
+            if which == "云":
+                mm = RE_PHASE.search(line)
+                if mm:
+                    phase.append((t, mm.group(1), int(mm.group(2))))
+                    hits += 1
+                    continue
+                mm = RE_EXEC.search(line)
+                if mm:
+                    exec_ms.append(float(mm.group(1)))
+                    hits += 1
+                    continue
+                mm = RE_CEXEC.search(line)
+                if mm:
+                    cexec_ms.append(float(mm.group(1)))
+                    hits += 1
+                    continue
+                mm = RE_PUB.search(line)
+                if mm:
+                    pub.append((t, [
+                        int(x) for x in mm.group(2).split(",") if x.strip()]))
+                    hits += 1
+                    continue
+                if RE_RANGE.search(line):
+                    range_t.append(t)
+                    hits += 1
+            else:
+                mm = RE_DISP_EMB.search(line)
+                if mm:
+                    disp.append((t, int(mm.group(1)), int(mm.group(2)),
+                                 int(mm.group(3))))
+                    hits += 1
+                    continue
+                mm = RE_STEP.search(line)
+                if mm:
+                    step_q.append((int(mm.group(1)), int(mm.group(2))))
+                    hits += 1
+                    continue
+                mm = RE_DELIVER.search(line)
+                if mm and mm.group(2).strip():
+                    deliv_rows.append(len(
+                        [x for x in mm.group(2).split(",") if x.strip()]))
+                    hits += 1
+    print(f"[probe]   {which}: 完成 {n:,} 行, 命中 {hits:,}",
+          file=sys.stderr, flush=True)
+    return {
+        "phase": phase, "exec_ms": exec_ms, "cexec_ms": cexec_ms,
+        "pub": pub, "range_t": range_t, "disp": disp, "step_q": step_q,
+        "deliv_rows": deliv_rows,
+        "counts": (
+            {"cloud-phase": len(phase), "cloud-exec": len(exec_ms),
+             "cloud-cexec": len(cexec_ms), "cloud-publish": len(pub),
+             "cloud-RangeNotify": len(range_t)}
+            if which == "云" else
+            {"edge-dispatch": len(disp), "edge-step": len(step_q),
+             "edge-deliver": len(deliv_rows)}
+        ),
+    }
 
-    # ① 相位构成与 decode 稀释
-    n_by = {}
-    for _, ph, _, _ in phases:
+
+def analyze(cloud_path: str, edge_path: str) -> dict:
+    c = _scan(cloud_path, "云")
+    e = _scan(edge_path, "边")
+    rep: dict = {"counts": c["counts"] | e["counts"]}
+
+    phases = c["phase"]
+    n_by: dict[str, int] = {}
+    for _, ph, _ in phases:
         n_by[ph] = n_by.get(ph, 0) + 1
-    dec_ts = [t for t, ph, _, _ in phases if ph == "DECODE"]
-    dec_gaps_ms = [
-        (b - a) * 1000 for a, b in zip(dec_ts, dec_ts[1:]) if b > a]
-    # 相邻 PREFILL 串(连续 prefill 步合并)之间的 decode 步数(穿插密度)
+    dec_ts = [t for t, ph, _ in phases if ph == "DECODE"]
+    gaps = [(b - a) * 1000 for a, b in zip(dec_ts, dec_ts[1:]) if b > a]
+    # 相邻 PREFILL 串(连续 prefill 步合并)之间的 decode 步数
     interleave: list[int] = []
     run = 0
     seen_first = False
-    in_prefill_run = False
-    for _, ph, _, _ in phases:
+    in_run = False
+    for _, ph, _ in phases:
         if ph == "PREFILL":
-            if seen_first and not in_prefill_run:
+            if seen_first and not in_run:
                 interleave.append(run)
             seen_first = True
-            in_prefill_run = True
+            in_run = True
             run = 0
         else:
-            in_prefill_run = False
+            in_run = False
             if ph == "DECODE":
                 run += 1
-    empty_starved = sum(
-        1 for _, ph, _, pend in phases if ph == "EMPTY" and pend > 0)
+    empty_starved = sum(1 for _, ph, pend in phases
+                        if ph == "EMPTY" and pend > 0)
     rep["phase"] = {
-        "n": len(phases), "by": n_by,
-        "decode_gaps_ms": dec_gaps_ms, "interleave": interleave,
-        "empty_starved": empty_starved,
-        "span_s": (phases[0][0], phases[-1][0]) if phases else None,
+        "n": len(phases), "by": n_by, "gaps": gaps,
+        "interleave": interleave, "empty_starved": empty_starved,
     }
 
-    # ② embed 准入
+    disp_t = [t for t, _, _, _ in e["disp"]]
+    disp_tokens = [tk for _, tk, _, _ in e["disp"]]
+    emb_q = [q for _, _, q, _ in e["disp"]] + [q for q, _ in e["step_q"]]
+    c2e_q = [p for _, _, _, p in e["disp"]] + [p for _, p in e["step_q"]]
     rep["admit"] = {
-        "disp_rate": _rate(disp_t), "range_rate": _rate(range_t),
-        "n_disp": len(disp_t), "n_range": len(range_t),
+        "disp_rate": _rate(disp_t), "range_rate": _rate(c["range_t"]),
+        "n_disp": len(disp_t), "n_range": len(c["range_t"]),
         "chunk_tokens_p50": _pct(disp_tokens, 50),
-        "emb_queue_p95": _pct(emb_queue, 95),
-        "c2e_pending_p95": _pct(step_c2e, 95),
+        "emb_queue_p95": _pct(emb_q, 95), "c2e_p95": _pct(c2e_q, 95),
     }
 
-    # ③ 产出效率与接受率
-    flat = [x for row in pub_tokens for x in row]
-    spec_span = max((pub_t[-1] - pub_t[0]) for pub_t in [pub_t]) \
-        if len(pub_t) > 1 else float("nan")
+    flat = [x for _, row in c["pub"] for x in row]
+    span = (c["pub"][-1][0] - c["pub"][0][0]) if len(c["pub"]) > 1 \
+        else float("nan")
     rep["yield"] = {
-        "steps": len(pub_tokens), "reqs_step_p50": _pct(
-            [len(r) for r in pub_tokens], 50),
-        "tok_flat": flat,
-        "tok_per_req_p50": _pct(flat, 50), "tok_per_req_p95": _pct(flat, 95),
-        "max_tok": max(flat) if flat else 0,
-        "total_tokens": sum(flat) if flat else 0,
-        "tok_per_s": (sum(flat) / spec_span) if spec_span == spec_span
-        and spec_span > 0 else float("nan"),
+        "steps": len(c["pub"]),
+        "reqs_step_p50": _pct([len(row) for _, row in c["pub"]], 50),
+        "flat": flat, "p50": _pct(flat, 50), "p95": _pct(flat, 95),
+        "max": max(flat) if flat else 0, "total": sum(flat) if flat else 0,
+        "tok_per_s": (sum(flat) / span) if span == span and span > 0
+        else float("nan"),
         "decode_rate": _rate(dec_ts),
     }
     rep["exec"] = {
-        "step_exec_p50": _pct(exec_ms, 50), "step_exec_p95": _pct(exec_ms, 95),
-        "cexec_p50": _pct(cexec_ms, 50), "cexec_p95": _pct(cexec_ms, 95),
+        "p50": _pct(c["exec_ms"], 50), "p95": _pct(c["exec_ms"], 95),
+        "cp50": _pct(c["cexec_ms"], 50), "cp95": _pct(c["cexec_ms"], 95),
     }
-    rep["deliver_rows_p50"] = _pct(deliv_rows, 50)
     return rep
 
 
@@ -216,136 +242,130 @@ def _f(v, nd=1):
 
 
 def print_report(rep: dict) -> None:
+    print("=" * 72, flush=True)
+    print("锚点命中: " + "  ".join(
+        f"{k}={v}" for k, v in rep["counts"].items()), flush=True)
+    if not any(rep["counts"].values()):
+        print("!! 两份日志没有任何锚点命中——确认日志来自 token_id 版分支"
+              "(prefill_only_v0.1_mtp_perf_ww)的部署", flush=True)
+        return
     ph = rep["phase"]
-    print("=" * 72)
     print("① 相位构成与 decode 稀释(相位调度器税)")
     if ph["n"]:
         share = {k: f"{v * 100 / ph['n']:.0f}%" for k, v in ph["by"].items()}
         print(f"   步数={ph['n']}  构成={share}  "
-              f"EMPTY且pending>0(引擎有活没吃)={ph['empty_starved']} 步")
-        g = ph["decode_gaps_ms"]
-        it = ph["interleave"]
+              f"EMPTY且pending>0={ph['empty_starved']} 步")
+        g, it = ph["gaps"], ph["interleave"]
         print(f"   decode 间隔 ms: p50={_f(_pct(g, 50))} "
               f"p95={_f(_pct(g, 95))} max={_f(max(g)) if g else 'n/a'}")
-        print(f"   相邻 PREFILL 串间 decode 步数: min={min(it) if it else 'n/a'} "
-              f"p50={_f(_pct(it, 50))}")
+        print(f"   相邻 PREFILL 串间 decode 步数: "
+              f"min={min(it) if it else 'n/a'} p50={_f(_pct(it, 50))}")
     else:
         print("   无 cloud step 相位日志")
     a = rep["admit"]
     print("② embed 准入(prefill 输入绕行链)")
     print(f"   边 chunk 派发 {_f(a['disp_rate'], 2)}/s (n={a['n_disp']});"
-          f" 云 RangeNotify 到达 {_f(a['range_rate'], 2)}/s (n={a['n_range']})")
+          f" 云 RangeNotify 到达 {_f(a['range_rate'], 2)}/s "
+          f"(n={a['n_range']})")
     print(f"   chunk tokens p50={_f(a['chunk_tokens_p50'], 0)}  "
-          f"emb 队列水位 p95={_f(a['emb_queue_p95'], 0)}  "
-          f"c2e_pending p95={_f(a['c2e_pending_p95'], 0)}")
+          f"emb 队列 p95={_f(a['emb_queue_p95'], 0)}  "
+          f"c2e_pending p95={_f(a['c2e_p95'], 0)}")
     y = rep["yield"]
-    print("③ 产出效率与 MTP 接受率")
+    print("③ 产出效率与 MTP 接受率(重点:单请求 vs bench 对比)")
     if y["steps"]:
-        k1 = y["max_tok"] or 1
-        flat = y["tok_flat"]
-        acc = (sum(flat) / len(flat)) / k1 if flat and k1 else float("nan")
-        print(f"   步数={y['steps']}  每步请求数 p50={_f(y['reqs_step_p50'], 0)}  "
-              f"每请求 token/步 均值={_f(sum(flat) / len(flat), 2)} "
-              f"p50={_f(y['tok_per_req_p50'], 2)} "
-              f"p95={_f(y['tok_per_req_p95'], 2)} (max={k1}→接受率≈"
-              f"{_f(acc * 100, 0)}%)")
-        print(f"   总 token={y['total_tokens']}  产出 {_f(y['tok_per_s'], 1)} "
-              f"tok/s  decode 步频 {_f(y['decode_rate'], 2)}/s")
+        k1 = y["max"] or 1
+        mean = sum(y["flat"]) / len(y["flat"])
+        acc = mean / k1
+        print(f"   步数={y['steps']}  每步请求数 p50={_f(y['reqs_step_p50'], 0)}"
+              f"  每请求 token/步 均值={_f(mean, 2)} p50={_f(y['p50'], 2)}"
+              f" p95={_f(y['p95'], 2)} (max={k1}→接受率≈{_f(acc * 100, 0)}%)")
+        print(f"   总 token={y['total']}  产出 {_f(y['tok_per_s'], 1)} tok/s"
+              f"  decode 步频 {_f(y['decode_rate'], 2)}/s")
+    else:
+        print("   无 publish c2e(token-id) 日志(token_id 版才有)")
     e = rep["exec"]
     print("④ 步耗时")
-    print(f"   引擎步 exec p50={_f(e['step_exec_p50'])}ms "
-          f"p95={_f(e['step_exec_p95'])}ms  前向 cexec p50="
-          f"{_f(e['cexec_p50'])}ms (exec≫cexec=引擎在等待/调度)")
+    print(f"   引擎步 exec p50={_f(e['p50'])}ms p95={_f(e['p95'])}ms  "
+          f"前向 cexec p50={_f(e['cp50'])}ms (exec≫cexec=在等待不在计算)")
     print("⑤ 判定")
-    verdicts = []
+    vs = []
     if ph["n"]:
-        g95, g50 = _pct(ph["decode_gaps_ms"], 95), _pct(
-            ph["decode_gaps_ms"], 50)
-        prefill_share = ph["by"].get("PREFILL", 0) / ph["n"]
-        if g95 - g50 > 200 or prefill_share > 0.3:
-            verdicts.append(
-                f"decode 间隔被拉长(p50 {_f(g50)}→p95 {_f(g95)}ms,"
-                f"PREFILL 占比 {prefill_share * 100:.0f}%)→"
-                f"【相位稀释显著】prefill 步在挤占 decode 步进")
+        g95, g50 = _pct(ph["gaps"], 95), _pct(ph["gaps"], 50)
+        pre = ph["by"].get("PREFILL", 0) / ph["n"]
+        if g95 - g50 > 200 or pre > 0.3:
+            vs.append(f"decode 间隔被拉长(p50 {_f(g50)}→p95 {_f(g95)}ms,"
+                      f"PREFILL 占 {pre * 100:.0f}%)→【相位稀释显著】")
         if ph["empty_starved"] > ph["n"] * 0.05:
-            verdicts.append(
-                f"EMPTY且pending>0 共 {ph['empty_starved']} 步→引擎有活没吃,"
-                f"存在停摆/等待段")
+            vs.append(f"EMPTY且pending>0 共 {ph['empty_starved']} 步→"
+                      f"引擎有活没吃,存在停摆/等待段")
     if a["disp_rate"] == a["disp_rate"] and a["range_rate"] == a[
             "range_rate"] and a["range_rate"] > a["disp_rate"] * 1.2:
-        verdicts.append(
-            f"RangeNotify 到达({a['range_rate']:.1f}/s)>边派发"
-            f"({a['disp_rate']:.1f}/s)→【embed 准入积压】prefill 在边侧排队")
-    if y["steps"] and y["max_tok"]:
-        acc = (sum(y["tok_flat"]) / len(y["tok_flat"])) / y["max_tok"]
+        vs.append(f"RangeNotify({a['range_rate']:.1f}/s)>边派发"
+                  f"({a['disp_rate']:.1f}/s)→【embed 准入积压】")
+    if y["steps"] and y["max"]:
+        acc = (sum(y["flat"]) / len(y["flat"])) / y["max"]
         if acc < 0.4:
-            verdicts.append(
-                f"接受率≈{acc * 100:.0f}% 偏低→MTP 在 bench 批组合下"
-                f"产出打折,对照集中式接受率核实")
-    if not verdicts:
-        verdicts.append("三个嫌疑指标均不显著——扩大样本或贴原始日志人工复核")
-    for v in verdicts:
+            vs.append(f"接受率≈{acc * 100:.0f}% 偏低→【MTP 接受率崩】"
+                      f"重点核查 draft 首趟兜底污染(单请求对照)")
+    if not vs:
+        vs.append("三个嫌疑指标均不显著——拿单请求日志跑同工具对比接受率")
+    for v in vs:
         print(f"   • {v}")
-    print("=" * 72)
+    print("=" * 72, flush=True)
 
 
 def selftest() -> int:
     import tempfile
     from pathlib import Path
     fmt = "%Y-%m-%d %H:%M:%S,%f"
-
-    def st(base, i):
-        return (base + _dt.timedelta(milliseconds=i)).strftime(fmt)[:-3]
-
     t0 = _dt.datetime(2026, 9, 18, 12, 0, 0)
+
+    def st(ms):
+        return (t0 + _dt.timedelta(milliseconds=ms)).strftime(fmt)[:-3]
+
     cloud, edge = [], []
     t = 0.0
     sn = 0
-    for cycle in range(60):          # 每 10 个 decode 步插 2 个 prefill 步
-        for j in range(10):
+    for _cycle in range(60):
+        for _j in range(10):
             cloud.append(
-                f"{st(t0, int(t * 1000))} [sched] [Lwd][sched] cloud "
-                f"step={sn} phase=DECODE seqno={j} "
-                f"reqs=[a,b] tokens=8 pending_notify=0 decode_ready=2")
+                f"{st(int(t * 1000))} [Lwd][sched] cloud step={sn} "
+                f"phase=DECODE seqno={sn} reqs=[a,b] tokens=8 "
+                f"pending_notify=0 decode_ready=2")
             sn += 1
-            cloud.append(
-                f"{st(t0, int(t * 1000))} [perf] [Lwd][perf] "
-                f"cloud-step exec=60.00ms")
-            cloud.append(
-                f"{st(t0, int(t * 1000))} [ctrl] [Lwd][cloud-ctrl] publish "
-                f"c2e(token-id): reqs=2 tokens=[4, 1]")
+            cloud.append(f"{st(int(t * 1000))} [Lwd][perf] "
+                         f"cloud-step exec=60.00ms")
+            cloud.append(f"{st(int(t * 1000))} [Lwd][cloud-ctrl] publish "
+                         f"c2e(token-id): reqs=2 tokens=[4, 1]")
             t += 0.06
         for j in range(2):
             cloud.append(
-                f"{st(t0, int(t * 1000))} [sched] [Lwd][sched] cloud "
-                f"step={sn} phase=PREFILL seqno=p{j} reqs=[c] tokens=4096 "
+                f"{st(int(t * 1000))} [Lwd][sched] cloud step={sn} "
+                f"phase=PREFILL seqno=p{j} reqs=[c] tokens=4096 "
                 f"pending_notify=1 decode_ready=2")
             sn += 1
             t += 0.25
-        cloud.append(
-            f"{st(t0, int(t * 1000))} [ctrl] [Lwd][cloud-ctrl] RangeNotify "
-            f"req=c num=4096 seqno=1")
+        cloud.append(f"{st(int(t * 1000))} [Lwd][cloud-ctrl] RangeNotify "
+                     f"req=c num=4096 seqno=1")
     for i in range(200):
         edge.append(
-            f"{st(t0, i * 50)} [sched] [Lwd][sched] edge dispatch-embed "
-            f"seqno={i} req=r tokens=2048 queue=3emb c2e_pending=0")
+            f"{st(i * 50)} [Lwd][sched] edge dispatch-embed seqno={i} "
+            f"req=r tokens=2048 queue=3emb c2e_pending=0")
         edge.append(
-            f"{st(t0, i * 50)} [sched] [Lwd][sched] edge step "
-            f"harvest_emb=1 deliver_unemb=1 disp_emb=1 queue=3emb "
-            f"c2e_pending=0")
+            f"{st(i * 50)} [Lwd][sched] edge step harvest_emb=1 "
+            f"deliver_unemb=1 disp_emb=1 queue=3emb c2e_pending=0")
     with tempfile.TemporaryDirectory() as d:
         cf, ef = Path(d) / "c.log", Path(d) / "e.log"
         cf.write_text("\n".join(cloud) + "\n")
         ef.write_text("\n".join(edge) + "\n")
         rep = analyze(str(cf), str(ef))
-        assert rep["phase"]["by"].get("DECODE") == 600, rep["phase"]["by"]
+        assert rep["phase"]["by"].get("DECODE") == 600, rep["counts"]
         assert rep["phase"]["by"].get("PREFILL") == 120
-        g95 = _pct(rep["phase"]["decode_gaps_ms"], 95)
-        assert g95 > 400, f"prefill 穿刺应拉大 decode 间隔 p95={g95}"
+        assert _pct(rep["phase"]["gaps"], 95) > 400
         assert rep["phase"]["interleave"].count(10) == 59
         assert 0 not in rep["phase"]["interleave"]
-        _flat = rep["yield"]["tok_flat"]
-        assert sum(_flat) / len(_flat) == 2.5
+        flat = rep["yield"]["flat"]
+        assert sum(flat) / len(flat) == 2.5
         assert rep["admit"]["disp_rate"] > 15
         print_report(rep)
     print("SELFTEST PASS")
