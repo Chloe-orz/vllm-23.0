@@ -108,7 +108,7 @@ def _t(line: str, idx: int) -> float:
     return float(idx)
 
 
-def report(per_req, batch, raw) -> None:
+def report(per_req, batch, raw, paths) -> None:
     print("=" * 66, flush=True)
     rows: list[tuple[float, int]] = []   # (t, reqs, 每请求值...) 展平用
     flat: list[int] = []
@@ -132,6 +132,26 @@ def report(per_req, batch, raw) -> None:
                   flush=True)
             for s in raw:
                 print(f"   | {s!r}", flush=True)
+        else:
+            print("日志中连 accept/unembed/token 字样的行都没有——先确认"
+                  "传的是边/云引擎日志(不是前端/客户端日志)。", flush=True)
+            print("自动取证:文件中含这些字样的前 5 行原文:", flush=True)
+            import re as _re
+            rx = _re.compile(r"accept|unembed|token", _re.I)
+            shown = 0
+            for path in paths:
+                with open(path, encoding="utf-8-sig",
+                          errors="replace") as fh:
+                    for line in fh:
+                        if rx.search(line):
+                            print(f"   | {line.rstrip()[:200]!r}", flush=True)
+                            shown += 1
+                            if shown >= 5:
+                                break
+                if shown >= 5:
+                    break
+            if shown == 0:
+                print("   (整份日志确实没有任何相关行)", flush=True)
         return
     print(f"数据源: {src}", flush=True)
 
@@ -205,7 +225,7 @@ def main() -> int:
     ap.add_argument("logs", nargs="+", help="边日志/云日志(可多个)")
     args = ap.parse_args()
     per_req, batch, raw = scan(args.logs)
-    report(per_req, batch, raw)
+    report(per_req, batch, raw, args.logs)
     return 0
 
 
