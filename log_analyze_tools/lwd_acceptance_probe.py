@@ -27,7 +27,11 @@ import os
 import re
 import sys
 
-RE_TS = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})[,.](\d{3})")
+# 时间戳宽容提取:行内任意位置,两种日期形态,毫秒可缺省
+RE_TS_FULL = re.compile(
+    r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:[,.](\d{1,3}))?")
+RE_TS_SHORT = re.compile(
+    r"(?<!\d)(\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:[,.](\d{1,3}))?")
 # 旧版:批级汇总(accepted 为全批之和)
 RE_UNEMBED = re.compile(
     r"\[Lwd\]\[edge-worker\] UNEMBED seqno=\d+ reqs=(\d+) "
@@ -41,9 +45,12 @@ BUCKETS = [(1, 1, "reqs=1"), (2, 4, "reqs=2-4"),
            (5, 16, "reqs=5-16"), (17, 10 ** 9, "reqs>16")]
 
 
-def _sec(ts: str, ms: str) -> float:
+def _sec(ts: str, ms: str | None) -> float:
+    # 首段 4 位=完整日期;2 位=MM-DD 短格式(年份按 2026 补)
+    if len(ts.split("-")[0]) != 4:
+        ts = "2026-" + ts
     return _dt.datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").timestamp() \
-        + int(ms) / 1000.0
+        + (int(ms) / 1000.0 if ms else 0.0)
 
 
 def _mean(v):
@@ -51,41 +58,57 @@ def _mean(v):
 
 
 def scan(paths: list[str]):
-    """返回 (per_request[(t, reqs, tokens...)], batch[(t, reqs, accepted)])."""
+    """返回 (per_request[(t, reqs, tokens...)], batch[(t, reqs, accepted)],
+    raw_samples[原始锚点行样例])."""
     per_req: list[tuple[float, int, list[int]]] = []
     batch: list[tuple[float, int, int]] = []
+    raw: list[str] = []
     for path in paths:
         size = os.path.getsize(path) if os.path.exists(path) else 0
         print(f"[probe] 解析 {path} ({size / 1e6:.1f} MB)...",
               file=sys.stderr, flush=True)
         n = 0
-        with open(path, encoding="utf-8", errors="replace") as fh:
+        # utf-8-sig:吞掉 Windows 拷贝可能带入的 BOM
+        with open(path, encoding="utf-8-sig", errors="replace") as fh:
             for line in fh:
                 n += 1
                 if n % 5_000_000 == 0:
                     print(f"[probe]   已扫描 {n:,} 行", file=sys.stderr,
                           flush=True)
-                if "[Lwd]" not in line:
+                if "[Lwd]" not in line and "UNEMBED" not in line \
+                        and "tokens=[" not in line:
                     continue
-                m = RE_TS.match(line)
-                if not m:
-                    continue
-                t = _sec(m.group(1), m.group(2))
                 mm = RE_TOKENS.search(line)
                 if mm and mm.group(2).strip():
                     toks = [int(x) for x in mm.group(2).split(",")
                             if x.strip()]
-                    per_req.append((t, len(toks), toks))
+                    per_req.append((_t(line, n), len(toks), toks))
                     continue
                 mm = RE_UNEMBED.search(line)
                 if mm:
-                    batch.append((t, int(mm.group(1)), int(mm.group(2))))
+                    batch.append((_t(line, n), int(mm.group(1)),
+                                  int(mm.group(2))))
+                    continue
+                if len(raw) < 5 and ("UNEMBED" in line
+                                     or "deliver-unembed" in line):
+                    raw.append(line.rstrip()[:200])
     per_req.sort(key=lambda x: x[0])
     batch.sort(key=lambda x: x[0])
-    return per_req, batch
+    return per_req, batch, raw
 
 
-def report(per_req, batch) -> None:
+def _t(line: str, idx: int) -> float:
+    """行时间戳;解析不出时用行号作伪时间(仅保序,不影响分组/直方图)。"""
+    m = RE_TS_FULL.search(line)
+    if m:
+        return _sec(m.group(1), m.group(2))
+    m = RE_TS_SHORT.search(line)
+    if m:
+        return _sec(m.group(1), m.group(2))
+    return float(idx)
+
+
+def report(per_req, batch, raw) -> None:
     print("=" * 66, flush=True)
     rows: list[tuple[float, int]] = []   # (t, reqs, 每请求值...) 展平用
     flat: list[int] = []
@@ -104,6 +127,11 @@ def report(per_req, batch) -> None:
     else:
         print("!! 未找到任何接受率锚点(UNEMBED / deliver-unembed / publish)",
               flush=True)
+        if raw:
+            print("发现疑似锚点但正则不匹配,前几行原文如下(用于修正正则):",
+                  flush=True)
+            for s in raw:
+                print(f"   | {s!r}", flush=True)
         return
     print(f"数据源: {src}", flush=True)
 
@@ -176,8 +204,8 @@ def main() -> int:
         description="MTP 接受率分析(纯 Python,Windows 可用)")
     ap.add_argument("logs", nargs="+", help="边日志/云日志(可多个)")
     args = ap.parse_args()
-    per_req, batch = scan(args.logs)
-    report(per_req, batch)
+    per_req, batch, raw = scan(args.logs)
+    report(per_req, batch, raw)
     return 0
 
 
