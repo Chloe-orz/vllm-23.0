@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import time
 from collections import deque
 from typing import TYPE_CHECKING
 
@@ -35,10 +34,6 @@ logger = init_logger(__name__)
 _LWD_PHASE_PREFILL_FIRST = "prefill_first"
 _LWD_PHASE_DECODE_FIRST = "decode_first"
 
-# 步元数据队满重试小睡(元数据不可丢)
-_LWD_C2E_SEND_RETRY_SLEEP_S = 0.05
-
-
 class LwdCloudScheduler(LwdBaseScheduler):
     """工作纯相位批次策略;相位(prefill_first/decode_first)构造期自解析。
     前置约束:不兼容 spec decode(eagle 会 shift num_computed_tokens,纯度判据失真)。"""
@@ -53,8 +48,8 @@ class LwdCloudScheduler(LwdBaseScheduler):
         self._last_step_was_prefill: bool = False
         # prefill 通知队列:边侧范围预告逐条入队,一步弹一条点名
         self.prefill_notify_queue: deque[LwdRangeNotify] = deque()
-        # 步元数据发布面(引擎装配后回填);None 期间步输出透传
-        self.lwd_publisher = None
+        # 步末待发 c2e(update_from_output 入列,引擎 post_step 冲刷)
+        self.pending_c2e: list[LwdC2eNotify] = []
         logger.info(
             "[Lwd] cloud scheduler: single-request prefill batches "
             "enforced (edge/cloud chunk stream stays per-request contiguous)"
@@ -171,17 +166,23 @@ class LwdCloudScheduler(LwdBaseScheduler):
         scheduler_output: SchedulerOutput,
         model_output: "ModelRunnerOutput",
     ) -> "dict[int, EngineCoreOutputs]":
-        """原生入账后解 pinned 载荷组 c2e 发边(边侧据此预挂 DOWN
-        recv);carrier 缺席或发布面未就绪仅透传。"""
+        """原生入账后解 pinned 载荷组 c2e 入 pending_c2e(纯提取,
+        不做 I/O;引擎 post_step 统一冲刷发边——边侧据此预挂 DOWN
+        recv);carrier 缺席仅透传。"""
         engine_core_outputs = super().update_from_output(scheduler_output, model_output)
         carrier = getattr(model_output, "lwd_down_carrier", None)
-        if carrier is None or self.lwd_publisher is None:
+        if carrier is None:
             return engine_core_outputs
         meta = self._lwd_carrier_to_meta(carrier)
         LwdDebug.cloud_step(self, meta, engine_core_outputs)  # [lwd-debug]
-        self._lwd_publish_c2e(
-            meta, self._lwd_c2e_finish_reasons(meta, engine_core_outputs)
-        )
+        self.pending_c2e.append(LwdC2eNotify(
+            hidden_num_elements=meta.hidden_num_elements,
+            top_id_ths=meta.top_id_ths,
+            num_accepted_tokens=meta.num_accepted_tokens,
+            req_ids=meta.req_ids,
+            finish_reasons=self._lwd_c2e_finish_reasons(meta, engine_core_outputs),
+            down_seqno=meta.down_seqno,
+        ))
         return engine_core_outputs
 
     @staticmethod
@@ -228,25 +229,3 @@ class LwdCloudScheduler(LwdBaseScheduler):
             for request_id in meta.req_ids
         ]
 
-    def _lwd_publish_c2e(self, meta: "LwdC2eMeta", finish_reasons: list[int]) -> None:
-        """步元数据(含逐请求完成码)发边:队满小睡重试,关停退出。"""
-        notify = LwdC2eNotify(
-            hidden_num_elements=meta.hidden_num_elements,
-            top_id_ths=meta.top_id_ths,
-            num_accepted_tokens=meta.num_accepted_tokens,
-            req_ids=meta.req_ids,
-            finish_reasons=finish_reasons,
-            down_seqno=meta.down_seqno,
-        )
-        while not self.lwd_publisher.closed:
-            if self.lwd_publisher.publish(notify):
-                logger.info(
-                    "[Lwd][cloud-ctrl] publish C2eNotify reqs=%d down_seqno=%s "
-                    "finish=%s hidden_elems=%s",
-                    len(notify.req_ids),
-                    notify.down_seqno,
-                    finish_reasons,
-                    notify.hidden_num_elements,
-                )
-                return
-            time.sleep(_LWD_C2E_SEND_RETRY_SLEEP_S)

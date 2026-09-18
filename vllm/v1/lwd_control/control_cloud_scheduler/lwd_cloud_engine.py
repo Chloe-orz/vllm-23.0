@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import time
 
 import torch
 
@@ -31,6 +32,10 @@ from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import LwdBaseEngineC
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+# c2e 队满重试小睡(元数据不可丢)
+_LWD_C2E_SEND_RETRY_SLEEP_S = 0.05
+
 
 class LwdCloudEngineCore(LwdBaseEngineCore):
     """云 PO 引擎:构造期建 ZMQ 双面 + 起 PRE_OUT 接收线程,其余全走原生。"""
@@ -165,3 +170,23 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         )
         request.lwd_embeds_placeholder = True  # 同上:占位 embeds 不上 MQ
         return request
+
+    def post_step(self, model_executed: bool) -> None:
+        """步末冲刷待发 c2e:update_from_output 只入列(纯提取不做
+        I/O),发布在此归引擎层;两条步路径(step/step_with_batch_queue)
+        的原生尾部都会走到本钩子。队满小睡重试,关停退出。"""
+        for notify in self.scheduler.pending_c2e:
+            while not self._publisher.closed:
+                if self._publisher.publish(notify):
+                    logger.info(
+                        "[Lwd][cloud-ctrl] publish C2eNotify reqs=%d down_seqno=%s "
+                        "finish=%s hidden_elems=%s",
+                        len(notify.req_ids),
+                        notify.down_seqno,
+                        notify.finish_reasons,
+                        notify.hidden_num_elements,
+                    )
+                    break
+                time.sleep(_LWD_C2E_SEND_RETRY_SLEEP_S)
+        self.scheduler.pending_c2e.clear()
+        super().post_step(model_executed)

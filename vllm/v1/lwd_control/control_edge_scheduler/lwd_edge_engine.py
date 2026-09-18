@@ -91,6 +91,8 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         # 构造期等待是边侧唯一的发现窗口
         self._hello_event = threading.Event()
         self._lwd_setup_planes()
+        # 发布面回填调度器(schedule_prefill 的 RangeNotify 出口)
+        self.scheduler.lwd_publisher = self._publisher
         if not self._hello_event.wait(config.hello_timeout_s):
             self._lwd_shutdown_planes()
             raise RuntimeError(
