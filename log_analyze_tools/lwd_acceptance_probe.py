@@ -69,7 +69,7 @@ def scan(paths: list[str]):
               file=sys.stderr, flush=True)
         n = 0
         # utf-8-sig:吞掉 Windows 拷贝可能带入的 BOM
-        with open(path, encoding="utf-8-sig", errors="replace") as fh:
+        with open(path, encoding="utf-16" if open(path, "rb").read(2) in (b"\xff\xfe", b"\xfe\xff") else "utf-8-sig", errors="replace") as fh:
             for line in fh:
                 n += 1
                 if n % 5_000_000 == 0:
@@ -140,8 +140,7 @@ def report(per_req, batch, raw, paths) -> None:
             rx = _re.compile(r"accept|unembed|token", _re.I)
             shown = 0
             for path in paths:
-                with open(path, encoding="utf-8-sig",
-                          errors="replace") as fh:
+                with open(path, encoding="utf-16" if open(path, "rb").read(2) in (b"\xff\xfe", b"\xfe\xff") else "utf-8-sig", errors="replace") as fh:
                     for line in fh:
                         if rx.search(line):
                             print(f"   | {line.rstrip()[:200]!r}", flush=True)
