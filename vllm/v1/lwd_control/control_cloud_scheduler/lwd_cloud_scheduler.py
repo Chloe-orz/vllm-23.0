@@ -26,8 +26,8 @@ from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
 from vllm.v1.lwd_debug import LwdDebug
 
 if TYPE_CHECKING:
-    from vllm.v1.engine import EngineCoreOutputs, ModelRunnerOutput
-    from vllm.v1.outputs import LwdC2eMeta
+    from vllm.v1.engine import EngineCoreOutputs
+    from vllm.v1.outputs import LwdC2eMeta, ModelRunnerOutput
 
 logger = init_logger(__name__)
 

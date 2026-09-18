@@ -33,7 +33,8 @@ from collections import deque
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
-from vllm.v1.engine import EngineCoreRequestType, RequestStatus
+from vllm.v1.engine import EngineCoreRequestType
+from vllm.v1.request import RequestStatus
 from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
     LwdControlPublisher,
 )
