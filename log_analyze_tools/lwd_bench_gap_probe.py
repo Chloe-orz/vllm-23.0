@@ -42,7 +42,10 @@ import os
 import re
 import sys
 
-RE_TS = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})[,.](\d{3})")
+RE_TS_FULL = re.compile(
+    r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:[,.](\d{1,3}))?")
+RE_TS_SHORT = re.compile(
+    r"(?<!\d)(\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:[,.](\d{1,3}))?")
 
 RE_PHASE = re.compile(
     r"\[Lwd\]\[sched\] cloud step=\d+ phase=(\w+) seqno=\S+ "
@@ -65,9 +68,23 @@ RE_DELIVER = re.compile(
 _PROGRESS_EVERY = 5_000_000
 
 
-def _sec(ts: str, ms: str) -> float:
+def _sec(ts: str, ms: str | None) -> float:
+    if len(ts.split("-")[0]) != 4:
+        ts = "2026-" + ts
     return _dt.datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").timestamp() \
-        + int(ms) / 1000.0
+        + (int(ms) / 1000.0 if ms else 0.0)
+
+
+def _t(line: str, idx: int) -> tuple[float, bool]:
+    """行时间戳 + 是否真实时间(解析失败用行号伪时间保序,
+    伪时间下间隔类指标不可用)。"""
+    m = RE_TS_FULL.search(line)
+    if m:
+        return _sec(m.group(1), m.group(2)), True
+    m = RE_TS_SHORT.search(line)
+    if m:
+        return _sec(m.group(1), m.group(2)), True
+    return float(idx), False
 
 
 def _pct(v, p):
@@ -102,7 +119,10 @@ def _scan(path: str, which: str) -> dict:
     size = os.path.getsize(path) if os.path.exists(path) else 0
     print(f"[probe] 解析{which}日志 {path} ({size / 1e6:.1f} MB)...",
           file=sys.stderr, flush=True)
-    with open(path, encoding="utf-8", errors="replace") as fh:
+    enc = ("utf-16" if open(path, "rb").read(2) in (b"\xff\xfe", b"\xfe\xff")
+           else "utf-8-sig")
+    pseudo = 0
+    with open(path, encoding=enc, errors="replace") as fh:
         for line in fh:
             n += 1
             if n % _PROGRESS_EVERY == 0:
@@ -110,22 +130,18 @@ def _scan(path: str, which: str) -> dict:
                       file=sys.stderr, flush=True)
             if "[Lwd]" not in line:
                 continue  # 快速预过滤:绝大多数行非锚点,跳过全部正则
-            m = RE_TS.match(line)
-            if not m:
-                continue
-            t = _sec(m.group(1), m.group(2))
+            t, real = _t(line, n)
+            if not real:
+                pseudo += 1
             if which == "云":
                 mm = RE_PHASE.search(line)
                 if mm:
                     reqs_raw, toks = mm.group(2), int(mm.group(3))
-                    n = reqs_raw.count(",") + 1 if reqs_raw else 0
-                    if "+Nmore" in reqs_raw:  # 截断标记:近似用可见数+1
-                        pass
-                    import re as _re2
-                    m2 = _re2.search(r"\+(\d+)more", reqs_raw)
-                    if m2:
-                        n = n - 1 + int(m2.group(1))
-                    ratio = (toks / n) if n else 0.0
+                    n_reqs = reqs_raw.count(",") + 1 if reqs_raw else 0
+                    m2 = re.search(r"\+(\d+)more", reqs_raw)
+                    if m2:  # 截断标记:可见数补上 more 数
+                        n_reqs = n_reqs - 1 + int(m2.group(1))
+                    ratio = (toks / n_reqs) if n_reqs else 0.0
                     phase.append((t, mm.group(1), int(mm.group(4)), ratio))
                     hits += 1
                     continue
@@ -170,7 +186,7 @@ def _scan(path: str, which: str) -> dict:
     return {
         "phase": phase, "exec_ms": exec_ms, "cexec_ms": cexec_ms,
         "pub": pub, "range_t": range_t, "disp": disp, "step_q": step_q,
-        "deliv_rows": deliv_rows,
+        "deliv_rows": deliv_rows, "pseudo": pseudo,
         "counts": (
             {"cloud-phase": len(phase), "cloud-exec": len(exec_ms),
              "cloud-cexec": len(cexec_ms), "cloud-publish": len(pub),
@@ -185,6 +201,7 @@ def _scan(path: str, which: str) -> dict:
 def analyze(cloud_path: str, edge_path: str) -> dict:
     c = _scan(cloud_path, "云")
     e = _scan(edge_path, "边")
+    rep_pseudo = c["pseudo"] + e["pseudo"]
     rep: dict = {"counts": c["counts"] | e["counts"]}
 
     phases = c["phase"]
@@ -192,7 +209,8 @@ def analyze(cloud_path: str, edge_path: str) -> dict:
     for _, ph, _, _ in phases:
         n_by[ph] = n_by.get(ph, 0) + 1
     dec_ts = [t for t, ph, _, _ in phases if ph == "DECODE"]
-    gaps = [(b - a) * 1000 for a, b in zip(dec_ts, dec_ts[1:]) if b > a]
+    gaps = ([(b - a) * 1000 for a, b in zip(dec_ts, dec_ts[1:]) if b > a]
+            if rep_pseudo == 0 else [])
     # decode 步调度密度(tokens/请求数)按"上一步相位"分组:
     # ≈1=spec 未被调度(调度侧病灶),≈4=调度了但验证被拒(对位病灶)
     ratio_after: dict[str, list[float]] = {}
@@ -221,7 +239,7 @@ def analyze(cloud_path: str, edge_path: str) -> dict:
     empty_starved = sum(1 for _, ph, pend, _ in phases
                         if ph == "EMPTY" and pend > 0)
     rep["phase"] = {
-        "n": len(phases), "by": n_by, "gaps": gaps,
+        "n": len(phases), "by": n_by, "gaps": gaps, "pseudo": rep_pseudo,
         "interleave": interleave, "empty_starved": empty_starved,
         "ratio_after": ratio_after,
     }
@@ -275,8 +293,11 @@ def print_report(rep: dict) -> None:
         print(f"   步数={ph['n']}  构成={share}  "
               f"EMPTY且pending>0={ph['empty_starved']} 步")
         g, it = ph["gaps"], ph["interleave"]
-        print(f"   decode 间隔 ms: p50={_f(_pct(g, 50))} "
-              f"p95={_f(_pct(g, 95))} max={_f(max(g)) if g else 'n/a'}")
+        if ph.get("pseudo"):
+            print("   (时间戳不可解析:间隔类指标不可用,密度/构成仍有效)")
+        else:
+            print(f"   decode 间隔 ms: p50={_f(_pct(g, 50))} "
+                  f"p95={_f(_pct(g, 95))} max={_f(max(g)) if g else 'n/a'}")
         print(f"   相邻 PREFILL 串间 decode 步数: "
               f"min={min(it) if it else 'n/a'} p50={_f(_pct(it, 50))}")
         ra = ph["ratio_after"]
