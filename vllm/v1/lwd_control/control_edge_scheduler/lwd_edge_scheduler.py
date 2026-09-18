@@ -30,6 +30,7 @@ from vllm.v1.core.sched.output import (
     LwdBatch,
     LwdBatchType,
     LwdEmbedBatch,
+    LwdUnembedBatch,
     SchedulerOutput,
 )
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
@@ -405,3 +406,43 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 f"(request {request.request_id}): not carried on the "
                 "edge->cloud wire, cloud would silently sample without them"
             )
+
+def lwd_build_unembed_batch(notify: LwdC2eNotify) -> SchedulerOutput:
+    """组 UNEMBED 批(引擎步内调用,云载荷派发给边 worker 做 lm_head)。
+
+    云结果不经过原生 schedule,无原生排程产物可用——以 make_empty
+    为骨架:
+    - lwd_batch 携带 LwdUnembedBatch:req_ids(隐藏行序)/
+      num_accept_tokens/top_id_ths 逐请求透传自 c2e;批序号将随 c2e
+      通告携带(规划),当前占位 0;recv_num_elements
+      (DOWN 通道每请求接收元素数)与 out_token_idxs(生成序号)控制面
+      不可知,留空由数据面按 DOWN 张量实收推导;
+    - 请求集合同步镜像到 num_scheduled_tokens:值 = 该请求本步
+      hidden 行数(num_accepted_tokens 对位,spec 步可 >1),保持
+      原生管道字段语义一致,不作 token 预算解释。
+    """
+    scheduler_output = SchedulerOutput.make_empty()
+    # 每请求本步还原的 token 数 = hidden 行数 = num_accepted_tokens
+    # (spec 步一请求可多行,非 spec 恒 1);与 req_ids 按位对齐,错配
+    # fail-fast
+    assert len(notify.num_accepted_tokens) == len(notify.req_ids)
+    scheduler_output.num_scheduled_tokens = dict(
+        zip(notify.req_ids, notify.num_accepted_tokens)
+    )
+    scheduler_output.total_num_scheduled_tokens = sum(
+        notify.num_accepted_tokens
+    )
+    scheduler_output.lwd_batch = LwdBatch(
+        batch_type=LwdBatchType.LWD_UNEMBED,
+        seqno=notify.down_seqno,
+        batch_meta=LwdUnembedBatch(
+            req_ids=list(notify.req_ids),
+            num_accept_tokens=list(notify.num_accepted_tokens),
+            recv_num_elements=notify.hidden_num_elements,
+            out_token_idxs=[],
+            top_id_ths=list(notify.top_id_ths),
+            token_ids=[list(t) for t in notify.token_ids],
+        ),
+    )
+    scheduler_output.lwd_c2e_notify = [notify]
+    return scheduler_output

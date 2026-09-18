@@ -39,7 +39,7 @@ from vllm.v1.request import Request
 
 if TYPE_CHECKING:
     from vllm.v1.engine import EngineCoreOutputs
-    from vllm.v1.outputs import ModelRunnerOutput
+    from vllm.v1.outputs import LwdC2eMeta, ModelRunnerOutput
 
 logger = init_logger(__name__)
 
@@ -49,6 +49,13 @@ LWD_PRE_OUT_RECV_TIMEOUT_MS = 5000
 # 步元数据队满重试小睡:元数据不可丢(边侧据此预挂精确尺寸 recv)
 _LWD_C2E_SEND_RETRY_SLEEP_S = 0.05
 
+
+def _lwd_token_id_mode() -> bool:
+    """token_id 回传版总开关(VLLM_ASCEND_LWD_EDGE_SKIP_SAMPLE=1):
+    token 经 c2e 通告直付边侧,云侧跳过 DOWN 张量发送,边侧不再派
+    UNEMBED 批(收发通道代码保留,开关关闭即回 rank-replay 模式)。
+    诊断/实验用途,生产禁开(token id 不上网线的约束)。"""
+    return os.environ.get("VLLM_ASCEND_LWD_EDGE_SKIP_SAMPLE") == "1"
 
 
 class LwdCloudEngineCore(EngineCoreProc):
@@ -287,51 +294,101 @@ class LwdCloudEngineCore(EngineCoreProc):
             (time.monotonic() - _t0) * 1000,
         )
         return out
+
     def lwd_handle_model_output(
         self,
         model_output: ModelRunnerOutput,
         engine_core_outputs: dict[int, EngineCoreOutputs],
     ) -> ModelRunnerOutput:
-        """token_id 回传版:采样 token ids 直接随 model_output 抵达
-        (async 调度下已在侧线程物化为 host 列表),由此组 c2e notify 经
-        POST_OUT 发边;逐请求 finish_reasons 完成码取自本步
-        engine_core_outputs 的 finish(原生停止条件即云侧 decode 终结
-        的事实源)。每步必发(含无产出步的 finish),不依赖 DOWN 载荷。"""
-        ids_by_req = self._lwd_ids_by_req(engine_core_outputs)
-        reasons = self._lwd_finish_reason_map(engine_core_outputs)
-        req_ids = list(dict.fromkeys(
-            list(ids_by_req.keys()) + list(reasons.keys())
-        ))
-        if not req_ids:
-            logger.info(
-                "[Lwd][cloud-ctrl] handle_model_output: no sampled reqs "
-                "this step"
+        """rank-replay:解码 worker 主流末尾 pinned 物化的步 meta(就绪由
+        响应入队处的 event synchronize 保证),组 c2e 通告经 POST_OUT
+        先于 hidden 发边;finish 码取自 engine_core_outputs。
+
+        pinned 布局:[ranks(各调度段行)..., counts(accepted/请求)...,
+        seg_lens(段长/请求)...];top_id_ths 按段长切,被拒行一并携带,
+        边侧按 num_accepted 取有效前缀。"""
+        # [Lwd][perf] cloud-step dt 已由 exec 时长替代(见 step_with_batch_queue
+        # 覆写):开始执行→执行结束,不含无请求的空等。
+        carrier = getattr(model_output, "lwd_down_carrier", None)
+        if carrier is not None:
+            pinned, req_ids, hidden_numel, seqno = carrier
+            n_req = len(req_ids)
+            vals = pinned.tolist()
+            counts = vals[-2 * n_req : -n_req]
+            seg_lens = vals[-n_req:]
+            ranks_flat = vals[: -2 * n_req]
+            top_id_ths: list[list[int]] = []
+            off = 0
+            for seg_len in seg_lens:
+                top_id_ths.append(ranks_flat[off : off + seg_len])
+                off += seg_len
+            from vllm.v1.outputs import LwdC2eMeta
+
+            meta = LwdC2eMeta(
+                hidden_num_elements=hidden_numel,
+                top_id_ths=top_id_ths,
+                num_accepted_tokens=list(counts),
+                req_ids=list(req_ids),
+                down_seqno=seqno,
             )
-            return model_output
-        logger.info(
-            "[Lwd][cloud-ctrl] publish c2e(token-id): reqs=%d tokens=%s",
-            len(req_ids), [len(ids_by_req.get(rid, [])) for rid in req_ids],
-        )
-        LwdDebug.cloud_step(self.scheduler, req_ids, engine_core_outputs)  # [lwd-debug]
-        _t = time.monotonic()
-        self._lwd_send_notify(LwdC2eNotify(
-            hidden_num_elements=0,
-            top_id_ths=[[] for _ in req_ids],
-            num_accepted_tokens=[
-                len(ids_by_req.get(rid, [])) for rid in req_ids
-            ],
-            req_ids=req_ids,
-            finish_reasons=[
-                reasons.get(rid, LWD_NOT_FINISHED) for rid in req_ids
-            ],
-            down_seqno=-1,
-            token_ids=[ids_by_req.get(rid, []) for rid in req_ids],
-        ))
-        # [Lwd][perf] 云侧 LWD 税:finish 码推导 + ZMQ publish
-        logger.info(
-            "[Lwd][perf] publish reqs=%d dur=%.2fms",
-            len(req_ids), (time.monotonic() - _t) * 1000,
-        )
+            logger.info(
+                "[Lwd][cloud-ctrl] publish c2e(rank-replay): reqs=%s "
+                "rows=%d seqno=%d",
+                meta.req_ids, off, seqno,
+            )
+            LwdDebug.cloud_step(self.scheduler, meta, engine_core_outputs)  # [lwd-debug]
+            _t = time.monotonic()
+            # 诊断旁路(VLLM_ASCEND_LWD_EDGE_SKIP_SAMPLE=1):把本步逐请求
+            # accepted token ids 捎带给边侧,边侧跳过 lm_head/rank-replay
+            # 直接交付,用于把边侧 unembed 从 ITL 归因中剥离。
+            token_ids: list[list[int]] = []
+            if _lwd_token_id_mode():
+                token_ids = [
+                    self._lwd_ids_by_req(engine_core_outputs).get(rid, [])
+                    for rid in meta.req_ids
+                ]
+            self._lwd_publish_c2e(
+                meta,
+                self._lwd_c2e_finish_reasons(meta, engine_core_outputs),
+                token_ids,
+            )
+            # [Lwd][perf] 云侧 LWD 税:finish 码推导 + ZMQ publish
+            logger.info(
+                "[Lwd][perf] publish reqs=%d dur=%.2fms",
+                len(meta.req_ids), (time.monotonic() - _t) * 1000,
+            )
+        elif _lwd_token_id_mode():
+            # token_id 回传版:无 carrier 的步也直发 tokens-only 通告——
+            # 交付不依赖"本步恰好有 DOWN payload"(收尾步/空步的 finish
+            # 不再丢车),云 worker 在本模式下已跳过 DOWN 发送
+            ids_by_req = self._lwd_ids_by_req(engine_core_outputs)
+            reasons = self._lwd_finish_reason_map(engine_core_outputs)
+            req_ids = list(dict.fromkeys(
+                list(ids_by_req.keys()) + list(reasons.keys())
+            ))
+            if req_ids:
+                self._lwd_send_notify(LwdC2eNotify(
+                    hidden_num_elements=0,
+                    top_id_ths=[[] for _ in req_ids],
+                    num_accepted_tokens=[
+                        len(ids_by_req.get(rid, [])) for rid in req_ids
+                    ],
+                    req_ids=req_ids,
+                    finish_reasons=[
+                        reasons.get(rid, LWD_NOT_FINISHED) for rid in req_ids
+                    ],
+                    down_seqno=-1,
+                    token_ids=[ids_by_req.get(rid, []) for rid in req_ids],
+                ))
+                logger.info(
+                    "[Lwd][cloud-ctrl] publish c2e(token-id): reqs=%d "
+                    "finish=%s", len(req_ids),
+                    [reasons.get(rid) for rid in req_ids],
+                )
+        else:
+            logger.info(
+                "[Lwd][cloud-ctrl] handle_model_output: no down carrier this step"
+            )
         return model_output
 
     @staticmethod
@@ -361,6 +418,37 @@ class LwdCloudEngineCore(EngineCoreProc):
             for request_id in outputs.finished_requests or ():
                 reasons.setdefault(request_id, int(FinishReason.ABORT))
         return reasons
+
+    @staticmethod
+    def _lwd_c2e_finish_reasons(
+        meta: LwdC2eMeta,
+        engine_core_outputs: dict[int, EngineCoreOutputs],
+    ) -> list[int]:
+        """req_ids 对齐的逐请求完成码:本步任一 EngineCoreOutputs 里带
+        finish_reason 的输出取其码;仅进 finished_requests 的缺口按 ABORT
+        兜底;其余 LWD_NOT_FINISHED(边侧保持 awaiting,由后续步通告收口)。"""
+        reasons = LwdCloudEngineCore._lwd_finish_reason_map(engine_core_outputs)
+        return [reasons.get(request_id, LWD_NOT_FINISHED)
+                for request_id in meta.req_ids]
+
+    def _lwd_publish_c2e(
+        self,
+        meta: LwdC2eMeta,
+        finish_reasons: list[int],
+        token_ids: list[list[int]] | None = None,
+    ) -> None:
+        """步元数据(含逐请求 finish_reasons 完成码)发边:队满小睡重试
+        (元数据不可丢),关停(closed)退出。token_ids 仅诊断旁路
+        (VLLM_ASCEND_LWD_EDGE_SKIP_SAMPLE)携带。"""
+        self._lwd_send_notify(LwdC2eNotify(
+            hidden_num_elements=meta.hidden_num_elements,
+            top_id_ths=meta.top_id_ths,
+            num_accepted_tokens=meta.num_accepted_tokens,
+            req_ids=meta.req_ids,
+            finish_reasons=finish_reasons,
+            down_seqno=meta.down_seqno,
+            token_ids=token_ids or [],
+        ))
 
     def _lwd_send_notify(self, notify: LwdC2eNotify) -> None:
         """c2e 通告发边:队满小睡重试(元数据不可丢),关停退出。"""

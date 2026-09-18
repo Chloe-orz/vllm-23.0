@@ -70,10 +70,8 @@ LWD_NOT_FINISHED = -1
 
 
 class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):
-    """云->边步通告(POST_OUT)。token_id 回传版:token ids 随通告直付,
-    每步必发(含无产出步的 finish);hidden/top_id_ths/down_seqno 为
-    rank-replay 时代字段,现恒为占位值(0/[]/-1),仅为 msgspec 结构
-    兼容保留。"""
+    """云->边步元数据通告(POST_OUT),先于隐藏张量到达,边侧据此预挂精确
+    尺寸 recv;hidden_num_elements=0 为纯终结通告,边侧本地终结不派发 unembed。"""
 
     hidden_num_elements: int
     top_id_ths: list[list[int]]
@@ -85,10 +83,13 @@ class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):
     REPETITION=4),边侧原样透传 finish_reason(LENGTH 不再伪装成 STOP)。
     空列表 = 云侧未携带,错配即 IndexError fail-fast。"""
     down_seqno: int = -1
-    """rank-replay 时代字段,token_id 版恒 -1(无 DOWN 张量配对)。"""
+    """本步 DOWN 隐藏张量的通道序号,自 LwdC2eMeta.down_seqno 原样透传:
+    云 worker 发送时分配(通道级单调),边侧按此值预挂配对 irecv;
+    缺省 -1 = 旧版云侧未携带(msgspec 带默认字段,线上 additive 兼容)。"""
     token_ids: list[list[int]] = []
-    """逐请求 accepted token ids,与 req_ids 按位对齐——token_id 回传版
-    的主载荷,边侧到达即付。"""
+    """诊断旁路载荷:云侧逐请求 accepted token ids(仅
+    VLLM_ASCEND_LWD_EDGE_SKIP_SAMPLE=1 时填充),与 req_ids 按位对齐。
+    空列表 = 未携带,边侧走原生 rank-replay(lm_head + top_id_ths)。"""
 
 
 # typing.Union 而非 PEP 604 `|`:msgspec 解码器的全版本支持路径
@@ -97,7 +98,7 @@ LwdNotify = Union[LwdRangeNotify, LwdRequestNotify, LwdAbortNotify]  # noqa: UP0
 # 驱动);重同步消息在此 union 上 additive 扩展
 LwdCloudNotify = Union[LwdHelloNotify, LwdC2eNotify]  # noqa: UP007
 # 数据面批型定义归 vllm/v1/core/sched/output.py(LwdBatch/LwdBatchType/
-# LwdEmbedBatch,f8182fd5 定稿),协议层不重复声明
+# LwdEmbedBatch/LwdUnembedBatch,f8182fd5 定稿),协议层不重复声明
 
 _NOTIFY_DECODER = msgspec.msgpack.Decoder(LwdNotify)
 _CLOUD_NOTIFY_DECODER = msgspec.msgpack.Decoder(LwdCloudNotify)
