@@ -48,7 +48,7 @@ RE_TS_SHORT = re.compile(
     r"(?<!\d)(\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:[,.](\d{1,3}))?")
 
 RE_PHASE = re.compile(
-    r"\[Lwd\]\[sched\] cloud step=\d+ phase=(\w+) seqno=\S+ "
+    r"\[Lwd\]\[sched\] cloud step=\d+ phase=(\w+) seqno=\S* "
     r"reqs=\[(.*?)\] tokens=(\d+) pending_notify=(\d+) decode_ready=\d+")
 RE_EXEC = re.compile(r"\[Lwd\]\[perf\] cloud-step exec=([\d.]+)ms")
 RE_CEXEC = re.compile(r"\[Lwd\]\[perf\] cloud-exec total=([\d.]+)ms")
@@ -58,10 +58,11 @@ RE_PUB = re.compile(
 RE_RANGE = re.compile(r"\[Lwd\]\[cloud-ctrl\] RangeNotify req=")
 RE_DISP_EMB = re.compile(
     r"\[Lwd\]\[sched\] edge dispatch-embed seqno=\d+ req=\S+ tokens=(\d+) "
-    r"queue=(\d+)emb c2e_pending=(\d+)")
+    r"(?:queue=(\d+)emb|ahead_unemb=\d+ ahead_emb=(\d+)) c2e_pending=(\d+)")
 RE_STEP = re.compile(
-    r"\[Lwd\]\[sched\] edge step harvest_emb=\d+ deliver_unemb=\d+ "
-    r"disp_emb=\d+ queue=(\d+)emb c2e_pending=(\d+)")
+    r"\[Lwd\]\[sched\] edge step harvest_emb=\d+ "
+    r"(?:harvest_unemb=\d+ |deliver_unemb=\d+ )disp_emb=\d+ "
+    r"(?:disp_unemb=\d+ )?queue=(\d+)emb(?:/\d+unemb)? c2e_pending=(\d+)")
 RE_DELIVER = re.compile(
     r"\[Lwd\]\[sched\] edge deliver-unembed reqs=(\d+) tokens=\[([\d, ]*)\]")
 
@@ -167,8 +168,9 @@ def _scan(path: str, which: str) -> dict:
             else:
                 mm = RE_DISP_EMB.search(line)
                 if mm:
-                    disp.append((t, int(mm.group(1)), int(mm.group(2)),
-                                 int(mm.group(3))))
+                    nums = [g for g in mm.groups() if g is not None]
+                    disp.append((t, int(nums[0]), int(nums[1]),
+                                 int(nums[-1])))
                     hits += 1
                     continue
                 mm = RE_STEP.search(line)
