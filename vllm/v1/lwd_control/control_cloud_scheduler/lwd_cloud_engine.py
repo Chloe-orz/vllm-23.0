@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from typing import TYPE_CHECKING
@@ -329,8 +330,21 @@ class LwdCloudEngineCore(EngineCoreProc):
             )
             LwdDebug.cloud_step(self.scheduler, meta, engine_core_outputs)  # [lwd-debug]
             _t = time.monotonic()
+            # 诊断旁路(VLLM_ASCEND_LWD_EDGE_SKIP_SAMPLE=1):把本步逐请求
+            # accepted token ids 捎带给边侧,边侧跳过 lm_head/rank-replay
+            # 直接交付,用于把边侧 unembed 从 ITL 归因中剥离。
+            token_ids: list[list[int]] = []
+            if os.environ.get("VLLM_ASCEND_LWD_EDGE_SKIP_SAMPLE") == "1":
+                ids_by_req: dict[str, list[int]] = {}
+                for outputs in engine_core_outputs.values():
+                    for out in outputs.outputs:
+                        if out.new_token_ids:
+                            ids_by_req[out.request_id] = list(out.new_token_ids)
+                token_ids = [ids_by_req.get(rid, []) for rid in meta.req_ids]
             self._lwd_publish_c2e(
-                meta, self._lwd_c2e_finish_reasons(meta, engine_core_outputs)
+                meta,
+                self._lwd_c2e_finish_reasons(meta, engine_core_outputs),
+                token_ids,
             )
             # [Lwd][perf] 云侧 LWD 税:finish 码推导 + ZMQ publish
             logger.info(
@@ -361,9 +375,15 @@ class LwdCloudEngineCore(EngineCoreProc):
         return [reasons.get(request_id, LWD_NOT_FINISHED)
                 for request_id in meta.req_ids]
 
-    def _lwd_publish_c2e(self, meta: LwdC2eMeta, finish_reasons: list[int]) -> None:
+    def _lwd_publish_c2e(
+        self,
+        meta: LwdC2eMeta,
+        finish_reasons: list[int],
+        token_ids: list[list[int]] | None = None,
+    ) -> None:
         """步元数据(含逐请求 finish_reasons 完成码)发边:队满小睡重试
-        (元数据不可丢),关停(closed)退出。"""
+        (元数据不可丢),关停(closed)退出。token_ids 仅诊断旁路
+        (VLLM_ASCEND_LWD_EDGE_SKIP_SAMPLE)携带。"""
         notify = LwdC2eNotify(
             hidden_num_elements=meta.hidden_num_elements,
             top_id_ths=meta.top_id_ths,
@@ -371,6 +391,7 @@ class LwdCloudEngineCore(EngineCoreProc):
             req_ids=meta.req_ids,
             finish_reasons=finish_reasons,
             down_seqno=meta.down_seqno,
+            token_ids=token_ids or [],
         )
         while not self._lwd_post_out.closed:
             if self._lwd_post_out.publish(notify):

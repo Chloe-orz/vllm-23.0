@@ -441,6 +441,7 @@ def lwd_build_unembed_batch(notify: LwdC2eNotify) -> SchedulerOutput:
             recv_num_elements=notify.hidden_num_elements,
             out_token_idxs=[],
             top_id_ths=list(notify.top_id_ths),
+            token_ids=[list(t) for t in notify.token_ids],
         ),
     )
     scheduler_output.lwd_c2e_notify = [notify]

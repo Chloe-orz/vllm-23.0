@@ -86,6 +86,10 @@ class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):
     """本步 DOWN 隐藏张量的通道序号,自 LwdC2eMeta.down_seqno 原样透传:
     云 worker 发送时分配(通道级单调),边侧按此值预挂配对 irecv;
     缺省 -1 = 旧版云侧未携带(msgspec 带默认字段,线上 additive 兼容)。"""
+    token_ids: list[list[int]] = []
+    """诊断旁路载荷:云侧逐请求 accepted token ids(仅
+    VLLM_ASCEND_LWD_EDGE_SKIP_SAMPLE=1 时填充),与 req_ids 按位对齐。
+    空列表 = 未携带,边侧走原生 rank-replay(lm_head + top_id_ths)。"""
 
 
 # typing.Union 而非 PEP 604 `|`:msgspec 解码器的全版本支持路径
