@@ -246,7 +246,18 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         """原生入账后消费云侧完成码(兜底终结):云侧判停而原生
         check_stop 未触发的请求在此终结并补带完成码的空输出。终结必须
         在 super() 后(本批行含最后 token,批不能跳过执行);原生已停/
-        迟到的请求已出 requests,自然跳过。"""
+        迟到的请求已出 requests,自然跳过。
+
+        EMBED 批无本地出账(采样在云侧,进度已于调度期乐观推进),整体
+        跳过原生入账:原生循环以 num_scheduled_tokens 为驱动、要求输出
+        含全部已调度请求,空输出必 KeyError。"""
+        batch = scheduler_output.lwd_batch
+        if batch is not None and batch.batch_type is LwdBatchType.LWD_EMBED:
+            engine_core_outputs: dict[int, EngineCoreOutputs] = {}
+        else:
+            engine_core_outputs = super().update_from_output(
+                scheduler_output, model_output
+            )
         for notify in getattr(scheduler_output, "lwd_c2e_notify", None) or ():
             for rid, code in zip(notify.req_ids, notify.finish_reasons):
                 if code == LWD_NOT_FINISHED:
