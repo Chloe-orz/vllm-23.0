@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import threading
 import time
-from collections import deque
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
@@ -59,9 +58,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# 步进流水深度:对齐旧手搓批队列的深度,由原生 batch_queue 机制承担
-LWD_EDGE_BATCH_DEPTH = 4
-
 # 请求元数据预告发布重试:次数 x 递增间隔(共约 3s),耗尽即请求级报错
 _LWD_ADD_RETRY_STEPS = 5
 _LWD_ADD_RETRY_INTERVAL_S = 0.2
@@ -72,18 +68,14 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
 
     步进全走父类(schedule → execute → update_from_output):调度器
     相位模板出 EMBED/UNEMBED 批并自带载荷,worker 契约不变;流水深度
-    强制 4,由原生 batch_queue 机制承担。"""
+    由原生 batch_queue 机制承担(async_scheduling 默认开)。"""
 
     lwd_scheduler_cls = LwdEdgeScheduler
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        # 流水深度强制 4:切换到原生 batch_queue 异步调度路径(worker 侧
-        # non_block 提交契约与旧手搓流水线一致;原生 async_scheduling 标志
-        # 仅剩 spec-decode 消费点,边侧无 spec,强行切换无冲突)
-        self.batch_queue_size = LWD_EDGE_BATCH_DEPTH
-        self.batch_queue = deque(maxlen=LWD_EDGE_BATCH_DEPTH)
-        self.step_fn = self.step_with_batch_queue
+        # 流水深度放大到 4(旧手搓队列深度):size 管填充阈值,maxlen 须同步放大(否则静默挤丢在飞批)
+        self.batch_queue_size, self.batch_queue = 4, type(self.batch_queue)(self.batch_queue, maxlen=4)
         config = self.lwd_config
         # 层日志总开关:env 已开则不动,config 段开则补开(仅本进程)
         LwdLogBase.set_debug(config.debug)
