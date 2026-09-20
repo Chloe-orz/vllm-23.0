@@ -28,8 +28,15 @@ class LwdBaseEngineCore(EngineCoreProc):
     def __init__(self, *args, **kwargs) -> None:
         self._publisher: LwdControlPublisher | None = None
         self._subscriber: LwdControlSubscriber | None = None
-        kwargs["vllm_config"].scheduler_config.scheduler_cls = self.lwd_scheduler_cls
+        scheduler_config = kwargs["vllm_config"].scheduler_config
+        scheduler_config.scheduler_cls = self.lwd_scheduler_cls
+        chunked_prefill_wanted = scheduler_config.enable_chunked_prefill
         super().__init__(*args, **kwargs)
+        # 上游 EngineCore 会对无 KV cache 组的部署禁用 chunked prefill,
+        # LWD 长序列分块依赖其开启:恢复构造前取值,使放开仅作用于 LWD
+        # 引擎(调度器对该开关为活读,构造后恢复即生效)
+        if not scheduler_config.enable_chunked_prefill and chunked_prefill_wanted:
+            scheduler_config.enable_chunked_prefill = True
         self.lwd_config: LwdConfig = kwargs["vllm_config"].lwd_config
 
     def _lwd_setup_planes(self) -> None:

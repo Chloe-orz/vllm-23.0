@@ -84,24 +84,20 @@ class LwdCloudScheduler(LwdBaseScheduler):
         return self._lwd_schedule_for_visible_reqs(req_ids)
 
     def schedule_prefill(self) -> SchedulerOutput:
-        """弹一条范围预告点名其请求,可见集调度;空步(KV 压力未准入)
-        回塞队首重试,准入后挂 EMBED 批。"""
+        """纯 prefill 步:取队首预告,按公告量钳制本步预算,照单执行。"""
         notify = q.popleft() if (q := self.prefill_notify_queue) else None
         if notify is not None and notify.request_id not in self.requests:
             # 请求已被 abort 释放:丢弃陈旧预告
             notify = None
-        if notify is not None:
-            logger.info(
-                "[Lwd][cloud-sched] prefill notify req=%s seqno=%s num=%s",
-                notify.request_id, notify.seqno, notify.num_tokens,
-            )
-        req_ids = [notify.request_id] if notify is not None else []
-        out = self._lwd_schedule_for_visible_reqs(req_ids)
         if notify is None:
-            return out
-        if not out.num_scheduled_tokens:
-            self.prefill_notify_queue.appendleft(notify)
-            return out
+            return self._lwd_schedule_for_visible_reqs([])
+        logger.info(
+            "[Lwd][cloud-sched] prefill notify req=%s seqno=%s num=%s",
+            notify.request_id, notify.seqno, notify.num_tokens,
+        )
+        out = self._lwd_schedule_for_visible_reqs(
+            [notify.request_id], token_budget_cap=notify.num_tokens
+        )
         # 占位 token 行数必须等于边侧实际发送数(HCCL P2P 要求两端
         # numel 匹配);seqno 为 UP 链配对号,与边侧 EMBED 批同源同值
         out.lwd_batch = LwdBatch(
@@ -110,6 +106,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
             batch_meta=LwdEmbedBatch(
                 req_ids=[notify.request_id],
                 token_ids=[[0] * notify.num_tokens],
+                token_offsets=[notify.offset],
             ),
         )
         return out

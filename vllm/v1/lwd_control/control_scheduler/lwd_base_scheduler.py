@@ -84,12 +84,17 @@ class LwdBaseScheduler(AsyncScheduler):
             queue.add_request(req)
         return queue
 
-    def _lwd_schedule_for_visible_reqs(self, req_ids: list[str]) -> SchedulerOutput:
+    def _lwd_schedule_for_visible_reqs(
+        self, req_ids: list[str], token_budget_cap: int | None = None
+    ) -> SchedulerOutput:
         """把 req_ids 指定的请求从三队列剔除、单独调度,步后按原队列拼回。
 
         waiting/skipped 来源的请求走原生准入窗口(allocate/状态迁移/
         记账一样不少),running 来源的走续跑。拼回:仍被调度的接在隐藏
-        running 之后,被抢占的排 waiting 尾部,被跳过的排 skipped 队首。"""
+        running 之后,被抢占的排 waiting 尾部,被跳过的排 skipped 队首。
+
+        参数 ``token_budget_cap``:本步 prefill 预算上限,用于把"本步执行
+        多少token"的决定权从云侧原生预算移交给边侧公告量。仅用于收紧,不放宽原生上限。"""
         picked = {self.requests[req_id] for req_id in req_ids}
         from_running = [req for req in self.running if req in picked]
         from_waiting = [req for req in self.waiting if req in picked]
@@ -108,12 +113,18 @@ class LwdBaseScheduler(AsyncScheduler):
         self.running = from_running
         self.waiting = self._lwd_new_queue(from_waiting)
         self.skipped_waiting = self._lwd_new_queue(from_skipped)
+        saved_token_budget = self.max_num_scheduled_tokens
+        if token_budget_cap is not None:
+            self.max_num_scheduled_tokens = min(
+                saved_token_budget, max(0, token_budget_cap)
+            )
         try:
             out = super().schedule()
         finally:
-            # 先恢复名额再拼回:running 存活者接尾,waiting 被抢占者排队尾,
+            # 先恢复名额与预算再拼回:running 存活者接尾,waiting 被抢占者排队尾,
             # skipped 被跳过者排队首
             self.max_num_running_reqs = saved_cap
+            self.max_num_scheduled_tokens = saved_token_budget
             post = (self.running, self.waiting, self.skipped_waiting)
             self.running, self.waiting, self.skipped_waiting = saved
             self.running += post[0]
