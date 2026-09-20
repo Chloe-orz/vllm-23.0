@@ -292,6 +292,17 @@ class LwdCloudEngineCore(EngineCoreProc):
         model_output: ModelRunnerOutput,
         engine_core_outputs: dict[int, EngineCoreOutputs],
     ) -> ModelRunnerOutput:
+        # [Lwd][mtp-dbg] 逐请求接受数探针(默认开,引擎侧单点,同步/
+        # 异步调度通吃):new_token_ids 即本步接受数。配对相位日志,
+        # lwd_mtp_dbg_probe 按 fresh/aged × gen-after-phase 分桶判决
+        # 草稿污染机制
+        for outputs in engine_core_outputs.values():
+            for out in outputs.outputs:
+                if out.new_token_ids:
+                    logger.info(
+                        "[Lwd][mtp-dbg] verify req=%s accepted=%d",
+                        out.request_id, len(out.new_token_ids),
+                    )
         """rank-replay:解码 worker 主流末尾 pinned 物化的步 meta(就绪由
         响应入队处的 event synchronize 保证),组 c2e 通告经 POST_OUT
         先于 hidden 发边;finish 码取自 engine_core_outputs。
