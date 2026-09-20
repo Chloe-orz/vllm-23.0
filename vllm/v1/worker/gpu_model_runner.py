@@ -1789,6 +1789,18 @@ class GPUModelRunner(
         for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
             prev_positions[i] = prev_req_id_to_index.get(req_id, -1)
 
+    def _get_scatter_prev_positions(self, num_reqs: int) -> np.ndarray:
+        """Row positions used by _prepare_input_ids' GPU passthrough scatter.
+
+        Default: the plain prev-batch mapping. Subclasses (LWD phase
+        scheduling) override to fall back one more generation for decode
+        requests hidden from the previous (pure prefill) batch, keeping
+        the draft/sample passthrough alive across the phase alternation.
+        The accounting consumers (num_computed_tokens correction kernels)
+        keep reading self.prev_positions, whose semantics stay unchanged.
+        """
+        return self.prev_positions.np[:num_reqs]
+
     def _prepare_input_ids(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1817,7 +1829,9 @@ class GPUModelRunner(
         # Async scheduling case, where some decode requests from the previous
         # iteration won't have entries in input_ids_cpu and need to be copied
         # on the GPU from prev_sampled_token_ids.
-        prev_positions = self.prev_positions.np[:num_reqs]
+
+        # LWD passthrough: shadow rows fall back one generation here.
+        prev_positions = self._get_scatter_prev_positions(num_reqs)
         scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
         sample_flattened_indices: list[int] = []
         spec_flattened_indices: list[int] = []
