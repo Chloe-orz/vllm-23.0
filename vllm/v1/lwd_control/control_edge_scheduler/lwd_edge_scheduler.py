@@ -247,9 +247,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         check_stop 未触发的请求在此终结并补带完成码的空输出。终结必须
         在 super() 后(本批行含最后 token,批不能跳过执行);原生已停/
         迟到的请求已出 requests,自然跳过。"""
-        engine_core_outputs = super().update_from_output(
-            scheduler_output, model_output
-        )
         for notify in getattr(scheduler_output, "lwd_c2e_notify", None) or ():
             for rid, code in zip(notify.req_ids, notify.finish_reasons):
                 if code == LWD_NOT_FINISHED:

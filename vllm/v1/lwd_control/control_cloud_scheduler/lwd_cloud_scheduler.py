@@ -86,9 +86,6 @@ class LwdCloudScheduler(LwdBaseScheduler):
     def schedule_prefill(self) -> SchedulerOutput:
         """纯 prefill 步:取队首预告,按公告量钳制本步预算,照单执行。"""
         notify = q.popleft() if (q := self.prefill_notify_queue) else None
-        if notify is not None and notify.request_id not in self.requests:
-            # 请求已被 abort 释放:丢弃陈旧预告
-            notify = None
         if notify is None:
             return self._lwd_schedule_for_visible_reqs([])
         logger.info(
