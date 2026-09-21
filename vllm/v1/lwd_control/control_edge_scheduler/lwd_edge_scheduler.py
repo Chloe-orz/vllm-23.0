@@ -193,6 +193,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             )
             request.num_computed_tokens += accept[rid]
         out = SchedulerOutput.make_empty()
+        # 手工构造不经原生排程,同样须交接并重置 finished_req_ids
+        out.finished_req_ids = self.finished_req_ids
+        self.finished_req_ids = set()
         out.num_scheduled_tokens = {rid: accept[rid] for rid in targets}
         out.total_num_scheduled_tokens = sum(accept[rid] for rid in targets)
         self._lwd_attach_unembed_batch(out, notify)

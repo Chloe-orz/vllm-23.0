@@ -53,14 +53,17 @@ class LwdBaseScheduler(AsyncScheduler):
         (embed/unembed)由两侧实现各自挂批,不在本层出现。"""
         phase = self._lwd_select_phase()
         if phase is None:
-            # [诊断] 空步不进原生 schedule,其尾部的 finished_req_ids
-            # 交接在此不可达;打出 has_requests 的两个判定项以定位
-            # 空转驱动源(unfinished= 谁还在调度器, finished_ids= 花名册)
+            out = SchedulerOutput.make_empty()
+            # 原生 schedule() 尾部会交接并重置 finished_req_ids(载给
+            # worker 清每请求缓存态);空步不进原生排程,须自做——否则
+            # 花名册只进不出,has_finished_requests() 恒真,主循环空转
+            out.finished_req_ids = self.finished_req_ids
+            self.finished_req_ids = set()
             logger.info(
-                "[Lwd][diag] idle step: unfinished=%s finished_ids=%s",
-                self.get_num_unfinished_requests(), self.finished_req_ids,
+                "[Lwd][diag] idle flush: unfinished=%s handed_off=%s",
+                self.get_num_unfinished_requests(), out.finished_req_ids,
             )
-            return SchedulerOutput.make_empty()
+            return out
         out = (
             self.schedule_prefill()
             if phase is LwdReqPhase.PREFILL
