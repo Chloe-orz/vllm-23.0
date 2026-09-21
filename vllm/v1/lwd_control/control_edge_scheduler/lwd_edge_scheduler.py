@@ -243,6 +243,14 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             engine_core_outputs = super().update_from_output(
                 scheduler_output, model_output
             )
+        # [诊断] 判停后 _free_request 的两段效果:请求已出队列/requests
+        # (unfinished 归零),id 进花名册等下一次 schedule 尾部交接
+        if self.finished_req_ids:
+            logger.info(
+                "[Lwd][diag] finished registry: %s (unfinished=%s)",
+                self.finished_req_ids,
+                self.get_num_unfinished_requests(),
+            )
         for notify in getattr(scheduler_output, "lwd_c2e_notify", None) or ():
             for rid, code in zip(notify.req_ids, notify.finish_reasons):
                 if code == LWD_NOT_FINISHED:

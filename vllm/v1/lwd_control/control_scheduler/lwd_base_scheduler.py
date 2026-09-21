@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import enum
 
+from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
 
 
 class LwdReqPhase(enum.Enum):
@@ -50,6 +53,13 @@ class LwdBaseScheduler(AsyncScheduler):
         (embed/unembed)由两侧实现各自挂批,不在本层出现。"""
         phase = self._lwd_select_phase()
         if phase is None:
+            # [诊断] 空步不进原生 schedule,其尾部的 finished_req_ids
+            # 交接在此不可达;打出 has_requests 的两个判定项以定位
+            # 空转驱动源(unfinished= 谁还在调度器, finished_ids= 花名册)
+            logger.info(
+                "[Lwd][diag] idle step: unfinished=%s finished_ids=%s",
+                self.get_num_unfinished_requests(), self.finished_req_ids,
+            )
             return SchedulerOutput.make_empty()
         out = (
             self.schedule_prefill()
