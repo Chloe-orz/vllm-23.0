@@ -239,6 +239,8 @@ class LwdCloudEngineCore(EngineCoreProc):
         publisher = getattr(self, "_lwd_post_out", None)
         if publisher is not None:
             publisher.shutdown()
+        for post_out in (getattr(self, "_lwd_post_outs", None) or {}).values():
+            post_out.shutdown()
         super().shutdown()
 
     def _lwd_dispatch(self, edge_id: int, msg) -> None:

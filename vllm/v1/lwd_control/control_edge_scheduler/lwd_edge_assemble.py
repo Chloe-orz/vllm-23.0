@@ -157,6 +157,14 @@ def _lwd_apply_env_overrides(config: LwdConfig) -> LwdConfig:
     post_bind = os.getenv(_LWD_ENV_PREFIX + "POST_OUT_BIND")
     hello_timeout = _lwd_read_env_float("HELLO_TIMEOUT_S")
     debug = os.getenv(_LWD_ENV_PREFIX + "DEBUG")
+    raw_transport = os.getenv(_LWD_ENV_PREFIX + "CTRL_TRANSPORT")
+    if raw_transport is not None and raw_transport.lower() not in ("pubsub", "router"):
+        logger.warning(
+            "[Lwd] ignore invalid env %sCTRL_TRANSPORT=%r (pubsub|router)",
+            _LWD_ENV_PREFIX,
+            raw_transport,
+        )
+        raw_transport = None
     return LwdConfig(
         is_edge_node=config.is_edge_node,
         pre_out_host=host if host else config.pre_out_host,
