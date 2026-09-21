@@ -58,9 +58,6 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
         # prefill 通知队列:边侧范围预告(RangeNotify)逐条入队,每步取
         # 队首点名其 request_id;预告自带 seqno 即本步 UP 链配对号
         self.prefill_notify_queue: deque[LwdRangeNotify] = deque()
-        # 边侧 prefill 切块权威:本步强制调度 token 数(= 预告 chunk),
-        # 供原生 schedule 两路径钩子读取,步末复位 None(无强制)
-        self._lwd_forced_prefill_tokens: int | None = None
         # [Lwd][sched] 调度批日志步计数(饿死分析:RangeNotify 到达 →
         # PREFILL 步消费的间隔与中间插入的 decode 步数)
         self._lwd_sched_step = 0
@@ -218,8 +215,9 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
     # ------------------------------------------------------------------ #
     def _schedule_pure_prefill(self) -> SchedulerOutput:
         """纯 prefill 步:prefill_notify_queue 有预告则取队首 msg,单独
-        调度其请求(按原队列归位,waiting/skipped 来源走原生准入);没有则
-        空集进窗口,等价空步,三队列原样保留。"""
+        调度其请求(按公告量钳制本步预算,照单执行;按原队列归位,
+        waiting/skipped 来源走原生准入);没有则空集进窗口,等价空步,
+        三队列原样保留。"""
         notify = q.popleft() if (q := self.prefill_notify_queue) else None
         if notify is not None and notify.request_id not in self.requests:
             # 请求已被 abort 释放:丢弃陈旧预告,本步按空集走
@@ -229,17 +227,14 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
                 "[Lwd][cloud-sched] prefill notify req=%s seqno=%s num=%s",
                 notify.request_id, notify.seqno, notify.num_tokens,
             )
-        req_ids = [notify.request_id] if notify is not None else []
-        # 云侧按边侧预告 chunk 原样执行,不复切块:把预告 token 数作为强制
-        # 调度量传给原生 schedule(running/waiting 两路径的钩子读取),保证
-        # num_scheduled_tokens == notify.num_tokens,边云锁步。
-        self._lwd_forced_prefill_tokens = (
-            notify.num_tokens if notify is not None else None
+        # 边侧是 prefill 切块权威,云侧按预告 chunk 钳制本步预算执行
+        # (只收紧不放宽原生上限):num_scheduled_tokens == 公告量,边云
+        # 锁步;mamba align 的块对齐复切在原生路径内照常生效(边侧
+        # chunk 块对齐时为 no-op)。
+        out = self._lwd_schedule_for_visible_reqs(
+            [notify.request_id] if notify is not None else [],
+            token_budget_cap=notify.num_tokens if notify is not None else None,
         )
-        try:
-            out = self._lwd_schedule_for_visible_reqs(req_ids)
-        finally:
-            self._lwd_forced_prefill_tokens = None
         if notify is None:
             return out
         if not out.num_scheduled_tokens:
