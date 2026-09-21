@@ -915,7 +915,13 @@ class EngineCoreProc(EngineCore):
         tensor_queue: Queue | None = None,
         *,
         engine_index: int = 0,
+        cloud_control_command_queue: Any | None = None,
+        cloud_control_event_queue: Any | None = None,
     ):
+        # 云侧前缀复用协调:父进程(uvicorn 宿主)与云引擎子进程的命令/事件队列;
+        # None = 未启用(边侧或未开 lwd_coordination)。
+        self.cloud_control_command_queue = cloud_control_command_queue
+        self.cloud_control_event_queue = cloud_control_event_queue
         self.input_queue = queue.Queue[tuple[EngineCoreRequestType, Any]]()
         self.output_queue = queue.Queue[tuple[int, EngineCoreOutputs] | bytes]()
         executor_fail_callback = lambda: self.input_queue.put_nowait(

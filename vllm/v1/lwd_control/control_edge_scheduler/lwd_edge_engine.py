@@ -101,6 +101,11 @@ class LwdEdgeEngineCore(EngineCoreProc):
         # 按底层队列序排水,交错收割会连带等错批。t_dispatch 供
         # [Lwd][sched] harvest wait(派发→收割)度量批在队列里的滞留时长
         self._lwd_batch_queue: deque = deque()
+        # 云侧回边的 usage(含 prompt_tokens_details.cached_tokens)。
+        # 消费口径**与参考分支一致:仅边侧留痕**(参考打 event
+        # `edge_usage_received`,我们落此 dict + 同字段日志),**不注入客户端
+        # 响应**;留存可供后续可选消费者取用(边界淘汰最旧,防长期运行增长)。
+        self.lwd_edge_usages: dict[str, dict] = {}
         # 装配期模式分叉:registry_path 非空 = 云侧复用,单 ROUTER 通道
         # connect 全部云;为空 = 现状 1E1C 单套 Publisher/Subscriber +
         # 阻塞等云首拍 HELLO
@@ -517,6 +522,30 @@ class LwdEdgeEngineCore(EngineCoreProc):
             )
             if finished:
                 finished_reqs.add(request_id)
+                self._lwd_consume_usage(notify, index, request_id)
+
+    def _lwd_consume_usage(
+        self, notify: LwdC2eNotify, index: int, request_id: str
+    ) -> None:
+        """消费云侧随 C2e 回边的 usage(含 cached_tokens)。
+
+        参考分支经探针 SSE 末 chunk 回 usage;prefill_only 边侧探针同步、
+        不消费 body,故改挂步元数据通道。落 ``lwd_edge_usages`` 供记账/前端
+        取用,fail-open(缺字段即跳过)。"""
+        usages = getattr(notify, "usages", None)
+        if not usages or index >= len(usages) or not usages[index]:
+            return
+        usage = usages[index]
+        if len(self.lwd_edge_usages) >= 4096:
+            for stale in list(self.lwd_edge_usages)[:512]:
+                self.lwd_edge_usages.pop(stale, None)
+        self.lwd_edge_usages[request_id] = usage
+        details = usage.get("prompt_tokens_details") or {}
+        logger.info(
+            "[Lwd][edge] usage req=%s prompt=%s completion=%s total=%s cached=%s",
+            request_id, usage.get("prompt_tokens"), usage.get("completion_tokens"),
+            usage.get("total_tokens"), details.get("cached_tokens"),
+        )
 
     @staticmethod
     def _lwd_finish_code(

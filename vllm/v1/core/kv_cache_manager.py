@@ -219,6 +219,13 @@ class KVCacheManager:
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
         max_cache_hit_length = request.num_tokens - 1
+        # LWD prefill_only:续算边界由边侧声明(probe 命中并 trim 后的
+        # chunk 起点,随请求预告透传);云侧 resume 不得超过它,否则
+        # 「边未裁/裁得少、云侧块池却命中更多」会在注入起点处错位。
+        # 缺省 0 = 边侧未裁剪 = 不续算(与边侧恒发整段 embed 一致)。
+        lwd_declared_hit = getattr(request, "lwd_resume_cap_tokens", None)
+        if lwd_declared_hit is not None:
+            max_cache_hit_length = min(max_cache_hit_length, lwd_declared_hit)
         computed_blocks, num_new_computed_tokens = (
             self.coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length

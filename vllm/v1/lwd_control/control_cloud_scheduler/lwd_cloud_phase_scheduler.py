@@ -7,17 +7,20 @@ import time
 from collections import deque
 
 from vllm.logger import init_logger
+from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 from vllm.v1.core.sched.output import (
     LwdBatch,
     LwdBatchType,
     LwdEmbedBatch,
     SchedulerOutput,
 )
+from vllm.v1.core.sched.scheduler import Scheduler as _NativeScheduler
 from vllm.v1.lwd_control.control_communication.lwd_id_adapter import parse_edge_id
 from vllm.v1.lwd_control.control_communication.lwd_notify import LwdRangeNotify
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     LwdBaseScheduler,
 )
+from vllm.v1.request import RequestStatus
 
 logger = init_logger(__name__)
 
@@ -31,6 +34,20 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        # 收尾快照:request_id -> (prompt_tokens, completion_tokens)。
+        # 释放链唯一收口点是 ``_free_request``(常规终结 update_from_output 直接
+        # 调它,**不经 finish_requests**);而 LWD 的 finish/usage 结算发生在其后
+        # 的 lwd_handle_model_output —— 那时请求已从 self.requests 摘除(旧实现
+        # 因此从不结算、预留泄漏)。故在 _free_request 覆写里抓最小快照,由引擎
+        # 侧消费(消费即摘除);超上限按插入序兜底淘汰残留。
+        self.lwd_finished_records: dict[str, tuple[int, int]] = {}
+        # 块哈希粒度(与边侧链同域):用于生成段块登记窗口的 token 换算
+        self._lwd_hash_block_size = resolve_kv_cache_block_sizes(
+            self.kv_cache_config, self.vllm_config
+        )[1]
+        # 生成段块登记读数:request_id -> 已按边侧链登记的满块数(验证多轮命中边界是否
+        # 含生成段;每登记一个新满块打一条,量级 = 每 block_size 生成 token 一次)
+        self.lwd_gen_registered_blocks: dict[str, int] = {}
         self._lwd_prefill_first = self._lwd_resolve_phase()
         # One-shot 翻转:某相位空步而另一相位有活时,强制下一步走后者;
         # 双标志显式定向,按偏好取反会错翻,造成空步死循环。
@@ -41,6 +58,9 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
         # prefill 通知队列:边侧范围预告(RangeNotify)逐条入队,每步取
         # 队首点名其 request_id;预告自带 seqno 即本步 UP 链配对号
         self.prefill_notify_queue: deque[LwdRangeNotify] = deque()
+        # 边侧 prefill 切块权威:本步强制调度 token 数(= 预告 chunk),
+        # 供原生 schedule 两路径钩子读取,步末复位 None(无强制)
+        self._lwd_forced_prefill_tokens: int | None = None
         # [Lwd][sched] 调度批日志步计数(饿死分析:RangeNotify 到达 →
         # PREFILL 步消费的间隔与中间插入的 decode 步数)
         self._lwd_sched_step = 0
@@ -48,6 +68,108 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
             "[Lwd] cloud phase scheduler: single-request prefill batches "
             "enforced (edge/cloud chunk stream stays per-request contiguous)"
         )
+
+    def _free_request(self, request, delay_free_blocks: bool = False):
+        """收尾快照(见 ``lwd_finished_records``):挂在**释放链唯一收口点**。
+
+        常规终结(update_from_output 里 check_stop 命中)是直接
+        ``self._free_request(request)``(**不经 finish_requests**),abort/error
+        走 ``finish_requests`` → ``_free_request``;两者都收口于本方法,故快照
+        必须挂这里(挂 finish_requests 会漏掉绝大多数正常结束)。此刻请求尚在、
+        长度已是最终值(update_from_output 先落 token 再终结);由引擎侧消费
+        (消费即摘除),超上限按插入序兜底淘汰残留。"""
+        try:
+            self.lwd_finished_records[request.request_id] = (
+                request.num_prompt_tokens,
+                request.num_tokens - request.num_prompt_tokens,
+            )
+            if len(self.lwd_finished_records) > 1024:
+                for stale in list(self.lwd_finished_records)[:256]:
+                    self.lwd_finished_records.pop(stale, None)
+                logger.warning(
+                    "[Lwd][coord] finished-record table full; evicted oldest"
+                )
+        except Exception:  # noqa: BLE001  快照失败不阻断释放
+            logger.warning(
+                "[Lwd][coord] finished snapshot failed (non-fatal)", exc_info=True
+            )
+        return super()._free_request(request, delay_free_blocks)
+
+    def _lwd_capped_cache_tokens(self, request) -> int:
+        """生成段块登记窗口:封顶到「边侧 HMAC 链已覆盖」的 token 数。
+
+        生成段 token 的 HMAC 只有持密钥的边能算(``LwdGenChainNotify`` 全量
+        替换上报);链未到达前不得登记这些块——否则会以 local_hasher 键入池,
+        而块一旦登记无法按 HMAC 重登记。链缺失 → 只登记 prompt 段(fail-safe
+        降级:生成段块不入池);链到达后由后续步自动追平。"""
+        num_computed = (
+            request.num_computed_tokens - request.num_output_placeholders
+        )
+        prompt_end = request.num_prompt_tokens
+        if num_computed <= prompt_end:
+            return num_computed
+        chains = getattr(self, "lwd_edge_chains", None)
+        if chains is None:
+            # 协调未启用:不封顶,保持原生登记行为(生成段块照常按本地哈希入池)
+            return num_computed
+        entry = chains.get(request.request_id)
+        if not entry:
+            return prompt_end
+        block_size, chain = entry
+        if int(block_size) != self._lwd_hash_block_size:
+            # 链粒度 ≠ 本地 hash 粒度(ratio≠1):链索引与云内 block_hashes
+            # 错位,不采用(生成段块不入池,fail-safe)
+            return prompt_end
+        covered = len(chain) * self._lwd_hash_block_size
+        return min(num_computed, max(prompt_end, covered))
+
+    def _lwd_log_gen_registration(self, request, capped_tokens: int) -> None:
+        """生成段块按边侧链的登记进度读数(每新登记一个满块打一条)。
+
+        prompt 段之后才是生成段;水位按 request_id 记。验证多轮复用时看这条:
+        下一条请求的 probe 命中边界应能覆盖到这里登记的块数。"""
+        prompt_end = request.num_prompt_tokens
+        if capped_tokens <= prompt_end:
+            return
+        covered = capped_tokens // self._lwd_hash_block_size
+        if covered <= self.lwd_gen_registered_blocks.get(request.request_id, 0):
+            return
+        if len(self.lwd_gen_registered_blocks) >= 4096:
+            for stale in list(self.lwd_gen_registered_blocks)[:512]:
+                self.lwd_gen_registered_blocks.pop(stale, None)
+        self.lwd_gen_registered_blocks[request.request_id] = covered
+        logger.info(
+            "[Lwd][coord] gen-blocks registered req=%s covered_blocks=%d "
+            "(prompt_blocks=%d)",
+            request.request_id, covered,
+            prompt_end // self._lwd_hash_block_size,
+        )
+
+    def _update_request_with_output(self, request, new_token_ids):
+        """与 AsyncScheduler 同款,仅把生成段块的 cache 窗口封顶。
+
+        直接调 ``Scheduler`` 的实现(而非 super():super 是 AsyncScheduler,
+        会按未封顶窗口再登记一次),再按 async 语义补 async_tokens_to_discard
+        与 num_output_placeholders 两项记账。
+
+        **升级检查点**:本覆写入参/语义与
+        ``vllm/v1/core/sched/async_scheduler.py:AsyncScheduler._update_request_with_output``
+        及 ``vllm/v1/core/sched/scheduler.py:Scheduler._update_request_with_output``
+        对偶——上游若改这两处(async 记账项/停止判定),此处必须同步。"""
+        if request.async_tokens_to_discard > 0:
+            request.async_tokens_to_discard -= 1
+            return [], False
+        status_before_update = request.status
+        new_token_ids, stopped = _NativeScheduler._update_request_with_output(
+            self, request, new_token_ids
+        )
+        request.num_output_placeholders -= len(new_token_ids)
+        assert request.num_output_placeholders >= 0
+        if status_before_update == RequestStatus.RUNNING:
+            capped_tokens = self._lwd_capped_cache_tokens(request)
+            self.kv_cache_manager.cache_blocks(request, capped_tokens)
+            self._lwd_log_gen_registration(request, capped_tokens)
+        return new_token_ids, stopped
 
     def _lwd_resolve_phase(self) -> bool:
         """返回 True=prefill_first;缺省/未知相位告警回退 prefill_first。"""
@@ -108,7 +230,16 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
                 notify.request_id, notify.seqno, notify.num_tokens,
             )
         req_ids = [notify.request_id] if notify is not None else []
-        out = self._lwd_schedule_for_visible_reqs(req_ids)
+        # 云侧按边侧预告 chunk 原样执行,不复切块:把预告 token 数作为强制
+        # 调度量传给原生 schedule(running/waiting 两路径的钩子读取),保证
+        # num_scheduled_tokens == notify.num_tokens,边云锁步。
+        self._lwd_forced_prefill_tokens = (
+            notify.num_tokens if notify is not None else None
+        )
+        try:
+            out = self._lwd_schedule_for_visible_reqs(req_ids)
+        finally:
+            self._lwd_forced_prefill_tokens = None
         if notify is None:
             return out
         if not out.num_scheduled_tokens:

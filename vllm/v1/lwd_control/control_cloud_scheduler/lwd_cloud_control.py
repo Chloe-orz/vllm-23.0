@@ -1,0 +1,266 @@
+# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+"""云侧前缀协商 HTTP 控制面(prefill_only 裁剪版)。
+
+从参考分支 ``edge_cloud/cloud_control.py`` 裁剪:父进程 FastAPI 应用 + 桥
+(LwdCloudControlBridge),子进程处理器(LwdCloudControlProcessor,poll 非阻塞),
+经两条 multiprocessing 队列对接。宿主是 ``LwdCloudEngineCore``(替代参考分支
+的 ``PassiveEngineCore``)。
+
+本控制面**只承载 probe 一个事件**(命中结果随 JSON 响应头立即回边)。
+usage 不在此通道:它随数据面步元数据 ``LwdC2eNotify.usages`` 回边(参考分支
+原经探针 SSE 流末 chunk 承载且**只做边侧日志留痕**,我们换通道但保持同一
+消费口径——见 ``LwdEdgeEngineCore._lwd_consume_usage``)。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import queue
+import threading
+import time
+from dataclasses import replace as dataclass_replace
+from typing import Any
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+from vllm.logger import init_logger
+from vllm.v1.lwd_control.control_communication.lwd_id_adapter import wrap_req_id
+from vllm.v1.lwd_control.control_communication.lwd_prefix import (
+    HEADER_EDGE_ID,
+    LwdPrefixManifest,
+    LwdProbeResult,
+)
+
+logger = init_logger(__name__)
+
+
+class LwdCloudControlBridge:
+    """父进程侧:把 HTTP 协程与子进程的 probe 事件用队列对接。
+
+    result 通过普通字典轮询回传(dispatch 线程写入、handler 协程 await sleep
+    轮询),刻意避开「跨线程 asyncio.Future + call_soon_threadsafe」——后者在
+    uvicorn 挂线程 + uvloop 环境下会出现 future 不 resolve、响应头迟迟不发的
+    诡异卡死。轮询简单、可观测、无跨线程事件循环依赖。
+    """
+
+    _PROBE_POLL_INTERVAL = 0.02
+
+    def __init__(self, command_queue: Any, event_queue: Any) -> None:
+        self._command_queue = command_queue
+        self._event_queue = event_queue
+        self._results: dict[str, tuple[bool, Any]] = {}
+        self._lock = threading.Lock()
+        self._closed = False
+        self._dispatch_thread = threading.Thread(
+            target=self._dispatch_events, name="lwd-ctrl-dispatch", daemon=True
+        )
+
+    def start(self) -> None:
+        self._dispatch_thread.start()
+
+    def close(self) -> None:
+        self._closed = True
+
+    async def probe(
+        self, manifest: LwdPrefixManifest, timeout: float = 60.0
+    ) -> LwdProbeResult:
+        """发探针命令并同步轮询结果;超时抛 TimeoutError(由 handler 转 503)。"""
+        logger.info("[Lwd][ctrl] bridge probe req=%s", manifest.request_id)
+        self._command_queue.put({"type": "probe", "manifest": manifest})
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._lock:
+                entry = self._results.pop(manifest.request_id, None)
+            if entry is not None:
+                ok, payload = entry
+                if ok:
+                    return payload
+                raise RuntimeError(payload or "probe failed")
+            await asyncio.sleep(self._PROBE_POLL_INTERVAL)
+        raise TimeoutError(f"prefix probe timed out after {timeout}s")
+
+    def _dispatch_events(self) -> None:
+        while not self._closed:
+            try:
+                event = self._event_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            logger.info(
+                "[Lwd][ctrl] dispatch got event type=%s req=%s ok=%s",
+                event.get("type"), event.get("request_id"), event.get("ok"),
+            )
+            kind = event.get("type")
+            if kind == "probe":
+                with self._lock:
+                    self._results[event["request_id"]] = (
+                        bool(event.get("ok")),
+                        event.get("result") if event.get("ok") else event.get("error"),
+                    )
+
+
+class LwdCloudControlProcessor:
+    """子进程侧:step 循环头部非阻塞 poll,消费 probe 命令、回填事件。"""
+
+    def __init__(self, command_queue: Any, event_queue: Any) -> None:
+        self._command_queue = command_queue
+        self._event_queue = event_queue
+
+    def poll(self, coordinator: Any) -> None:
+        while True:
+            command = None
+            # mp Queue 的 get_nowait 有 feeder 线程竞态:父进程刚 put、共享信号量
+            # 尚未被释放的瞬间会 spurious Empty,漏掉命令。短 sleep + 重试给
+            # feeder 腾出 flush 时间。
+            for _ in range(3):
+                try:
+                    command = self._command_queue.get_nowait()
+                    break
+                except queue.Empty:
+                    time.sleep(0.002)
+            if command is None:
+                return
+            logger.info("[Lwd][ctrl] poll consumed command type=%s", command.get("type"))
+            if command.get("type") == "probe":
+                manifest: LwdPrefixManifest = command["manifest"]
+                try:
+                    result = coordinator.probe(manifest)
+                    self._event_queue.put({
+                        "type": "probe",
+                        "request_id": manifest.request_id,
+                        "ok": True,
+                        "result": result,
+                    })
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("[Lwd][ctrl] probe failed")
+                    self._event_queue.put({
+                        "type": "probe",
+                        "request_id": manifest.request_id,
+                        "ok": False,
+                        "error": str(exc),
+                    })
+
+
+def create_lwd_cloud_control_app(
+    bridge: LwdCloudControlBridge,
+) -> Any:
+    """FastAPI 控制面应用;/v1/chat/completions 先校验协议头再消费 body。"""
+    app = FastAPI()
+
+    @app.post("/v1/chat/completions")
+    async def chat_completions(request: Request) -> Any:
+        try:
+            headers = dict(request.headers)
+            body = await request.json()
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse({"error": f"bad request: {exc}"}, status_code=400)
+        try:
+            manifest = LwdPrefixManifest.from_openai_request(headers, body)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
+        # 多边入口命名空间包裹:按自报 X-Edge-Cloud-Edge-Id 把 manifest.request_id
+        # 包成云内唯一 id("e{edge_id}-{req_id}"),与云引擎 _lwd_dispatch 的同款
+        # wrap 对齐,使协调器预留键 == 数据面请求键。
+        # 注意:ASGI/Starlette 给的 header key **全小写**,此处必须按小写取——
+        # 否则恒回退 "0"(实测:探针恒包成 e0-,而数据面按信封 identity 包成
+        # e{真边},预留键与请求键错位 → claim/前缀校验全部失效)。
+        headers_lc = {k.lower(): v for k, v in headers.items()}
+        try:
+            edge_id = int(headers_lc.get(HEADER_EDGE_ID.lower(), "0"))
+        except (TypeError, ValueError) as exc:
+            return JSONResponse(
+                {"error": f"invalid {HEADER_EDGE_ID}: {exc}"}, status_code=400
+            )
+        if edge_id < 0:
+            return JSONResponse({"error": "negative edge_id"}, status_code=400)
+        # 成员校验(尽力而为):registry 若已在本进程装载则校验 edge_id 属于
+        # 实边集合;未装载(单边/1E1C)跳过。
+        try:
+            from vllm.v1.lwd_control.control_communication.lwd_role_registry import (
+                get_role_registry,
+            )
+
+            registry = get_role_registry()
+            if registry is not None and edge_id not in registry.edge_ids:
+                return JSONResponse(
+                    {"error": f"unknown edge_id {edge_id}"}, status_code=400
+                )
+        except Exception:  # noqa: BLE001  registry 未就绪等,不阻断主链路
+            pass
+        manifest = dataclass_replace(
+            manifest, request_id=wrap_req_id(edge_id, manifest.request_id)
+        )
+
+        try:
+            logger.info(
+                "[Lwd][ctrl] handler entering probe req=%s edge=%d",
+                manifest.request_id, edge_id,
+            )
+            result = await bridge.probe(manifest)
+            logger.info(
+                "[Lwd][ctrl] handler probe resolved req=%s hit=%d",
+                manifest.request_id, result.hit_tokens,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("[Lwd][ctrl] handler probe raised")
+            return JSONResponse({"error": str(exc)}, status_code=503)
+
+        # 命中结果必须随响应头立即回边。边侧 negotiate 只读响应头、不消费 body;
+# 参考分支曾把 usage 挂在同一条 SSE 流末 chunk(且只做边侧日志留痕),而
+# StreamingResponse 的响应头要等 events() 首 chunk 才发出,会把命中结果
+# 卡到请求完结 → 边侧探针超时。故本控制面只走 JSONResponse(头即结果),
+# usage 改由数据面步元数据 LwdC2eNotify.usages 回边(同一消费口径)。
+        return JSONResponse(
+            content={
+                "request_id": result.request_id,
+                "instance_id": result.instance_id,
+                "block_size": result.block_size,
+                "hit_blocks": result.hit_blocks,
+                "hit_tokens": result.hit_tokens,
+            },
+            headers=result.to_headers(),
+        )
+
+    return app
+
+
+def start_lwd_cloud_control_server(vllm_config: Any) -> tuple[Any | None, Any | None]:
+    """父进程侧启动 HTTP 控制服务 + 队列桥(仅云侧且启用协调时)。
+
+    返回 ``(command_queue, event_queue)``,交由子进程 EngineCore 经
+    ``CoreEngineProcManager`` 透传;未启用/边侧返回 ``(None, None)``。
+
+    uvicorn 与桥均在后台线程运行,须在 spawn EngineCoreProc 之前调用。"""
+    coord_cfg = getattr(vllm_config, "lwd_coordination", None)
+    if coord_cfg is None or not coord_cfg.enabled:
+        return None, None
+    if vllm_config.lwd_config.is_edge:
+        return None, None
+
+    from vllm.utils.system_utils import get_mp_context
+
+    import uvicorn
+
+    mp_ctx = get_mp_context()
+    command_queue = mp_ctx.Queue()
+    event_queue = mp_ctx.Queue()
+    bridge = LwdCloudControlBridge(command_queue, event_queue)
+    bridge.start()
+    app = create_lwd_cloud_control_app(bridge)
+    threading.Thread(
+        target=uvicorn.run,
+        args=(app,),
+        kwargs={
+            "host": coord_cfg.listen_host,
+            "port": coord_cfg.listen_port,
+            "log_level": "warning",
+        },
+        name="lwd-cloud-ctrl",
+        daemon=True,
+    ).start()
+    logger.info(
+        "[Lwd] cloud control HTTP server listening on %s:%s",
+        coord_cfg.listen_host, coord_cfg.listen_port,
+    )
+    return command_queue, event_queue

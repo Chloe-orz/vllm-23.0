@@ -11,7 +11,7 @@ from enum import Enum, auto
 from multiprocessing import Process, connection
 from multiprocessing.process import BaseProcess
 from multiprocessing.queues import Queue
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import patch
 
 import msgspec
@@ -136,8 +136,19 @@ class CoreEngineProcManager:
         log_stats: bool,
         client_handshake_address: str | None = None,
         tensor_queue: Queue | None = None,
+        cloud_control_command_queue: Any | None = None,
+        cloud_control_event_queue: Any | None = None,
     ):
         context = get_mp_context()
+        # 云侧前缀复用协调:未显式注入队列时,由父进程统一拉起 HTTP 控制
+        # 服务 + 队列桥(边/未启用经 helper 内部短路),再透传给子进程。
+        if cloud_control_command_queue is None and cloud_control_event_queue is None:
+            from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_control import (
+                start_lwd_cloud_control_server,
+            )
+            cloud_control_command_queue, cloud_control_event_queue = (
+                start_lwd_cloud_control_server(vllm_config)
+            )
         common_kwargs = {
             "vllm_config": vllm_config,
             "local_client": local_client,
@@ -145,6 +156,8 @@ class CoreEngineProcManager:
             "executor_class": executor_class,
             "log_stats": log_stats,
             "tensor_queue": tensor_queue,
+            "cloud_control_command_queue": cloud_control_command_queue,
+            "cloud_control_event_queue": cloud_control_event_queue,
         }
 
         if client_handshake_address:

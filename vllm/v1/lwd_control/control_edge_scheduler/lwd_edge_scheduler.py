@@ -36,6 +36,8 @@ from vllm.v1.core.sched.output import (
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LwdAbortNotify,
     LwdC2eNotify,
+    LwdFinishNotify,
+    LwdGenChainNotify,
     LwdRangeNotify,
     LwdRequestNotify,
 )
@@ -96,6 +98,16 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self._lwd_cloud_id = getattr(lwd_cfg, "cloud_id", 0)
         # 请求-云绑定表:入口登记、finish/abort 解绑、通告/abort 按它定向
         self._lwd_binding = LwdEdgeBindingTable()
+        # 收尾记账(§11.4):边侧请求在"嵌入完结"时即清出调度器(awaiting
+        # 接管),终结时拿不到 Request 对象,故在入口留 prompt ids、在投递处
+        # 累积生成 ids,终结即用租户密钥建全量块哈希链上报云侧并清理。
+        self._lwd_finish_prompt_ids: dict[str, list[int]] = {}
+        self._lwd_finish_gen_ids: dict[str, list[int]] = {}
+        # 生成段链增量上报水位(request_id -> 已上报满块数):只在满块数
+        # 增加时发一条(全量替换语义),避免逐步刷控制面。
+        self._lwd_gen_chain_sent: dict[str, int] = {}
+        # 租户 HMAC hasher 惰性缓存(避免每请求重读密钥文件)
+        self._lwd_hasher_cache = None
         # 前缀缓存:manager 级关命中,配置级保留使能。两级拆分的原因:
         # - 必须关命中:命中会跳过 token 排程,首条 RangeNotify 的
         #   offset != 0,云侧按 offset==0 识别首块的约定失效;且被
@@ -210,19 +222,99 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         finish + abort 出口,与原生语义一致。
         """
         self._lwd_validate_request(request)
+        # 收尾记账备料:prompt ids 留档(终结时 Request 已不在调度器)
+        self._lwd_finish_prompt_ids[request.request_id] = list(
+            request.prompt_token_ids
+        )
+        # add_request 前自动 HTTP 探前缀(manifest.request_id == 数据面
+        # request_id,云侧按此键落预留;命中时推进 num_computed 只发尾巴)。
+        # 返回的块哈希链随 notify 上云:协调启用时恒为 HMAC 协调链,与
+        # 云侧块池/协调器同域(不依赖探测成败),续算边界两侧一致。
+        block_hashes, prefix_hit_tokens = self._lwd_probe_prefix(request)
         cloud_id = self._lwd_default_cloud_id()
         self._lwd_binding.bind(request.request_id, cloud_id)
         self.lwd_edge_notify_request(
             request_id=request.request_id,
             num_prompt_tokens=len(request.prompt_token_ids),
             sampling_params=request.sampling_params,
-            block_hashes=list(request.block_hashes),
+            block_hashes=block_hashes,
+            prefix_hit_tokens=prefix_hit_tokens,
             cloud_id=cloud_id,
         )
         super().add_request(request)
         if request.abort_immediately:
             self.finish_requests([request.request_id], RequestStatus.FINISHED_ABORTED)
             self.lwd_edge_abort([request.request_id])
+
+    def _lwd_probe_prefix(self, request: Request) -> tuple[list[bytes], int]:
+        """add_request 前自动 HTTP 探前缀,manifest.request_id 取数据面
+        request_id,云侧按 (edge_id 包裹后的) 同键落预留(claim/complete 同键)。
+
+        fail-open:未启用/缺配置/探测失败均放行;命中时推进
+        request.num_computed_tokens 使边侧只 embed/发尾巴(续算)。
+
+        返回 (随 notify 上云的 prompt 满块哈希链, 续算边界 token 数):
+        协调启用时链恒为 HMAC 协调链(本地产 manifest,与云侧块池/
+        协调器同域),命中值即 trim 后的边侧 chunk 起点,云侧据此封顶
+        resume;未启用/回退时返回 request 自身原生块哈希 + 0(不续算)。"""
+        vllm_config = getattr(self, "vllm_config", None)
+        if vllm_config is None:
+            return list(request.block_hashes), 0
+        coord_cfg = getattr(vllm_config, "lwd_coordination", None)
+        if coord_cfg is None or not getattr(coord_cfg, "enabled", False):
+            return list(request.block_hashes), 0
+        if not coord_cfg.control_url or not coord_cfg.tenant_key_file:
+            return list(request.block_hashes), 0
+        try:
+            import asyncio
+
+            import aiohttp
+
+            from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_client import (
+                LwdEdgePrefixClient,
+            )
+
+            with open(coord_cfg.tenant_key_file, "rb") as f:
+                tenant_key = f.read()
+            client = LwdEdgePrefixClient(
+                coord_cfg.control_url,
+                vllm_config.cache_config.block_size,
+                tenant_key,
+                edge_id=self._lwd_edge_id,
+                consumer_id=coord_cfg.consumer_id,
+                connect_timeout=coord_cfg.connect_timeout,
+            )
+            manifest = client.build_manifest(
+                request.request_id, list(request.prompt_token_ids)
+            )
+            chain = list(manifest.full_block_hashes)
+
+            async def _probe():
+                async with aiohttp.ClientSession() as session:
+                    return await client.negotiate(
+                        session,
+                        request.request_id,
+                        list(request.prompt_token_ids),
+                    )
+
+            result = asyncio.run(_probe())
+            logger.info(
+                "[Lwd][edge] prefix probe req=%s hit_tokens=%d blocks=%d",
+                request.request_id, result.hit_tokens, len(chain),
+            )
+            # 命中边界以云侧块池单真源为准(probe 现读块池,与云侧请求
+            # resume 同池同链),推进 num_computed 后边侧只 embed/发尾巴,
+            # chunk offset == 云侧 computed,续算闭环。命中值随 notify
+            # 下发,云侧按它封顶 resume——probe 超时/并发下池增长时,
+            # 云侧不会越过边侧实际裁剪的边界。
+            if result.hit_tokens > 0:
+                request.num_computed_tokens = result.hit_tokens
+            return chain, result.hit_tokens
+        except Exception:  # noqa: BLE001  fail-open:探测失败不阻断请求
+            logger.warning(
+                "[Lwd][edge] prefix probe failed (fail-open)", exc_info=True,
+            )
+            return list(request.block_hashes), 0
 
     def lwd_edge_notify(self, scheduler_output: SchedulerOutput) -> bool:
         """对新调度的 prefill 块发 LwdRangeNotify(seqno 先行)。
@@ -294,6 +386,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         num_prompt_tokens: int,
         sampling_params: SamplingParams | None = None,
         block_hashes: list[bytes] | None = None,
+        prefix_hit_tokens: int = 0,
         cloud_id: int | None = None,
     ) -> None:
         """发 LwdRequestNotify(请求元数据预告)。
@@ -301,6 +394,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         block_hashes = prompt 全量满块哈希链(自位置 0 起)。云侧
         prompt token 是占位零值,本地算不出真实内容哈希,前缀缓存
         命中只能靠这条链;缺省空链 = 不提供,云侧回退占位链。
+
+        prefix_hit_tokens = 边侧 probe 命中并 trim 后的续算边界:云侧
+        resume 封顶于此(0 = 不续算,与恒发整段一致)。
 
         sampling_params 只透传影响云侧 token 选择的字段(采样核/惩罚/
         EOS 策略/min_tokens);stop 字符串等 detokenizer 层参数留在
@@ -328,6 +424,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             cloud_id=cloud_id,
             edge_id=self._lwd_edge_id,
             block_hashes=block_hashes if block_hashes is not None else [],
+            prefix_hit_tokens=prefix_hit_tokens,
             temperature=sp.temperature if sp is not None else 1.0,
             top_p=sp.top_p if sp is not None else 1.0,
             top_k=sp.top_k if sp is not None else 0,
@@ -367,6 +464,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         (发布前 abort)仅本地清台账。"""
         for request_id in request_ids:
             self._lwd_awaiting.pop(request_id, None)
+            # 收尾备料随 abort 一并清理(不再上报 finish)
+            self._lwd_finish_prompt_ids.pop(request_id, None)
+            self._lwd_finish_gen_ids.pop(request_id, None)
+            self._lwd_gen_chain_sent.pop(request_id, None)
             cloud_id = self._lwd_binding.unbind(request_id)
             if cloud_id is None and self.lwd_edge_channel is not None:
                 logger.info(
@@ -388,6 +489,126 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                     "[Lwd][edge-notify] AbortNotify req=%s cloud=%d",
                     request_id, cloud_id,
                 )
+
+    def lwd_edge_finish(self, request_id: str) -> None:
+        """收尾记账(§11.4):向云上报**全量块哈希链**(prompt + 生成段,HMAC 域)。
+
+        生成段(completion)哈希只有持租户密钥的边能算,云侧据此校验
+        prompt 前缀链未变并发布生成段摘要——**云不持密钥、不接触明文**
+        (参考分支同语义:原经 SO 附发 EdgeCloudFinishedRequest,我们走
+        控制面 LwdFinishNotify)。
+
+        fail-open:未启用协调/无密钥/建链或发布失败均仅告警,不阻断终结
+        路径(记账缺失不影响数据面正确性)。"""
+        prompt_ids = self._lwd_finish_prompt_ids.pop(request_id, None)
+        gen_ids = self._lwd_finish_gen_ids.pop(request_id, None)
+        self._lwd_gen_chain_sent.pop(request_id, None)
+        if prompt_ids is None:
+            return
+        vllm_config = getattr(self, "vllm_config", None)
+        if vllm_config is None:
+            return
+        coord_cfg = getattr(vllm_config, "lwd_coordination", None)
+        if coord_cfg is None or not getattr(coord_cfg, "enabled", False):
+            return
+        if not coord_cfg.tenant_key_file:
+            return
+        try:
+            hasher = self._lwd_prefix_hasher(coord_cfg, vllm_config)
+            completion_ids = gen_ids or []
+            manifest = hasher.build_manifest(
+                request_id, list(prompt_ids) + completion_ids
+            )
+            cloud_id = self._lwd_binding.cloud_of(
+                request_id, default=self._lwd_default_cloud_id()
+            )
+            message = LwdFinishNotify(
+                request_id=request_id,
+                prompt_tokens=len(prompt_ids),
+                completion_tokens=len(completion_ids),
+                full_block_hashes=list(manifest.full_block_hashes),
+                edge_id=self._lwd_edge_id,
+            )
+            if not self._lwd_publish(message, cloud_id):
+                logger.warning(
+                    "[Lwd][edge] finish announce publish failed req=%s", request_id
+                )
+                return
+            logger.info(
+                "[Lwd][edge] finish announced req=%s prompt=%d completion=%d "
+                "blocks=%d cloud=%d",
+                request_id, message.prompt_tokens, message.completion_tokens,
+                len(message.full_block_hashes), cloud_id,
+            )
+        except Exception:  # noqa: BLE001  fail-open:记账缺失不阻断终结
+            logger.warning(
+                "[Lwd][edge] finish announce failed (fail-open)", exc_info=True
+            )
+
+    def _lwd_announce_gen_chain(self, request_id: str) -> None:
+        """按步增量上报生成段链:满块数增加才发,全量替换语义。
+
+        云侧据此把生成段块按边侧 HMAC 链键入块池(多轮续写可命中)。会丢包
+        不要紧:下一条带全量链,云侧覆盖写自愈。fail-open:未启用协调/
+        无密钥/发布失败仅告警——链缺失只让云侧生成段块晚登记(fail-safe
+        降级),不影响数据面。"""
+        prompt_ids = self._lwd_finish_prompt_ids.get(request_id)
+        vllm_config = getattr(self, "vllm_config", None)
+        if prompt_ids is None or vllm_config is None:
+            return
+        coord_cfg = getattr(vllm_config, "lwd_coordination", None)
+        if coord_cfg is None or not getattr(coord_cfg, "enabled", False):
+            return
+        if not coord_cfg.tenant_key_file:
+            return
+        try:
+            hasher = self._lwd_prefix_hasher(coord_cfg, vllm_config)
+            gen_ids = self._lwd_finish_gen_ids.get(request_id) or []
+            manifest = hasher.build_manifest(
+                request_id, list(prompt_ids) + gen_ids
+            )
+            blocks = list(manifest.full_block_hashes)
+            if len(blocks) <= self._lwd_gen_chain_sent.get(request_id, 0):
+                return
+            cloud_id = self._lwd_binding.cloud_of(
+                request_id, default=self._lwd_default_cloud_id()
+            )
+            message = LwdGenChainNotify(
+                request_id=request_id,
+                block_hashes=blocks,
+                block_size=hasher.block_size,
+                edge_id=self._lwd_edge_id,
+            )
+            if not self._lwd_publish(message, cloud_id):
+                logger.warning(
+                    "[Lwd][edge] gen-chain publish failed req=%s blocks=%d",
+                    request_id, len(blocks),
+                )
+                return
+            self._lwd_gen_chain_sent[request_id] = len(blocks)
+            logger.info(
+                "[Lwd][edge] gen-chain announced req=%s blocks=%d cloud=%d",
+                request_id, len(blocks), cloud_id,
+            )
+        except Exception:  # noqa: BLE001  fail-open:链缺失只降级不阻断
+            logger.warning(
+                "[Lwd][edge] gen-chain announce failed (fail-open)", exc_info=True
+            )
+
+    def _lwd_prefix_hasher(self, coord_cfg, vllm_config):
+        """惰性构造并缓存租户 HMAC hasher(probe / 生成段链 / 收尾共用)。"""
+        hasher = self._lwd_hasher_cache
+        if hasher is not None:
+            return hasher
+        from vllm.v1.lwd_control.control_communication.lwd_prefix import (
+            LwdPrefixHasher,
+        )
+
+        with open(coord_cfg.tenant_key_file, "rb") as f:
+            tenant_key = f.read()
+        hasher = LwdPrefixHasher(tenant_key, vllm_config.cache_config.block_size)
+        self._lwd_hasher_cache = hasher
+        return hasher
 
     def lwd_edge_update_progress(self, executed: dict[str, int]) -> None:
         """步末登记执行量;嵌入完结即转入 awaiting。
@@ -439,7 +660,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 request_id,
             )
             return False
+        if token_ids:
+            self._lwd_finish_gen_ids.setdefault(request_id, []).extend(token_ids)
+            self._lwd_announce_gen_chain(request_id)
         if finished:
+            # 收尾记账先于解绑(上报按绑定表定向选云)
+            self.lwd_edge_finish(request_id)
             del self._lwd_awaiting[request_id]
             # finish 即解绑:请求与云实例的生命周期绑定结束
             # (迟到结果不再认领,绑定表出表)
@@ -476,12 +702,19 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 f"(request {request.request_id})"
             )
         sp = request.sampling_params
+        if sp.n != 1:
+            raise ValueError(
+                "[LWD] prefill-only mode requires n=1; got n="
+                f"{sp.n} (request {request.request_id}): n 不上 wire,云侧只采样"
+                "一路,多路会静默缺路"
+            )
         unsupported = [
             name
             for name, value in (
                 ("logit_bias", sp.logit_bias),
                 ("allowed_token_ids", sp.allowed_token_ids),
                 ("logprobs", sp.logprobs),
+                ("prompt_logprobs", sp.prompt_logprobs),
             )
             if value is not None
         ]

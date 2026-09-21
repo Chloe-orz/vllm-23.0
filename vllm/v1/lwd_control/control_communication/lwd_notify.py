@@ -56,12 +56,37 @@ class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):
     """结束符 id:边侧前端自 tokenizer 解析,云侧占位 prompt 无从
     得知,必须随预告透传;缺省 None = 云侧 EOS 判定落空,仅
     max_tokens 兜底(旧版边侧,additive 兼容)。"""
+    prefix_hit_tokens: int = 0
+    """边侧 probe 命中并 trim 后的续算边界(= 边侧 chunk 起点):云侧
+    resume 不得超过此值,否则「边未裁/裁得少、云块池却命中更多」会注入
+    错位。缺省 0 = 未命中/探测失败(fail-open)= 不续算,与边侧恒发
+    整段一致;additive 兼容旧版边侧。"""
 
 
 class LwdAbortNotify(msgspec.Struct, gc=False, tag=True):
     """边->云 abort 预告(PRE_OUT);云侧清理请求登记。"""
 
     request_id: str
+    edge_id: int = 0
+    """来源边 id(云侧据此定位被包装的 req_id);缺省 0 单边兼容。"""
+
+
+class LwdFinishNotify(msgspec.Struct, gc=False, tag=True):
+    """边->云收尾记账(PRE_OUT):请求在边侧终结时上报**全量块哈希链**
+    (prompt + 生成段,HMAC 域;原始 prompt 与生成内容均不过网)。
+
+    云侧据此:① 校验 prompt 前缀链未变(与 probe 预留的链比对);② 发布
+    生成段块摘要(生成段哈希只有持租户密钥的边能算,云不再持密钥)。
+    ``full_block_hashes`` 长度须 == (prompt_tokens + completion_tokens) //
+    block_size,不符即 fail-closed(只释放与记账、不发布)。"""
+
+    request_id: str
+    prompt_tokens: int
+    completion_tokens: int
+    full_block_hashes: list[bytes] = []
+    publish_cache: bool = True
+    """False = 只做释放与记账、不发布任何块(fail-closed,如媒体身份无法
+    重建);缺省 True。"""
     edge_id: int = 0
     """来源边 id(云侧据此定位被包装的 req_id);缺省 0 单边兼容。"""
 
@@ -99,19 +124,58 @@ class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):
     缺省 -1 = 旧版云侧未携带(msgspec 带默认字段,线上 additive 兼容)。"""
     cloud_id: int = 0
     """来源云 id:边据此选 DOWN 通道接收;缺省 0 单云兼容。"""
+    usages: list[dict] = []
+    """逐请求 usage 回边(与 req_ids 按位对齐;空列表 = 未携带):
+    云侧结算产出的 OpenAI 形状 usage(含 prompt_tokens_details.
+    cached_tokens),边侧据此把"复用省了多少 token"落到自身记账/前端。
+    参考分支用探针 SSE 流末 chunk 承载;prefill_only 边侧探针是同步、
+    不消费 body,故改挂步元数据通道(C2e),语义不变、零新管道。"""
+
+
+class LwdGenChainNotify(msgspec.Struct, gc=False, tag=True):
+    """边->云生成段哈希链(PRE_OUT,按步增量上报)。
+
+    生成段 token 的 HMAC 只有持租户密钥的边能算;云侧把这些块按**边侧链**
+    键入块池,后续"含生成段前缀"的请求(多轮续写)才能命中。语义为
+    **全量替换**:每次都带上「prompt + 已生成」的完整满块链,丢包由下一
+    条自愈(云侧覆盖写)。仅在满块数增加时发送(每 block_size 个生成
+    token 一次),流量极小。
+
+    云侧消费:块登记窗口封顶到本链覆盖范围(`_lwd_capped_cache_tokens`),
+    避免链到达前按 local_hasher 误登记(块一旦登记无法重登记)。"""
+
+    request_id: str
+    block_hashes: list[bytes] = []
+    block_size: int = 0
+    """边侧 manifest 块粒度(链的粒度)。云侧仅在它与本地 hash 块粒度**相等**
+    (ratio=1)时采用本链:否则链索引与云内 `block_hashes`(hash 粒度)错位,
+    会按错键登记块。0 = 旧版边侧未携带 → 同样不采用(保守)。"""
+    edge_id: int = 0
+    """来源边 id(云侧据此定位被包装的 req_id);缺省 0 单边兼容。"""
 
 
 # typing.Union 而非 PEP 604 `|`:msgspec 解码器的全版本支持路径
-LwdNotify = Union[LwdRangeNotify, LwdRequestNotify, LwdAbortNotify]  # noqa: UP007
+LwdNotify = Union[  # noqa: UP007
+    LwdRangeNotify,
+    LwdRequestNotify,
+    LwdAbortNotify,
+    LwdFinishNotify,
+    LwdGenChainNotify,
+]
 # 云->边方向(POST_OUT):HELLO 发现 + 步元数据(唯一载荷,兼结果回传
 # 驱动);重同步消息在此 union 上 additive 扩展
 LwdCloudNotify = Union[LwdHelloNotify, LwdC2eNotify]  # noqa: UP007
 # 双向全集(ROUTER-ROUTER 单通道收两个方向的载荷,按 tag 区分):
-# 边->云三类通告 + 云->边步元数据;HELLO/WELCOME 为通道层帧不进解码器
+# 边->云五类通告 + 云->边步元数据;HELLO/WELCOME 为通道层帧不进解码器。
+# **本 union 是通道解码的唯一依据**,任何新增 notify 必须同时加进这里,
+# 否则解码失败按坏包丢弃(实测:_lwd_dispatch 里 isinstance 永远不成立,
+# 两端日志都看不到该消息)。
 LwdWireNotify = Union[  # noqa: UP007
     LwdRangeNotify,
     LwdRequestNotify,
     LwdAbortNotify,
+    LwdFinishNotify,
+    LwdGenChainNotify,
     LwdC2eNotify,
 ]
 # 数据面批型定义归 vllm/v1/core/sched/output.py(LwdBatch/LwdBatchType/

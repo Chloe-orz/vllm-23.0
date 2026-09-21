@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import queue
 import threading
 import time
+from logging import DEBUG
 from typing import TYPE_CHECKING
 
 import msgspec
@@ -29,12 +31,15 @@ from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LWD_NOT_FINISHED,
     LwdAbortNotify,
     LwdC2eNotify,
+    LwdFinishNotify,
+    LwdGenChainNotify,
     LwdHelloNotify,
     LwdRangeNotify,
     LwdRequestNotify,
     lwd_decode_wire_notify,
     lwd_encode_cloud_notify,
 )
+from vllm.v1.lwd_control.control_communication.lwd_prefix import LwdUsage
 from vllm.v1.lwd_control.control_communication.lwd_role_registry import (
     get_role_registry,
     init_role_registry,
@@ -46,6 +51,12 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import LwdConf
 from vllm.v1.lwd_debug import LwdDebug
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_phase_scheduler import (
     LwdCloudPhaseScheduler,
+)
+from vllm.v1.lwd_control.control_cloud_scheduler.lwd_prefix_coordinator import (
+    LwdPrefixCoordinator,
+)
+from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_control import (
+    LwdCloudControlProcessor,
 )
 from vllm.v1.request import Request
 
@@ -76,7 +87,181 @@ class LwdCloudEngineCore(EngineCoreProc):
         # IO 线程把 RangeNotify 写进裸 AsyncScheduler 而崩溃。
         vllm_config = kwargs["vllm_config"]
         vllm_config.scheduler_config.scheduler_cls = LwdCloudPhaseScheduler
+        # 前缀复用协调:协调器 + 处理器(队列由父进程传入,None = 未启用)。
+        # **必须在 super() 之前占位**:super 内即启动 PRE_OUT IO 线程,该线程经
+        # _lwd_setup_zmq → _lwd_init_dispatch_state 读这些属性(以及按配置判断
+        # 协调是否启用);后设会与之竞态(实测 AttributeError → EXECUTOR_FAILED)。
+        self._lwd_prefix_coordinator: LwdPrefixCoordinator | None = None
+        self._lwd_cloud_control_processor: LwdCloudControlProcessor | None = None
+        # 生成段链台账:rid -> (链粒度, 链)。**同样在 super() 前建**——
+        # PRE_OUT IO 线程的分派分支要写它;交付调度器(读侧)在
+        # _lwd_setup_coordination 里做(主线程,步循环之前,无竞态)。
+        self._lwd_edge_chains: dict[str, tuple[int, list[bytes]]] = {}
         super().__init__(*args, **kwargs)
+        self._lwd_setup_coordination()
+
+    def _lwd_setup_coordination(self) -> None:
+        """装配前缀复用协调器 + 控制面处理器(队列由父进程传入,None = 未启用)。"""
+        coord_cfg = getattr(self.vllm_config, "lwd_coordination", None)
+        if coord_cfg is None or not coord_cfg.enabled:
+            return
+        if (
+            self.cloud_control_command_queue is None
+            or self.cloud_control_event_queue is None
+        ):
+            logger.warning(
+                "[Lwd][ctrl] coordination enabled but queues absent; skip")
+            return
+        hash_block_size = resolve_kv_cache_block_sizes(
+            self.scheduler.kv_cache_config, self.vllm_config
+        )[1]
+        # 诊断:KV 组规格。混合注意力下各组 block_size/滑窗不同,命中长度取
+        # 各组最小值(SWA/Mamba 还会把窗口外/非对齐块排除出哈希表),直接
+        # 决定长 prompt 能被声明多少前缀——排查命中异常先看这行。
+        # mamba_cache_mode:align 只存「每步最后一个 token 且落在 i*block」的
+        # state(单步整段 prefill 时几乎无快照),all 每个块边界都存。
+        logger.info(
+            "[Lwd][ctrl] kv groups (type, block_size, window, mamba_mode)=%s",
+            [
+                (
+                    type(g.kv_cache_spec).__name__,
+                    g.kv_cache_spec.block_size,
+                    getattr(g.kv_cache_spec, "sliding_window", None),
+                    getattr(g.kv_cache_spec, "mamba_cache_mode", None),
+                )
+                for g in self.scheduler.kv_cache_config.kv_cache_groups
+            ],
+        )
+        self._lwd_prefix_coordinator = LwdPrefixCoordinator(
+            hash_block_size,
+            instance_id=coord_cfg.instance_id,
+            kv_cache_manager=getattr(self.scheduler, "kv_cache_manager", None),
+        )
+        self._lwd_cloud_control_processor = LwdCloudControlProcessor(
+            self.cloud_control_command_queue, self.cloud_control_event_queue
+        )
+        # 生成段链台账交付调度器(引用交付:IO 线程写 / 调度线程读,dict 赋值
+        # 原子,与 seqno registry 同款)。**只在此暴露**(而非 IO 线程的
+        # _lwd_init_dispatch_state):此刻协调确实建成,步循环尚未开始,无竞态;
+        # 未启用协调时调度器看不到它 → 生成段块照原生 local 哈希登记。
+        self.scheduler.lwd_edge_chains = self._lwd_edge_chains
+        # 生成段哈希:云侧**不持租户密钥**——生成段(completion)token 的 HMAC
+        # 摘要由边侧在 LwdFinishNotify 里上报,云只做校验与记账发布
+        # (apply_finish_chain)。这样"密钥仅存边侧、永不过网"的隐私性质
+        # 成立(参考分支即此语义)。
+        logger.info(
+            "[Lwd][ctrl] coordination ready (hash_block_size=%d, "
+            "tenant key held edge-side only)",
+            hash_block_size,
+        )
+
+    def _lwd_poll_coordination(self) -> None:
+        """消费控制面 probe 命令(引擎步循环头部与空闲拍,非阻塞)。"""
+        processor = self._lwd_cloud_control_processor
+        coordinator = self._lwd_prefix_coordinator
+        if processor is not None and coordinator is not None:
+            processor.poll(coordinator)
+
+    # 空闲拍控制面服务间隔:原生 _process_input_queue 在无请求时于
+    # input_queue 上无限阻塞,引擎不进 step,probe 消费点(步循环头部)
+    # 永不执行——云空闲时边侧同步 probe 必然干等到超时(表现为边侧
+    # hit_tokens=0/fail-open 或手动探针 TimeoutError)。改为有界等待,
+    # 每拍服务一次控制面命令队列,使 probe 与引擎步循环解耦。
+    _LWD_IDLE_WAIT_S = 0.05
+
+    def _process_input_queue(self) -> None:
+        """空闲等待覆写:仅协调启用时生效(未启用走原生,零行为变化)。"""
+        if getattr(self, "_lwd_cloud_control_processor", None) is None:
+            return super()._process_input_queue()
+        waited = False
+        while not self.has_work() and self.is_running():
+            # 空闲拍先服务控制面:probe 命令不与「引擎有待办请求」耦合
+            self._lwd_poll_coordination()
+            self._notify_idle_state_callbacks()
+            if self.input_queue.empty():
+                # Drain aborts queue; all aborts are also processed via input_queue.
+                with self.aborts_queue.mutex:
+                    self.aborts_queue.queue.clear()
+                if logger.isEnabledFor(DEBUG):
+                    logger.debug("EngineCore waiting for work.")
+                    waited = True
+            try:
+                req = self.input_queue.get(timeout=self._LWD_IDLE_WAIT_S)
+                self._handle_client_request(*req)
+            except queue.Empty:
+                continue
+        if waited:
+            logger.debug("EngineCore loop active.")
+        # Handle any more client requests.
+        while not self.input_queue.empty():
+            req = self.input_queue.get_nowait()
+            self._handle_client_request(*req)
+
+    def _lwd_claim_reservation(self, request: Request) -> None:
+        """认领前缀复用预留(admit 期,观测用;续算由 block_hasher 驱动)。"""
+        coordinator = self._lwd_prefix_coordinator
+        if coordinator is None:
+            return
+        hit_tokens = coordinator.claim(request.request_id)
+        if hit_tokens is not None:
+            logger.info(
+                "[Lwd][coord] admit req=%s claim hit_tokens=%d",
+                request.request_id, hit_tokens,
+            )
+
+    def _lwd_publish_completed_prefixes(self, req_ids: list[str]) -> None:
+        """prompt 已算完的请求发布其 manifest 摘要进 completed 集。"""
+        coordinator = self._lwd_prefix_coordinator
+        if coordinator is None:
+            return
+        requests = getattr(self.scheduler, "requests", {})
+        for request_id in req_ids:
+            request = requests.get(request_id)
+            if request is None:
+                continue
+            if request.num_computed_tokens >= request.num_prompt_tokens:
+                coordinator.complete_request(request_id)
+
+    def _lwd_publish_finished_usage(
+        self, engine_core_outputs: dict[int, "EngineCoreOutputs"]
+    ) -> dict[str, LwdUsage]:
+        """请求完结结算(finish→记账),返回 {req_id: LwdUsage} 供 C2e 回边。
+
+        请求在 ``update_from_output`` 内已被 ``_free_blocks`` 从
+        ``scheduler.requests`` 摘除(见 ``Scheduler._free_blocks``),故本
+        方法不再回查请求,改用调度器在 ``finish_requests`` 时抓取的快照
+        (``scheduler.lwd_finished_records``)——否则结算永不触发、预留泄漏。
+        生成段哈希由边侧 ``LwdFinishNotify`` 上报(见 ``apply_finish_chain``),
+        云侧不再持租户密钥,故此处 ``generated_hashes=[]``。
+
+        usage 的消费口径与参考分支一致(仅边侧日志留痕,不注入客户端响应);
+        参考经探针 SSE 流末 chunk 承载,我们改挂本步 C2e 回边(见
+        ``_lwd_consume_usage``),故此处直接返回而不经控制面桥。"""
+        coordinator = self._lwd_prefix_coordinator
+        if coordinator is None:
+            return {}
+        finished: set[str] = set()
+        for outputs in engine_core_outputs.values():
+            for out in outputs.outputs:
+                if out.finish_reason is not None:
+                    finished.add(out.request_id)
+            for request_id in outputs.finished_requests or ():
+                finished.add(request_id)
+        records = getattr(self.scheduler, "lwd_finished_records", None) or {}
+        usages: dict[str, LwdUsage] = {}
+        for request_id in finished:
+            snapshot = records.pop(request_id, None)
+            if snapshot is None:
+                continue
+            prompt_tokens, completion_tokens = snapshot
+            usage = coordinator.finish(
+                request_id,
+                generated_hashes=[],
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            )
+            usages[request_id] = usage
+        return usages
 
     def _lwd_setup_zmq(self) -> None:
         """介入 ZMQ 双面:PRE_OUT bind 收边;POST_OUT connect 边,承载首拍
@@ -251,9 +436,51 @@ class LwdCloudEngineCore(EngineCoreProc):
             )
             logger.info("[Lwd][cloud-ctrl] AbortNotify req=%s", msg.request_id)
             self._lwd_gate_pending.pop(msg.request_id, None)
+            self._lwd_edge_chains.pop(msg.request_id, None)
             # 双队列与原生 ABORT 同款:eager 处理 + 保持 input_queue 次序
             self.aborts_queue.put_nowait([msg.request_id])
             self.input_queue.put_nowait((EngineCoreRequestType.ABORT, [msg.request_id]))
+            return
+        if isinstance(msg, LwdFinishNotify):
+            # 收尾记账(§11.4):边上报全量块哈希链(prompt+生成段)。云侧只
+            # 校验 prompt 前缀链未变 + 发布生成段摘要,**不接触明文、不持密钥**。
+            msg = msgspec.structs.replace(
+                msg, request_id=wrap_req_id(edge_id, msg.request_id)
+            )
+            coordinator = getattr(self, "_lwd_prefix_coordinator", None)
+            if coordinator is None:
+                return
+            coordinator.apply_finish_chain(
+                msg.request_id,
+                msg.prompt_tokens,
+                msg.completion_tokens,
+                list(msg.full_block_hashes),
+                msg.publish_cache,
+            )
+            # 收尾后生成段链台账即可释放(后续块不再需要登记)
+            self._lwd_edge_chains.pop(msg.request_id, None)
+            return
+        if isinstance(msg, LwdGenChainNotify):
+            # 生成段哈希链增量上报(全量替换)。存台账供两处同源消费:
+            # ① build_request 的 block_hasher 填生成段哈希;② 调度器封顶
+            # 生成段块的登记窗口(链未到前不按 local_hasher 误登记)。
+            msg = msgspec.structs.replace(
+                msg, request_id=wrap_req_id(edge_id, msg.request_id)
+            )
+            if len(self._lwd_edge_chains) >= 4096:
+                for stale in list(self._lwd_edge_chains)[:512]:
+                    self._lwd_edge_chains.pop(stale, None)
+                logger.warning("[Lwd][ctrl] gen-chain table full; evicted oldest")
+            # 存 (链粒度, 链):消费侧只在粒度与本地 hash 块粒度相等(ratio=1)
+            # 时采用——非等宽时链索引与云内 block_hashes(hash 粒度)错位,
+            # 采用会按错键登记块。
+            self._lwd_edge_chains[msg.request_id] = (
+                int(msg.block_size), list(msg.block_hashes)
+            )
+            logger.info(
+                "[Lwd][cloud-ctrl] GenChainNotify req=%s blocks=%d bs=%d",
+                msg.request_id, len(msg.block_hashes), msg.block_size,
+            )
             return
         rid = wrap_req_id(edge_id, msg.request_id)
         msg = msgspec.structs.replace(msg, request_id=rid)
@@ -269,6 +496,7 @@ class LwdCloudEngineCore(EngineCoreProc):
         wire = self._lwd_gate_pending.pop(request_id, None)
         if wire is not None:
             request = self._lwd_build_request(wire)
+            self._lwd_claim_reservation(request)
             self.input_queue.put_nowait((EngineCoreRequestType.ADD, (request, 0)))
             logger.info("[Lwd] cloud request %s admitted via gate", request_id)
 
@@ -324,17 +552,44 @@ class LwdCloudEngineCore(EngineCoreProc):
             # worker 本地分配):35MB 零 buffer 走 MQ overflow 通道实测
             # 单程 240ms+,是 prefill SO 开工延迟的主因。
             request.lwd_embeds_placeholder = True
+            # resume 封顶:边侧声明的续算边界(= 其 chunk 起点)是数据面
+            # 单真源,云侧块池命中不得超过它——边侧 probe 超时/并发下池
+            # 增长时,原生 find_longest_cache_hit 会命中更多,注入起点即错位。
+            request.lwd_resume_cap_tokens = wire.prefix_hit_tokens
             return request
         hash_block_size = resolve_kv_cache_block_sizes(
             self.scheduler.kv_cache_config, self.vllm_config
         )[1]
 
         def block_hasher(request: Request) -> list[bytes]:
-            # prompt 首建用边侧预告链,续算/缺链/长度不符回退本地(fail-open)
+            # 有预留且仍在纯 prefill 时用 HMAC 协调摘要(跨请求 prompt 前缀
+            # 命中);一旦开始 decode 即回退本地哈希,以覆盖全部(prompt+生成)
+            # 满块——协调摘要只覆盖 prompt 段,decode 所需满块数会超长,
+            # cache_full_blocks 有 len(block_hashes)>=num_full_blocks 断言。
+            coordinator = self._lwd_prefix_coordinator
+            if coordinator is not None and request.num_output_tokens == 0:
+                hashes = coordinator.coordination_hashes(request.request_id)
+                if hashes is not None and len(hashes) == (
+                    request.num_prompt_tokens // hash_block_size
+                ):
+                    return hashes
             if len(request.block_hashes) == 0 and request.num_output_tokens == 0:
                 expected = request.num_prompt_tokens // hash_block_size
                 if len(wire.block_hashes) == expected:
                     return wire.block_hashes
+            # 生成段满块取边侧回传链(与 prompt 段同域同源)。链只在
+            # 「粒度与本地 hash 粒度相等且尚有未覆盖块」时采用;其余情况
+            # **必须回退 local_hasher**:块哈希列表要随 token 增长持续补满
+            # cache_full_blocks 的 len>=num_full_blocks 断言,返回空会把
+            # 列表冻住(实测 DeepSeek:边链粒度 128 vs 云 hash 8,decode 每
+            # 8 token 跨一次块边界,冻结即刻断言)。回退登记的本地键不会
+            # 被误读——读侧由边侧声明封顶(probe 命中 0 → 云侧 resume 封 0)。
+            gen_entry = self._lwd_edge_chains.get(request.request_id)
+            if gen_entry is not None and int(gen_entry[0]) == hash_block_size:
+                gen_chain = gen_entry[1]
+                start = len(request.block_hashes)
+                if start < len(gen_chain):
+                    return list(gen_chain[start:])
             return local_hasher(request)
 
         request = Request(
@@ -346,10 +601,12 @@ class LwdCloudEngineCore(EngineCoreProc):
             block_hasher=block_hasher,
         )
         request.lwd_embeds_placeholder = True  # 同上:占位 embeds 不上 MQ
+        request.lwd_resume_cap_tokens = wire.prefix_hit_tokens
         return request
     
     def step_with_batch_queue(self):
         """步骤执行时长打点(开始执行→执行结束;不含引擎空等)。"""
+        self._lwd_poll_coordination()
         _t0 = time.monotonic()
         out = super().step_with_batch_queue()
         logger.info(
@@ -360,6 +617,7 @@ class LwdCloudEngineCore(EngineCoreProc):
 
     def step(self):
         """同步步路径同款打点。"""
+        self._lwd_poll_coordination()
         _t0 = time.monotonic()
         out = super().step()
         logger.info(
@@ -382,6 +640,10 @@ class LwdCloudEngineCore(EngineCoreProc):
         边侧按 num_accepted 取有效前缀。"""
         # [Lwd][perf] cloud-step dt 已由 exec 时长替代(见 step_with_batch_queue
         # 覆写):开始执行→执行结束,不含无请求的空等。
+        # 收尾结算先行:usage 需随本步 C2e 回边,而 C2e 在此处发布,
+        # 故先算好 finish/usage 再发(原实现放在方法末尾,回边拿不到)。
+        usages = self._lwd_publish_finished_usage(engine_core_outputs)
+        # 注意:meta.req_ids 出口已剥包装,而 usages/records 键是云内包装 id
         carrier = getattr(model_output, "lwd_down_carrier", None)
         if carrier:
             for edge_id, pinned, req_ids, hidden_numel, seqno in carrier:
@@ -415,7 +677,10 @@ class LwdCloudEngineCore(EngineCoreProc):
                     edge_id,
                     meta,
                     self._lwd_c2e_finish_reasons(meta, engine_core_outputs),
+                    usages,
                 )
+                # prompt 算完的请求发布其 manifest 摘要 → 后续 probe 可命中
+                self._lwd_publish_completed_prefixes(meta.req_ids)
                 # [Lwd][perf] 云侧 LWD 税:finish 码推导 + ZMQ publish
                 logger.info(
                     "[Lwd][perf] publish edge=%d reqs=%d dur=%.2fms",
@@ -447,17 +712,26 @@ class LwdCloudEngineCore(EngineCoreProc):
                 for request_id in meta.req_ids]
 
     def _lwd_publish_c2e(
-        self, edge_id: int, meta: LwdC2eMeta, finish_reasons: list[int]
+        self,
+        edge_id: int,
+        meta: LwdC2eMeta,
+        finish_reasons: list[int],
+        usages: dict[str, LwdUsage] | None = None,
     ) -> None:
-        """步元数据(含逐请求 finish_reasons 完成码)发边:队满小睡重试
-        (元数据不可丢),关停(closed)退出。req_ids 出口剥离命名空间,
+        """步元数据(含逐请求 finish_reasons 完成码 + usage)发边:队满小睡
+        重试(元数据不可丢),关停(closed)退出。req_ids 出口剥离命名空间,
         边侧只看原始 id。
+
+        usages:按云内包装 id 命中,与出口 req_ids 按位对齐;空 dict 项
+        表示该请求本步无 usage。参考分支经探针 SSE 末 chunk 回 usage,我们
+        改挂本通道(边侧已按步消费,零新管道)。
 
         按边分组已在云 worker 的 down carrier 完成(每 edge 独立
         down_seqno,一份 C2eNotify 严格配对一次 DOWN 发送),本方法只
         按分组结果定向发布:云侧复用经单通道 publish(dest=edge_id,
         per-identity FIFO 独立,某边消费慢只反压自己);1E1C 走单
         publisher。"""
+        usage_by_req = usages or {}
         notify = LwdC2eNotify(
             hidden_num_elements=meta.hidden_num_elements,
             top_id_ths=meta.top_id_ths,
@@ -466,6 +740,10 @@ class LwdCloudEngineCore(EngineCoreProc):
             finish_reasons=finish_reasons,
             down_seqno=meta.down_seqno,
             cloud_id=self._lwd_cloud_id,
+            usages=[
+                (u.to_openai_dict() if (u := usage_by_req.get(rid)) else {})
+                for rid in meta.req_ids
+            ],
         )
         if self._lwd_channel is not None:
             while not self._lwd_channel.closed:

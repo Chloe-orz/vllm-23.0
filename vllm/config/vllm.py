@@ -31,6 +31,7 @@ from vllm.utils.hashing import safe_hash
 
 from .attention import AttentionConfig
 from .lwd import LwdConfig
+from .lwd_coordination import LwdCoordinationConfig
 from .cache import CacheConfig
 from .compilation import CompilationConfig, CompilationMode, CUDAGraphMode
 from .device import DeviceConfig
@@ -367,6 +368,9 @@ class VllmConfig:
     ``additional_config["lwd_config"]`` in ``__post_init__``. Holds the
     LWD behavior settings; the parallel-topology knobs live in the
     aggregated ``parallel_config.lwd_config`` (LwdParallelConfig)."""
+    lwd_coordination: LwdCoordinationConfig | None = None
+    """云侧前缀复用协调配置,parsed from ``additional_config["lwd_coordination"]``
+    in ``__post_init__``;None = 未启用(边/云均可缺省)。"""
     instance_id: str = ""
     """The ID of the vLLM instance."""
     optimization_level: OptimizationLevel = OptimizationLevel.O2
@@ -862,6 +866,15 @@ class VllmConfig:
         additional = self.additional_config if isinstance(self.additional_config, dict) else {}
         raw_lwd = additional.get("lwd_config") or {}
         self.lwd_config = LwdConfig.from_dict(raw_lwd)
+        # 云侧前缀复用协调:parse + validate(依赖 lwd_config 解析结果判边/云角色)。
+        raw_coord = additional.get("lwd_coordination") or {}
+        self.lwd_coordination = LwdCoordinationConfig.from_dict(raw_coord)
+        if self.lwd_coordination.enabled:
+            self.lwd_coordination.validate(
+                lwd_mode=self.lwd_config.mode,
+                is_edge=self.lwd_config.is_edge,
+                enable_prefix_caching=self.cache_config.enable_prefix_caching,
+            )
         if self.lwd_config.enabled:
             parallel_lwd = self.parallel_config.lwd_config
             parallel_lwd.enable_lwd = True

@@ -437,6 +437,11 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens = self._mamba_block_aligned_split(
                     request, num_new_tokens
                 )
+            # LWD prefill_only:边侧是 prefill 切块权威,云侧按边侧预告
+            # chunk 原样执行,不再按云侧预算/块对齐复切,保证边云锁步。
+            forced = getattr(self, "_lwd_forced_prefill_tokens", None)
+            if forced is not None:
+                num_new_tokens = forced
 
             if num_new_tokens == 0:
                 # The request cannot be scheduled because one of the following
@@ -732,6 +737,11 @@ class Scheduler(SchedulerInterface):
                     )
                     if num_new_tokens == 0:
                         break
+                # LWD prefill_only:边侧是 prefill 切块权威,云侧按边侧预告
+                # chunk 原样执行,不再复切(与 running 路径同款钩子)。
+                forced = getattr(self, "_lwd_forced_prefill_tokens", None)
+                if forced is not None:
+                    num_new_tokens = forced
 
                 # Handles an edge case when P/D Disaggregation
                 # is used with Spec Decoding where an
