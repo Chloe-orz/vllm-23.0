@@ -112,6 +112,7 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
                 req_ids=[notify.request_id],
                 token_ids=[[0] * notify.num_tokens],
                 token_offsets=[notify.offset],
+                has_mrope=notify.has_mrope,
             ),
         )
         return out
