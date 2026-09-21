@@ -147,71 +147,56 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         return True
 
     def schedule_decode(self) -> SchedulerOutput:
-        """弹一条 unembed 通告:登账行数(欠条)→ 可见集调度 → 行数断言
-        → 挂 UNEMBED 批。全部未准入则退还欠条、通告回塞;部分排程
-        (DOWN 行无法对齐)当场报错。"""
+        """弹一条 unembed 通告派一步 decode(不经原生排程,账本自管):
+        ① 无可调度的行 → 丢弃;② 纯终结通告(hidden=0,无 token 无
+        数据)→ 本地终结,不派 worker;③ 带数据 → 排程量恒等于通告
+        accept——本就是云侧决定的接收量,边侧无准入/预算/抢占决策
+        自由度,欠条(收割冲销)与 computed 乐观推进在此手动登记,
+        挂批走全量行集保 worker 切行对齐。"""
         notify = q.popleft() if (q := self.unembed_notify_queue) else None
         if notify is None:
             return SchedulerOutput.make_empty()
         # 通告里仍可调度的请求(存在、未终结、decode 相位);其余行
-        # 由收割期原生跳过,批仍带全量通告行集保 worker 切分对齐
+        # 由收割期原生跳过,批仍带全量通告行集保 worker 切行对齐
         targets = [
             rid for rid in notify.req_ids
             if (req := self.requests.get(rid)) is not None
             and self._lwd_the_phase_of_req(req) is LwdReqPhase.DECODE
         ]
         if not targets:
+            logger.warning(
+                "[Lwd][edge-sched] decode notify dropped (no schedulable "
+                "targets): reqs=%s down_seqno=%s finish=%s",
+                notify.req_ids, notify.down_seqno, notify.finish_reasons,
+            )
             return SchedulerOutput.make_empty()
-        saved = self._lwd_set_pending_tokens(notify, targets)
-        out = self._lwd_schedule_for_visible_reqs(targets)
-        if not out.num_scheduled_tokens:
-            self._lwd_restore_pending_tokens(saved)
-            self.unembed_notify_queue.appendleft(notify)
+        # 纯终结通告:零 token 零数据(hidden=0 ⟹ accept 全零),无物
+        # 可收、无批可派——通告挂空步交给 update_from_output 的兜底
+        # 本地终结(空步过 super 无账可入,兜底照常消费完成码)
+        if notify.hidden_num_elements == 0:
+            logger.info(
+                "[Lwd][edge-sched] pure-finish notify: local finish, no "
+                "unembed: reqs=%s down_seqno=%s finish=%s",
+                notify.req_ids, notify.down_seqno, notify.finish_reasons,
+            )
+            out = SchedulerOutput.make_empty()
+            out.lwd_c2e_notify = [notify]
             return out
-        self._lwd_assert_tokens_match_notify(out, notify, targets)
-        self._lwd_attach_unembed_batch(out, notify)
-        return out
-
-    def _lwd_set_pending_tokens(
-        self, notify: LwdC2eNotify, targets: list[str]
-    ) -> dict[str, int]:
-        """登记"本步每请求待产出 token 数":把占位数设为使账面差
-        (num_tokens_with_spec + 占位 - computed)恰等于通告的
-        num_accepted_tokens;返回原占位值供未准入时恢复。"""
-        tokens_by_req = dict(zip(notify.req_ids, notify.num_accepted_tokens))
-        saved: dict[str, int] = {}
+        # 手工构造 UNEMBED 步:不经原生排程(守卫/预算/准入均不涉及,
+        # _update_after_schedule 亦不跑);收割期原生入账按欠条冲销归平
+        accept = dict(zip(notify.req_ids, notify.num_accepted_tokens))
         for rid in targets:
             request = self.requests[rid]
-            saved[rid] = request.num_output_placeholders
             request.num_output_placeholders = (
-                tokens_by_req[rid]
-                + request.num_computed_tokens
+                accept[rid] + request.num_computed_tokens
                 - request.num_tokens_with_spec
             )
-        return saved
-
-    def _lwd_restore_pending_tokens(self, saved: dict[str, int]) -> None:
-        """恢复登记前的占位值(未准入回退,防同条通告重复登记)。"""
-        for rid, placeholders in saved.items():
-            req = self.requests.get(rid)
-            if req is not None:
-                req.num_output_placeholders = placeholders
-
-    @staticmethod
-    def _lwd_assert_tokens_match_notify(
-        out: SchedulerOutput, notify: LwdC2eNotify, targets: list[str]
-    ) -> None:
-        """本步排程的 token 数须与通告逐请求相等,否则 worker 的
-        DOWN 数据切分错位,当场报错。"""
-        tokens_by_req = dict(zip(notify.req_ids, notify.num_accepted_tokens))
-        scheduled = out.num_scheduled_tokens
-        if set(scheduled) != set(targets) or any(
-            scheduled[rid] != tokens_by_req[rid] for rid in targets
-        ):
-            raise RuntimeError(
-                f"[LWD] edge decode batch mismatch vs c2e: "
-                f"scheduled={dict(scheduled)} notify={tokens_by_req}"
-            )
+            request.num_computed_tokens += accept[rid]
+        out = SchedulerOutput.make_empty()
+        out.num_scheduled_tokens = {rid: accept[rid] for rid in targets}
+        out.total_num_scheduled_tokens = sum(accept[rid] for rid in targets)
+        self._lwd_attach_unembed_batch(out, notify)
+        return out
 
     @staticmethod
     def _lwd_attach_unembed_batch(
