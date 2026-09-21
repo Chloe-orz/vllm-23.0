@@ -107,7 +107,18 @@ class LwdEdgeEngineCore(EngineCoreProc):
         self._edge_channel: LwdControlRouterChannel | None = None
         self._edge_receiver: LwdControlSubscriber | None = None
         self._edge_sender: LwdControlPublisher | None = None
+        # pubsub 调试形态:cloud_id -> 发布端定向表(装配期回填调度器)
+        self._edge_senders: dict[int, LwdControlPublisher] | None = None
         if config.is_cloud_reuse:
+            if config.ctrl_transport == "pubsub":
+                n_clouds = self._lwd_build_control_pubsub(config)
+                logger.info(
+                    "[Lwd] edge engine assembled: cloud-reuse pubsub planes "
+                    "(identity=edge%d, %d clouds)",
+                    config.self_edge_id,
+                    n_clouds,
+                )
+                return
             self._edge_channel = self._lwd_build_control_channel(config)
             self.scheduler.lwd_edge_channel = self._edge_channel
             threading.Thread(
@@ -180,6 +191,44 @@ class LwdEdgeEngineCore(EngineCoreProc):
             channel.announce(cloud_id)
         channel.start()
         return channel
+
+    def _lwd_build_control_pubsub(self, config: LwdConfig) -> int:
+        """pubsub 调试形态(azy_perf_debug_0921):云侧复用拓扑(registry)
+        但控制面走原 PUSH/PULL 双平面——POST_OUT 订阅面 bind 本边
+        registry 端口收云;PRE_OUT 发布面逐云 connect(registry 端点,
+        无 HELLO 发现)。调度器经 publisher 表按 cloud_id 定向发布。
+
+        接收线程收 LwdC2eNotify 投 c2e 队列 + WAKEUP,队列元素格式与
+        1E1C 一致((notify, t),来源云取载荷 cloud_id 字段)。
+
+        返回发布面数量(云数)。"""
+        registry = get_role_registry()
+        if registry is None:
+            from vllm.v1.lwd_control.control_communication.lwd_role_registry import (
+                init_role_registry,
+            )
+
+            registry = init_role_registry(config.registry_path)
+        self._edge_receiver = LwdControlSubscriber(
+            registry.edge_bind_endpoint(config.self_edge_id),
+            bind=True,
+            decoder=lwd_decode_cloud_notify,
+        )
+        self._edge_senders = {
+            cloud_id: LwdControlPublisher(
+                registry.endpoint(cloud_id),
+                bind=False,
+                queue_max=config.publish_queue_max,
+            )
+            for cloud_id in registry.cloud_ids
+        }
+        self.scheduler.lwd_edge_publisher_table = self._edge_senders
+        threading.Thread(
+            target=self._receive_thread_pubsub,
+            name="lwd-post-in",
+            daemon=True,
+        ).start()
+        return len(self._edge_senders)
 
     def _lwd_build_post_out(self, config: LwdConfig) -> LwdControlSubscriber:
         """bind POST_OUT 订阅面;云经 master_addr 主动来连(仅 1E1C)。"""
@@ -262,8 +311,28 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 self.lwd_c2e_meta_queue.put((cloud_id, notify, time.monotonic()))
                 self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
 
+    def _receive_thread_pubsub(self) -> None:
+        """pubsub 调试形态接收线程(原 1E1C 语义,无 HELLO/retarget):
+        LwdC2eNotify -> 载荷队列(阻塞 put,不可丢)+ WAKEUP;来源云取
+        载荷 cloud_id 字段(无信封);其余帧告警丢弃。"""
+        receiver = self._edge_receiver
+        while not receiver.closed:
+            msg = receiver.recv(timeout_ms=5000)
+            if msg is None:
+                continue
+            if isinstance(msg, LwdC2eNotify):
+                logger.info(
+                    "[Lwd][edge-ctrl] C2eNotify cloud=%d reqs=%d down_seqno=%s",
+                    msg.cloud_id, len(msg.req_ids), msg.down_seqno,
+                )
+                self.lwd_c2e_meta_queue.put((msg, time.monotonic()))
+                self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
+            else:
+                logger.warning("[Lwd] drop unexpected POST_OUT frame %r", type(msg))
+
     def _lwd_shutdown_planes(self) -> None:
-        """通信面关停(幂等):云侧复用单通道;1E1C 两面。"""
+        """通信面关停(幂等):router 单通道 / pubsub 订阅面+定向发布表 /
+        1E1C 两面。"""
         channel = getattr(self, "_edge_channel", None)
         if channel is not None:
             channel.shutdown()
@@ -273,6 +342,8 @@ class LwdEdgeEngineCore(EngineCoreProc):
         publisher = getattr(self, "_edge_sender", None)
         if publisher is not None:
             publisher.shutdown()
+        for sender in (getattr(self, "_edge_senders", None) or {}).values():
+            sender.shutdown()
 
     # ------------------------------------------------------------------ #
     # 引擎接口覆写                                                        #

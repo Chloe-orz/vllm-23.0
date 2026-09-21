@@ -91,6 +91,8 @@ class LwdCloudEngineCore(EngineCoreProc):
         self._lwd_channel: LwdControlRouterChannel | None = None
         self._lwd_subscriber: LwdControlSubscriber | None = None
         self._lwd_post_out: LwdControlPublisher | None = None
+        # pubsub 调试形态:edge_id -> POST_OUT 发布端定向表
+        self._lwd_post_outs: dict[int, LwdControlPublisher] | None = None
         self._lwd_cloud_id = getattr(
             self.vllm_config.parallel_config.lwd_config, "cloud_id", 0
         )
@@ -98,6 +100,27 @@ class LwdCloudEngineCore(EngineCoreProc):
             registry = get_role_registry()
             if registry is None:
                 registry = init_role_registry(config.registry_path)
+            if config.ctrl_transport == "pubsub":
+                self._lwd_subscriber = LwdControlSubscriber(
+                    registry.bind_endpoint(config.self_cloud_id), bind=True
+                )
+                self._lwd_post_outs = {
+                    edge_id: LwdControlPublisher(
+                        registry.edge_endpoint(edge_id),
+                        bind=False,
+                        encoder=lwd_encode_cloud_notify,
+                    )
+                    for edge_id in registry.edge_ids
+                }
+                self._lwd_init_dispatch_state()
+                logger.info(
+                    "[Lwd] cloud engine assembled: cloud-reuse pubsub planes "
+                    "PRE_OUT bind %s, POST_OUT -> %d edges (identity=cloud%d)",
+                    registry.bind_endpoint(config.self_cloud_id),
+                    len(registry.edge_ids),
+                    config.self_cloud_id,
+                )
+                return
             self._lwd_channel = LwdControlRouterChannel(
                 registry.bind_endpoint(config.self_cloud_id),
                 bind=True,
@@ -172,8 +195,9 @@ class LwdCloudEngineCore(EngineCoreProc):
         """PRE_OUT 接收循环:socket 与门状态在本线程内先建后用(zmq 单线程
         亲和);recv 挂超时拍仅作关停响应上限,关停(closed)退出。
 
-        云侧复用:循环 consume_new_outputs() 单通道,逐条 (edge_id, notify)
-        交分派(单消费者串行,替代 mux 轮询);1E1C 阻塞收单 subscriber。"""
+        云侧复用 router:循环 consume_new_outputs() 单通道,逐条 (edge_id,
+        notify) 交分派(单消费者串行,替代 mux 轮询);pubsub 调试形态与
+        1E1C 共用尾部阻塞收单 subscriber(edge_id 取载荷字段)。"""
         try:
             self._lwd_setup_zmq()
         except Exception:
@@ -470,6 +494,31 @@ class LwdCloudEngineCore(EngineCoreProc):
         if self._lwd_channel is not None:
             while not self._lwd_channel.closed:
                 if self._lwd_channel.publish(notify, edge_id):
+                    logger.info(
+                        "[Lwd][cloud-ctrl] publish C2eNotify edge=%d reqs=%d "
+                        "down_seqno=%s finish=%s hidden_elems=%s",
+                        edge_id,
+                        len(notify.req_ids),
+                        notify.down_seqno,
+                        finish_reasons,
+                        notify.hidden_num_elements,
+                    )
+                    return
+                time.sleep(_LWD_C2E_SEND_RETRY_SLEEP_S)
+            return
+        if self._lwd_post_outs is not None:
+            # pubsub 调试形态:逐边定向发布表路由(某边消费慢只反压该边
+            # 的 publisher 队列)
+            publisher = self._lwd_post_outs.get(edge_id)
+            if publisher is None:
+                logger.error(
+                    "[Lwd][cloud-ctrl] no POST_OUT publisher for edge=%d; "
+                    "c2e notify dropped",
+                    edge_id,
+                )
+                return
+            while not publisher.closed:
+                if publisher.publish(notify):
                     logger.info(
                         "[Lwd][cloud-ctrl] publish C2eNotify edge=%d reqs=%d "
                         "down_seqno=%s finish=%s hidden_elems=%s",

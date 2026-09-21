@@ -86,6 +86,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         super().__init__(*args, **kwargs)
         self.lwd_edge_publisher = publisher
         self.lwd_edge_channel = control_channel
+        # pubsub 调试形态:cloud_id -> LwdControlPublisher 定向表(引擎
+        # 装配期回填;与 publisher/channel 互斥)
+        self.lwd_edge_publisher_table: dict[int, LwdControlPublisher] | None = None
         # seqno 按 (cloud_id) 对分域:UP 数据通道按连续号序配对,号只能
         # 分配给真正上 wire 的块(peek-then-advance,发布成功才进位);
         # 1E1C 恒用 self._lwd_cloud_id 单键,行为与原单值计数器一致
@@ -116,7 +119,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
     # ------------------------------------------------------------------ #
     def _lwd_default_cloud_id(self) -> int:
         """默认绑定云(选路接入前固定第一台云;1E1C 即单云 id)。"""
-        if self.lwd_edge_channel is None:
+        if self.lwd_edge_channel is None and self.lwd_edge_publisher_table is None:
             return self._lwd_cloud_id
         from vllm.v1.lwd_control.control_communication.lwd_role_registry import (
             get_role_registry,
@@ -128,10 +131,19 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         return self._lwd_cloud_id
 
     def _lwd_publish(self, message, cloud_id: int) -> bool:
-        """控制面出口统一:云侧复用按 dest 定向 publish;1E1C 走单
+        """控制面出口统一:router 单通道 / pubsub 定向发布表 / 1E1C 单
         publisher。False = 未入队(队/FIFO 满),调用方退避重试。"""
         if self.lwd_edge_channel is not None:
             return self.lwd_edge_channel.publish(message, cloud_id)
+        if self.lwd_edge_publisher_table is not None:
+            publisher = self.lwd_edge_publisher_table.get(cloud_id)
+            if publisher is None:
+                logger.error(
+                    "[LWD] no publisher bound for cloud %d; notify dropped",
+                    cloud_id,
+                )
+                return False
+            return publisher.publish(message)
         if self.lwd_edge_publisher is not None:
             return self.lwd_edge_publisher.publish(message)
         return False
@@ -314,7 +326,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         调用链回前端 error 通道,用户立即得到失败;不做无限阻塞
         重试(发布点在引擎主线程,云宕机会把整个引擎卡死在 add)。
         此时请求未入队、云侧零残留,无需补发 abort。"""
-        if self.lwd_edge_publisher is None and self.lwd_edge_channel is None:
+        if (
+            self.lwd_edge_publisher is None
+            and self.lwd_edge_channel is None
+            and not self.lwd_edge_publisher_table
+        ):
             return
         if cloud_id is None:
             cloud_id = self._lwd_default_cloud_id()

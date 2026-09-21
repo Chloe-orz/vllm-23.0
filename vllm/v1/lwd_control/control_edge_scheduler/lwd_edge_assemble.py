@@ -64,6 +64,10 @@ class LwdConfig:
     """本边实例 id(云侧复用 identity=edge{self_edge_id})。"""
     self_cloud_id: int = 0
     """本云实例 id(云侧复用 identity=cloud{self_cloud_id})。"""
+    ctrl_transport: str = "pubsub"
+    """云侧复用控制面传输形态:pubsub = 原 PUSH/PULL 双平面(本调试分支
+    缺省,定界 ROUTER 通道用)/ router = ROUTER-ROUTER 单通道;仅
+    registry 模式生效,env VLLM_ASCEND_LWD_CTRL_TRANSPORT 覆盖。"""
 
     @property
     def is_cloud_reuse(self) -> bool:
@@ -117,6 +121,7 @@ class LwdConfig:
             registry_path=registry_path or None,
             self_edge_id=int(getattr(parallel_lwd, "edge_id", 0) or 0),
             self_cloud_id=int(getattr(parallel_lwd, "cloud_id", 0) or 0),
+            ctrl_transport=str(section.get("ctrl_transport", "pubsub")),
         )
         return _lwd_apply_env_overrides(config)
 
@@ -167,6 +172,10 @@ def _lwd_apply_env_overrides(config: LwdConfig) -> LwdConfig:
         registry_path=config.registry_path,
         self_edge_id=config.self_edge_id,
         self_cloud_id=config.self_cloud_id,
+        ctrl_transport=(
+            raw_transport.lower() if raw_transport is not None
+            else config.ctrl_transport
+        ),
     )
 
 

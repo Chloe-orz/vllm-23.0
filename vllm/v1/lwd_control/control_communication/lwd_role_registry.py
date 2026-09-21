@@ -6,19 +6,21 @@
 ``--role-registry`` 指定;未配置时退化单边一云 ``(edge0, cloud0)`` 域,
 行为与原 prefill_only 完全一致(非侵入式)。
 
-控制面端点规划(ROUTER-ROUTER):只有云侧 bind,每云单值 ``zmq_port``
-服务全部边;边侧 0 端口 connect 出去。端点公式唯一事实源在
-``endpoint``/``bind_endpoint``;数据面只消费 rank 映射
-(``edge_rank``/``cloud_rank``)。
+控制面端点规划:云侧 ``zmq_port`` 为 PRE_OUT bind(收边)。传输两种
+形态(``VLLM_ASCEND_LWD_CTRL_TRANSPORT``):pubsub(本调试分支缺省)边侧
+也 bind ``zmq_port`` 为 POST_OUT(收云,云经 ``addr`` connect);router
+(ROUTER-ROUTER 单通道)边侧 0 端口 connect。端点公式唯一事实源在
+``endpoint``/``bind_endpoint``/``edge_endpoint``/``edge_bind_endpoint``;
+数据面只消费 rank 映射(``edge_rank``/``cloud_rank``)。
 
 registry YAML 示例(2 边 2 云,全场共享同一份)::
 
     world: { master_addr: 10.1.0.1, master_port: 29500 }
     edges:
-      - { id: 0, addr: 10.0.0.1, ranks: [0, 1] }           # 不 bind,无端口字段
-      - { id: 1, addr: 10.0.0.2, ranks: [2, 3] }           # addr 仅诊断用,可省
+      - { id: 0, addr: 10.0.0.1, ranks: [0, 1], zmq_port: 5800 }  # POST_OUT bind
+      - { id: 1, addr: 10.0.0.2, ranks: [2, 3], zmq_port: 5800 }  # addr 供云 connect
     clouds:
-      - { id: 0, addr: 10.1.0.1, ranks: [4, 5, 6, 7], zmq_port: 5700 }
+      - { id: 0, addr: 10.1.0.1, ranks: [4, 5, 6, 7], zmq_port: 5700 }  # PRE_OUT bind
       - { id: 1, addr: 10.1.0.2, ranks: [8, 9, 10, 11], zmq_port: 5700 }
 """
 
@@ -167,6 +169,16 @@ class LwdRoleRegistry:
         """云控制面 bind 端点:addr 换为 ``*``,每云单端口服务全部边。"""
         return f"tcp://*:{self._clouds[cloud_id].zmq_port}"
 
+    def edge_endpoint(self, edge_id: int) -> str:
+        """边控制面端点(云侧 POST_OUT connect 用,pubsub 形态):
+        ``tcp://{edge.addr}:{zmq_port}``。"""
+        edge = self._edges[edge_id]
+        return f"tcp://{edge.addr}:{edge.zmq_port}"
+
+    def edge_bind_endpoint(self, edge_id: int) -> str:
+        """边控制面 bind 端点(pubsub 调试形态:边 POST_OUT bind 收云)。"""
+        return f"tcp://*:{self._edges[edge_id].zmq_port}"
+
     # ------------------------------------------------------------------ #
     # 构造                                                               #
     # ------------------------------------------------------------------ #
@@ -177,6 +189,8 @@ class LwdRoleRegistry:
                 peer_id=int(e["id"]),
                 addr=str(e.get("addr", "")),
                 ranks=[int(r) for r in e.get("ranks", [])],
+                # pubsub 调试形态:边 POST_OUT bind 端口(兼容旧字段名)
+                zmq_port=int(e.get("zmq_port", e.get("zmq_base_port", 0))),
             )
             for e in raw.get("edges", [])
         }
@@ -211,6 +225,23 @@ class LwdRoleRegistry:
                     f"[lwd] cloud {cloud_id} requires a positive zmq_port "
                     f"in the role registry (ROUTER bind)"
                 )
+        for edge_id, edge in edges.items():
+            if edge.zmq_port <= 0:
+                raise ValueError(
+                    f"[lwd] edge {edge_id} requires a positive zmq_port "
+                    f"in the role registry (POST_OUT bind, pubsub transport)"
+                )
+        missing_addr = [
+            f"{role}.{peer_id}"
+            for role, peers in (("edge", edges), ("cloud", clouds))
+            for peer_id, peer in peers.items()
+            if not peer.addr
+        ]
+        if missing_addr:
+            raise ValueError(
+                "role registry peers must declare a routable addr "
+                "(control-plane connect endpoints): " + ", ".join(missing_addr)
+            )
         digest = hashlib.sha256(
             json.dumps(raw, sort_keys=True, default=str).encode()
         ).hexdigest()[:16]
