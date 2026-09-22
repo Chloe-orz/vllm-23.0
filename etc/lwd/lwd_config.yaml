@@ -1,0 +1,38 @@
+# Single instance, one DP: edge TP=1, cloud TP=8.
+# Set additional_config.lwd_config.path to this file's actual runtime path.
+# Example checkout: /vllm-workspace/vllm/etc/lwd/lwd_config.yaml
+# Replace both example IP addresses with the real control-plane addresses.
+# Both sides must use identical topology contents; role and instance_id are
+# supplied separately through additional_config.lwd_config.
+# Current no-PP/PUSH-PULL runtime: ctrl_port maps to PRE_OUT.
+# Keep VLLM_ASCEND_LWD_POST_OUT_PORT=6454 on BOTH sides during transition.
+# Shared TCPStore binds the edge address on port 29600.
+
+deployment:
+  mode: 0
+  scene: single_instance
+  hccl_world_size: 9
+  edges_num: 1
+  clouds_num: 1
+
+feature_ctrl:
+  enable_early_recv: false
+  enable_scramble: false
+
+edges:
+  - id: 0
+    dp:
+      - dp_idx: 0
+        addr: 10.0.0.1  # Replace with the edge control-plane IP.
+        ranks: [0]
+
+clouds:
+  - id: 0
+    dp:
+      - dp_idx: 0
+        addr: 10.1.0.1  # Replace with the cloud control-plane IP.
+        ranks: [1, 2, 3, 4, 5, 6, 7, 8]
+        ctrl_port: 5550
+
+instance_links:
+  - {edge: 0, cloud: 0}

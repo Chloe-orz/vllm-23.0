@@ -66,30 +66,13 @@ class LwdCloudEngineCore(EngineCoreProc):
     def _lwd_setup_zmq(self) -> None:
         """介入 ZMQ 双面:PRE_OUT bind 收边;POST_OUT connect 边,承载首拍
         HELLO 通告与步内元数据。建站失败走 EXECUTOR_FAILED 升级。"""
-        config = LwdConfig.from_env_and_config(self.vllm_config)
+        config = LwdConfig.from_vllm_config(self.vllm_config)
         self._lwd_subscriber = LwdControlSubscriber(
             config.lwd_pre_out_endpoint(), bind=True
         )
-        # POST_OUT 连边地址:post_out_host(native 语义)优先;
-        # master_addr 仅作旧部署命令的兼容回退
-        connect_host = config.post_out_host
-        if not connect_host:
-            connect_host = self.vllm_config.parallel_config.master_addr
-            if connect_host:
-                logger.warning(
-                    "[Lwd] falling back to --master-addr=%s as the POST_OUT "
-                    "connect target; prefer lwd_config.post_out_host",
-                    connect_host,
-                )
-        if not connect_host:
-            raise ValueError(
-                "[Lwd] prefill_only cloud requires lwd_config.post_out_host "
-                "(POST_OUT connect target = edge IP)"
-            )
+        # POST_OUT 地址来自已解析的 YAML edge addr，不回退旧 CLI 配置。
         self._lwd_post_out = LwdControlPublisher(
-            config.lwd_post_out_connect_endpoint()
-            if config.post_out_host
-            else f"tcp://{connect_host}:{config.post_out_port}",
+            config.lwd_post_out_connect_endpoint(),
             bind=False,
             encoder=lwd_encode_cloud_notify,
         )

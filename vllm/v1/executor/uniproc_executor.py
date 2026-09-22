@@ -78,11 +78,11 @@ class UniProcExecutor(Executor):
                 LwdConfig,
             )
 
-            lwd_config = LwdConfig.from_env_and_config(self.vllm_config)
+            lwd_config = LwdConfig.from_vllm_config(self.vllm_config)
             if not lwd_config.post_out_host:
                 raise ValueError(
                     "[LWD] edge-cloud shared world requires "
-                    "lwd_config.post_out_host (= edge IP)"
+                    "a YAML edge addr (= edge IP)"
                 )
             distributed_init_method = lwd_config.lwd_wire_store_init_method()
         else:

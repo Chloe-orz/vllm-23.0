@@ -54,7 +54,7 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
             LwdConfig,
         )
 
-        phase = LwdConfig.from_env_and_config(self.vllm_config).scheduler_name
+        phase = LwdConfig.from_vllm_config(self.vllm_config).scheduler_name
         if phase == _LWD_PHASE_DECODE_FIRST:
             return False
         if phase != _LWD_PHASE_PREFILL_FIRST:

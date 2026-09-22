@@ -81,11 +81,11 @@ class LwdEdgeEngineCore(EngineCoreProc):
         # 一次性消费 scheduler_cls,后设无效(注入失效,首请求即崩)
         vllm_config.scheduler_config.scheduler_cls = LwdEdgeScheduler
         super().__init__(*args, **kwargs)
-        config = LwdConfig.from_env_and_config(vllm_config)
+        config = LwdConfig.from_vllm_config(vllm_config)
         # 层日志总开关:env 已开则不动,config 段开则补开(仅本进程)
         LwdLogBase.set_debug(config.debug)
         # 通信面:bind POST_OUT 订阅面 + 延迟连接的 PRE_OUT 发布面;
-        # 云端点由 HELLO 通告决定(边不预知云地址)
+        # 云端点由 HELLO 通告，并与本侧 YAML 校验一致后才连接。
         self._edge_receiver = self._lwd_build_post_out(config)
         self._edge_sender = LwdControlPublisher(
             None, bind=False, queue_max=config.publish_queue_max
@@ -133,7 +133,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
     # 通信面                                                              #
     # ------------------------------------------------------------------ #
     def _lwd_build_post_out(self, config: LwdConfig) -> LwdControlSubscriber:
-        """bind POST_OUT 订阅面;云经 master_addr 主动来连。"""
+        """bind POST_OUT 订阅面;云经 YAML edge addr 主动来连。"""
         return LwdControlSubscriber(
             config.lwd_post_out_bind_endpoint(),
             bind=True,
@@ -201,6 +201,17 @@ class LwdEdgeEngineCore(EngineCoreProc):
         wire_version==0 = 旧版云侧(不携带互校字段),仅告警不拒绝;
         版本不符或 edge/cloud NPU 计数与本侧配置不符即拒绝(计数取自
         vllm_config.parallel_config.lwd_config,不新增配置段)。"""
+        config = LwdConfig.from_vllm_config(self.vllm_config)
+        if (msg.pre_out_host, msg.pre_out_port) != (
+            config.pre_out_host,
+            config.pre_out_port,
+        ):
+            return (
+                "[Lwd] edge engine init failed: cloud HELLO endpoint "
+                f"{msg.pre_out_host}:{msg.pre_out_port} differs from YAML "
+                f"{config.pre_out_host}:{config.pre_out_port}; "
+                "use identical topology contents on both sides"
+            )
         if msg.wire_version == 0:
             logger.warning(
                 "[Lwd] cloud HELLO carries no wire version (legacy cloud); "

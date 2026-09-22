@@ -134,11 +134,11 @@ class MultiprocExecutor(Executor):
                 LwdConfig,
             )
 
-            lwd_config = LwdConfig.from_env_and_config(self.vllm_config)
+            lwd_config = LwdConfig.from_vllm_config(self.vllm_config)
             if not lwd_config.post_out_host:
                 raise ValueError(
                     "[LWD] edge-cloud shared world requires "
-                    "lwd_config.post_out_host (= edge IP, same value on "
+                    "a YAML edge addr (= edge IP, same value on "
                     "both sides; the edge rank-0 worker binds the "
                     "rendezvous store there)"
                 )

@@ -32,7 +32,6 @@ from pydantic.fields import FieldInfo
 from typing_extensions import TypeIs
 
 import vllm.envs as envs
-from vllm.config.parallel import LwdParallelConfig
 from vllm.config import (
     AttentionConfig,
     CacheConfig,
@@ -485,8 +484,6 @@ class EngineArgs:
     linear_backend: LinearBackend = KernelConfig.linear_backend
     all2all_backend: All2AllBackend = ParallelConfig.all2all_backend
     enable_elastic_ep: bool = ParallelConfig.enable_elastic_ep
-    edge_npu_count: int = 0
-    cloud_npu_count: int = 0
     enable_dbo: bool = ParallelConfig.enable_dbo
     ubatch_size: int = ParallelConfig.ubatch_size
     dbo_decode_token_threshold: int = ParallelConfig.dbo_decode_token_threshold
@@ -1080,14 +1077,6 @@ class EngineArgs:
         )
         parallel_group.add_argument(
             "--enable-elastic-ep", **parallel_kwargs["enable_elastic_ep"]
-        )
-        parallel_group.add_argument(
-            "--edge-npu-count", type=int, default=0,
-            help="Total number of edge NPUs across all DP instances (LWD mode).",
-        )
-        parallel_group.add_argument(
-            "--cloud-npu-count", type=int, default=0,
-            help="Total number of cloud NPUs across all DP instances (LWD mode).",
         )
         parallel_group.add_argument(
             "--dbo-decode-token-threshold",
@@ -1836,11 +1825,13 @@ class EngineArgs:
             "nnodes > 1 is only supported with data_parallel_backend=mp"
         )
         inferred_data_parallel_rank = 0
-        # LWD (edge-cloud): enable_lwd is only back-filled into ParallelConfig
-        # in VllmConfig.__post_init__, which runs after this method, so read
-        # the raw additional_config dict here instead.
-        lwd_cfg = (self.additional_config or {}).get("lwd_config") or {}
-        lwd_enabled = bool(lwd_cfg.get("enabled", False))
+        # Only inspect the entry here. YAML is loaded at the existing
+        # VllmConfig.__post_init__ configuration boundary.
+        from vllm.config.lwd import lwd_entry_from_additional
+
+        lwd_enabled = lwd_entry_from_additional(self.additional_config) is not None
+        if lwd_enabled and self.distributed_executor_backend not in (None, "mp"):
+            raise ValueError("[LWD] Single-instance execution requires the mp executor")
         if self.nnodes > 1 and not lwd_enabled:
             world_size = (
                 self.data_parallel_size
@@ -2001,7 +1992,6 @@ class EngineArgs:
             enable_ep_weight_filter=self.enable_ep_weight_filter,
             all2all_backend=self.all2all_backend,
             enable_elastic_ep=self.enable_elastic_ep,
-            lwd_config=LwdParallelConfig(edge_npu_count=self.edge_npu_count, cloud_npu_count=self.cloud_npu_count),
             enable_dbo=self.enable_dbo,
             ubatch_size=self.ubatch_size,
             dbo_decode_token_threshold=self.dbo_decode_token_threshold,
@@ -2015,7 +2005,9 @@ class EngineArgs:
             ray_workers_use_nsight=self.ray_workers_use_nsight,
             ray_runtime_env=ray_runtime_env,
             placement_group=placement_group,
-            distributed_executor_backend=self.distributed_executor_backend,
+            distributed_executor_backend=(
+                "mp" if lwd_enabled else self.distributed_executor_backend
+            ),
             worker_cls=self.worker_cls,
             worker_extension_cls=self.worker_extension_cls,
             decode_context_parallel_size=self.decode_context_parallel_size,

@@ -110,9 +110,8 @@ class LwdParallelConfig:
     """LWD (layerwise disaggregated) parallel-topology config aggregation.
 
     Aggregates the vLLM-side parallel knobs of an LWD deployment into a
-    single object: the master switch (mirrored from
-    ``additional_config["lwd_config"].enabled``), the edge/cloud process
-    role mirror and the edge/cloud NPU counts (from the LWD CLI flags).
+    single object: the master switch (enabled by ``lwd_config.path``),
+    the edge/cloud role and NPU counts derived from the topology YAML.
     ``ParallelConfig`` exposes exactly one field of this type, so no LWD
     variable is ever scattered across ``ParallelConfig``.
     """
@@ -830,16 +829,9 @@ class ParallelConfig:
             * self.prefill_context_parallel_size
         )
 
-        # LWD edge-cloud mode: ``world_size`` spans both sides of the
-        # deployment (per DP instance) so that per-rank bookkeeping (e.g.
-        # ``WorkerProc.all_kwargs``) has a slot for every edge/cloud rank.
-        # NOTE: ``lwd_config.enable_lwd`` is only back-filled later in
-        # ``VllmConfig.__post_init__``, so gate on the CLI-provided NPU
-        # counts here instead.
-        if (
-            self.lwd_config.edge_npu_count > 0
-            and self.lwd_config.cloud_npu_count > 0
-        ):
+        # Already-resolved copies preserve the shared bootstrap world.
+        # The initial YAML projection occurs in VllmConfig.__post_init__.
+        if self.lwd_config.enable_lwd:
             self.world_size = (
                 self.lwd_config.edge_npu_count + self.lwd_config.cloud_npu_count
             )

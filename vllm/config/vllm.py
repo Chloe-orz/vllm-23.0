@@ -30,7 +30,6 @@ from vllm.utils import random_uuid
 from vllm.utils.hashing import safe_hash
 
 from .attention import AttentionConfig
-from .lwd import LwdConfig
 from .cache import CacheConfig
 from .compilation import CompilationConfig, CompilationMode, CUDAGraphMode
 from .device import DeviceConfig
@@ -40,6 +39,7 @@ from .kv_events import KVEventsConfig
 from .kv_transfer import KVTransferConfig
 from .load import LoadConfig
 from .lora import LoRAConfig
+from .lwd import LwdConfig, lwd_entry_from_additional
 from .mamba import MambaConfig
 from .model import ModelConfig
 from .observability import ObservabilityConfig
@@ -856,47 +856,20 @@ class VllmConfig:
         # To give each torch profile run a unique instance name.
         self.instance_id = f"{time.time_ns()}"
 
-        # LWD (layerwise disaggregated) bootstrap: parse the JSON config body into
-        # VllmConfig.lwd_config, then mirror the master switch, role and CLI NPU
-        # counts into the aggregated ParallelConfig.lwd_config object.
-        additional = self.additional_config if isinstance(self.additional_config, dict) else {}
-        self.lwd_config = LwdConfig.from_dict(additional.get("lwd_config") or {})
+        # Load topology here; engines/workers consume the resulting snapshot.
+        # Keep additional_config JSON-serializable for other plugins and hashing.
+        self.lwd_config = LwdConfig.from_dict(
+            lwd_entry_from_additional(self.additional_config)
+        )
         if self.lwd_config.enabled:
-            parallel_lwd = self.parallel_config.lwd_config
-            parallel_lwd.enable_lwd = True
-            parallel_lwd.is_edge_node = self.lwd_config.is_edge
-            if self.lwd_config.is_edge and parallel_lwd.edge_npu_count <= 0:
-                raise ValueError("--edge-npu-count must be positive on the LWD edge process")
-            # 运行时并行组按 LWD 布局构建(边单例 TP=edge_npu_count,
-            # 云一组 TP=cloud_npu_count);配置 tp 回填为真值,使头数/
-            # KV spec/MoE 切分等配置派生量与运行时组态对齐。
-            self.parallel_config.tensor_parallel_size = (
-                parallel_lwd.edge_npu_count
-                if self.lwd_config.is_edge
-                else parallel_lwd.cloud_npu_count
-            )
-            # 边云模式并行度由拓扑推导,不接受 CLI 指定(对齐参考实现
-            # v0.23.0_lwd_prefill_only 70151bf):world = 边 + 云(边云共享
-            # 一个世界组,仅作 LWD 通道建组的 new_group 母体);PP 恒为
-            # 1(各侧模型执行走 pp=1 原生集中式,PP 组全单例);
-            # TP 边取 edge_npu_count、云取 cloud_npu_count(云侧按此切权重)。
-            if (self.parallel_config.tensor_parallel_size != 1
-                    or self.parallel_config.pipeline_parallel_size != 1):
+            self.lwd_config.apply_to_parallel_config(self.parallel_config)
+            assert self.lwd_config.topology is not None
+            features = self.lwd_config.topology.feature_ctrl
+            if features.enable_early_recv or features.enable_scramble:
                 logger.warning(
-                    "Lwd edge-cloud mode derives parallel sizes from the "
-                    "topology; ignoring CLI tp=%s pp=%s.",
-                    self.parallel_config.tensor_parallel_size,
-                    self.parallel_config.pipeline_parallel_size,
+                    "[LWD] feature_ctrl is parsed and forwarded only; "
+                    "enable_early_recv/enable_scramble have no runtime effect yet"
                 )
-            self.parallel_config.world_size = (
-                parallel_lwd.edge_npu_count + parallel_lwd.cloud_npu_count
-            )
-            self.parallel_config.pipeline_parallel_size = 1
-            self.parallel_config.tensor_parallel_size = (
-                parallel_lwd.edge_npu_count
-                if parallel_lwd.is_edge_node
-                else parallel_lwd.cloud_npu_count
-            )
 
         if self.performance_mode != "balanced":
             logger.info_once("Performance mode set to '%s'.", self.performance_mode)

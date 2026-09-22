@@ -1,0 +1,41 @@
+# CONFIGURATION EXAMPLE ONLY: multi-DP execution is not implemented yet.
+# One logical edge/cloud instance, two DPs. The edge rank is shared;
+# cloud DPs use disjoint ranks. Nine unique ranks, NOT ten.
+# Parsing keeps both DPs; serving with this file fails explicitly before
+# starting workers. Use lwd_config.yaml for the current NPU acceptance run.
+
+deployment:
+  mode: 0
+  scene: single_instance
+  hccl_world_size: 9
+  edges_num: 1
+  clouds_num: 1
+
+feature_ctrl:
+  enable_early_recv: false
+  enable_scramble: false
+
+edges:
+  - id: 0
+    dp:
+      - dp_idx: 0
+        addr: 10.0.0.1
+        ranks: [0]
+      - dp_idx: 1
+        addr: 10.0.0.1
+        ranks: [0]
+
+clouds:
+  - id: 0
+    dp:
+      - dp_idx: 0
+        addr: 10.1.0.1
+        ranks: [1, 2, 3, 4]
+        ctrl_port: 5550
+      - dp_idx: 1
+        addr: 10.1.0.1
+        ranks: [5, 6, 7, 8]
+        ctrl_port: 5551
+
+instance_links:
+  - {edge: 0, cloud: 0}

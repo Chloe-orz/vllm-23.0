@@ -107,14 +107,12 @@ def check_getattr_budget(lwd_root: Path) -> list[str]:
 
 
 def check_env_parsing(lwd_root: Path) -> list[str]:
-    """内核 os.environ 读取 = 0(唯一入口 LwdConfig.from_env_and_config)。"""
+    """内核 os.environ 读取 = 0，环境过渡参数仅在 vllm/config/lwd.py 解析。"""
     violations: list[str] = []
     for path in _lwd_iter_files(lwd_root):
-        if path.name == "lwd_edge_assemble.py":
-            continue  # LwdConfig 定义处:唯一 env 入口(§7.3-C3/§10.3)
         if _LWD_ENV_PATTERN.search(path.read_text(encoding="utf-8")):
             violations.append(
-                f"{path.name}: env 解析越权(仅 lwd_edge_assemble.py 允许)"
+                f"{path.name}: env 解析越权(仅 vllm/config/lwd.py 允许)"
             )
     return violations
 
