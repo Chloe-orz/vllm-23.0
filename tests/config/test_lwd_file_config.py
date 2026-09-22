@@ -71,9 +71,9 @@ def test_single_dp_projection_and_transport(monkeypatch, role, tp, ranks):
     with monkeypatch.context() as patch:
         patch.setattr(Path, "open", lambda *a, **kw: pytest.fail("YAML was reopened"))
         transport = TransportConfig.from_vllm_config(SimpleNamespace(lwd_config=config))
-    assert transport.lwd_pre_out_endpoint() == "tcp://10.1.0.1:5550"
-    assert transport.lwd_post_out_connect_endpoint() == "tcp://10.0.0.1:6454"
-    assert transport.lwd_wire_store_init_method() == "tcp://10.0.0.1:29600"
+    assert transport.lwd_pre_out_endpoint() == "tcp://76.76.26.234:6453"
+    assert transport.lwd_post_out_connect_endpoint() == "tcp://76.76.26.18:6454"
+    assert transport.lwd_wire_store_init_method() == "tcp://76.76.26.18:29600"
 
 
 def test_multi_dp_parses_but_cannot_execute(monkeypatch):

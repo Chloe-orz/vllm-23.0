@@ -9,10 +9,11 @@ PUSH/PULL 通信。没有实现 ROUTER/DEALER、多 DP 调度或共享卡执行�
 - `lwd_config.yaml`：当前上板入口，单实例、单 DP，边 TP=1、云 TP=8，world=9。
 - `lwd_config_2dp.yaml`：配置预留示例，保留两个 DP；边 rank 0 共享，云每 DP 4 卡。
   解析器支持该结构，当前运行入口会明确报多 DP 暂不支持，不会只取 DP0 继续跑。
-- YAML 放在 vllm 仓的 `etc/lwd/`，vllm-ascend 不维护第二份。
+- 上板配置固定为 vllm 仓的 `etc/lwd/lwd_config.yaml`，不按模型重命名，
+  vllm-ascend 不维护第二份。多 DP 文件仅为预留示例，不是当前启动入口。
   若仓库在 `/vllm-workspace/vllm`，实际路径就是
   `/vllm-workspace/vllm/etc/lwd/lwd_config.yaml`。
-  `/etc/lwd/lwd_config.yaml` 仅是可选安装路径，并不要求复制过去。
+  不再使用系统目录 `/etc/lwd/` 作为本次部署位置。
 
 两端都需要本次 `prefill_only_newsetting` 的 vllm 代码，以及包含 no-PP 的
 vllm-ascend（本次基线 `11b6a1d54`）。不能只更新一个仓或只更新一侧。
@@ -20,8 +21,9 @@ vllm-ascend（本次基线 `11b6a1d54`）。不能只更新一个仓或只更新
 
 ## 配置替换
 
-1. 修改 `lwd_config.yaml` 的两个示例 IP 为实际边/云控制面 IPv4 地址。
-   两侧文件内容必须一致，文件的本地绝对路径可以不同。
+1. `lwd_config.yaml` 已填入当前 Qwen3.8 环境：边 `76.76.26.18`、
+   云 `76.76.26.234`、云 `ctrl_port: 6453`。两侧使用相同内容，
+   文件名及仓内位置固定；以后更换环境只修改文件内容。
 2. 保留正常模型、网卡、可见 NPU、图模式等设置。边侧选 1 张卡，云侧选 8 张卡。
    `ranks` 是全局逻辑 rank，不是 `ASCEND_RT_VISIBLE_DEVICES` 的物理卡号。
 3. `additional-config.lwd_config` 只填 `path/role/instance_id`。
@@ -43,9 +45,9 @@ vllm-ascend（本次基线 `11b6a1d54`）。不能只更新一个仓或只更新
 
 | 用途 | 当前来源 | 示例 |
 | --- | --- | --- |
-| PRE_OUT（边 → 云控制） | 云 `dp.addr:ctrl_port` | 云 IP:5550 |
-| POST_OUT（云 → 边控制/HELLO） | 边 `dp.addr` + 暂留的 POST_OUT export | 边 IP:6454 |
-| no-PP 共享世界 TCPStore | 边 `dp.addr` + 默认端口 29600 | 边 IP:29600 |
+| PRE_OUT（边 → 云控制） | 云 `dp.addr:ctrl_port` | 76.76.26.234:6453 |
+| POST_OUT（云 → 边控制/HELLO） | 边 `dp.addr` + 暂留的 POST_OUT export | 76.76.26.18:6454 |
+| no-PP 共享世界 TCPStore | 边 `dp.addr` + 默认端口 29600 | 76.76.26.18:29600 |
 
 双方暂时都保留这一行（不设置时默认 5559）：
 
@@ -57,8 +59,8 @@ export VLLM_ASCEND_LWD_POST_OUT_PORT=6454
 WIRE_STORE_PORT/HELLO_TIMEOUT_S/DEBUG 环境覆盖链已移除，不再决定传输参数。
 不要靠旧 export 改地址或端口；PRE_OUT 改 YAML，TCPStore 本版固定 29600，
 HELLO 超时保持 600 秒。其他模块原有的性能、日志和 NPU 环境变量不在本次清理范围。
-确认云 5550、边 6454 和边 29600 可达且未被占用。
-如果要沿用旧 PRE_OUT=6453，把 YAML 的 ctrl_port 改成 6453，双方使用同一文件。
+确认云 6453、边 6454 和边 29600 可达且未被占用。
+当前 YAML 已沿用 PRE_OUT=6453，双方使用同一文件。
 POST_OUT 不得与边 TCPStore 的 29600 冲突。
 
 ## 边 1 卡 / 云 8 卡启动示例

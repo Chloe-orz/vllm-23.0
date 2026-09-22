@@ -1,7 +1,9 @@
-# Single instance, one DP: edge TP=1, cloud TP=8.
+# Qwen3.8: single instance, one DP: edge TP=1, cloud TP=8.
+# Fixed configuration filename and repository location: etc/lwd/lwd_config.yaml.
 # Set additional_config.lwd_config.path to this file's actual runtime path.
-# Example checkout: /vllm-workspace/vllm/etc/lwd/lwd_config.yaml
-# Replace both example IP addresses with the real control-plane addresses.
+# NPU deployment: /vllm-workspace/vllm/etc/lwd/lwd_config.yaml
+# Addresses and control port match qwen3.8edge.sh / qwen3.8cloud.sh.
+# Ranks are logical global ranks, not physical NPU IDs.
 # Both sides must use identical topology contents; role and instance_id are
 # supplied separately through additional_config.lwd_config.
 # Current no-PP/PUSH-PULL runtime: ctrl_port maps to PRE_OUT.
@@ -23,16 +25,16 @@ edges:
   - id: 0
     dp:
       - dp_idx: 0
-        addr: 10.0.0.1  # Replace with the edge control-plane IP.
+        addr: 76.76.26.18
         ranks: [0]
 
 clouds:
   - id: 0
     dp:
       - dp_idx: 0
-        addr: 10.1.0.1  # Replace with the cloud control-plane IP.
+        addr: 76.76.26.234
         ranks: [1, 2, 3, 4, 5, 6, 7, 8]
-        ctrl_port: 5550
+        ctrl_port: 6453
 
 instance_links:
   - {edge: 0, cloud: 0}
