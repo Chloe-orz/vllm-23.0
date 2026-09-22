@@ -99,7 +99,7 @@ class LwdCloudEngineCore(EngineCoreProc):
         logger.info(
             "[Lwd] cloud engine assembled: PRE_OUT bind %s, POST_OUT -> %s",
             config.lwd_pre_out_endpoint(),
-            f"tcp://{connect_host}:{config.post_out_port}",
+            config.lwd_post_out_connect_endpoint(),
         )
 
     def process_input_sockets(
