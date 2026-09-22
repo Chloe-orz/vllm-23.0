@@ -11,15 +11,19 @@ POST_OUT port is the temporary environment snapshot captured by core config.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import asdict, dataclass
 
 from vllm.config.lwd import LWD_POST_OUT_PORT_DEFAULT, LWD_WIRE_STORE_PORT_DEFAULT
+from vllm.logger import init_logger
 from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
     LWD_PUBLISH_QUEUE_MAX,
 )
 
 LWD_PRE_OUT_PORT_DEFAULT = 5558
 LWD_HELLO_TIMEOUT_S_DEFAULT = 600.0
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -60,13 +64,22 @@ class LwdConfig:
         edge = topology.dp("edge", 0, 0)
         cloud = topology.dp("cloud", 0, 0)
         assert cloud.ctrl_port is not None
-        return cls(
+        config = cls(
             is_edge_node=effective.is_edge,
             pre_out_host=cloud.addr,
             pre_out_port=cloud.ctrl_port,
             post_out_host=edge.addr,
             post_out_port=effective.post_out_port,
         )
+        # This adapter is called from several engine/executor entry points.
+        # Report the actual returned values once per process/config, not per step.
+        logger.info_once(
+            "[LWD][config][transport] role=%s instance_id=%d values=%s",
+            effective.role,
+            effective.instance_id,
+            json.dumps(asdict(config), ensure_ascii=False),
+        )
+        return config
 
 
 def is_lwd_prefill_only(vllm_config) -> bool:

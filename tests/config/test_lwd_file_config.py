@@ -3,15 +3,19 @@
 
 """Configuration-only coverage; no device or distributed initialization."""
 
+import json
 import pickle
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import yaml
 
 from vllm.config.lwd import LwdConfig, lwd_entry_from_additional
 from vllm.config.lwd_topology import LwdTopology
+from vllm.v1.lwd_control.control_edge_scheduler import lwd_edge_assemble
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import (
     LwdConfig as TransportConfig,
 )
@@ -165,3 +169,25 @@ def test_feature_defaults_and_rank_validation():
     raw["clouds"][0]["dp"][0]["ranks"][-1] = 7
     with pytest.raises(ValueError, match="duplicate ranks"):
         LwdTopology.from_dict(raw)
+
+
+def test_transport_log_contains_the_returned_config(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_LWD_POST_OUT_PORT", "6454")
+    config = LwdConfig.from_dict(entry("cloud"))
+    log = Mock()
+    monkeypatch.setattr(lwd_edge_assemble.logger, "info_once", log)
+    transport = TransportConfig.from_vllm_config(SimpleNamespace(lwd_config=config))
+    message, role, instance_id, payload = log.call_args.args
+    assert "[LWD][config][transport]" in message
+    assert (role, instance_id) == ("cloud", 0)
+    assert json.loads(payload) == asdict(transport)
+
+
+def test_parsed_log_payload_preserves_all_dps(monkeypatch):
+    monkeypatch.delenv("VLLM_ASCEND_LWD_POST_OUT_PORT", raising=False)
+    config = LwdConfig.from_dict(entry(filename="lwd_config_2dp.yaml"))
+    payload = json.loads(json.dumps(asdict(config)))
+    assert payload["path"] == entry(filename="lwd_config_2dp.yaml")["path"]
+    assert len(payload["topology"]["edges"][0]["dp"]) == 2
+    assert payload["topology"]["clouds"][0]["dp"][1]["ranks"] == [5, 6, 7, 8]
+    assert payload["topology"]["feature_ctrl"]["enable_early_recv"] is False

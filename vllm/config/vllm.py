@@ -10,7 +10,7 @@ import threading
 import time
 from collections.abc import Iterable
 from contextlib import contextmanager
-from dataclasses import is_dataclass
+from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from enum import IntEnum
 from functools import lru_cache
@@ -862,7 +862,33 @@ class VllmConfig:
             lwd_entry_from_additional(self.additional_config)
         )
         if self.lwd_config.enabled:
+            # Log the retained snapshot, not the raw file or all additional
+            # plugin settings. Defaults and all DP entries are visible here,
+            # even when the following runtime gate rejects a future layout.
+            logger.info(
+                "[LWD][config][parsed] %s",
+                json.dumps(asdict(self.lwd_config), ensure_ascii=False),
+            )
+            logger.info(
+                "[LWD][config][selected] role=%s instance_id=%d instance=%s",
+                self.lwd_config.role,
+                self.lwd_config.instance_id,
+                json.dumps(asdict(self.lwd_config.instance), ensure_ascii=False),
+            )
             self.lwd_config.apply_to_parallel_config(self.parallel_config)
+            logger.info(
+                "[LWD][config] path=%s role=%s instance_id=%d dp_idx=%d "
+                "ranks=%s TP=%d PP=%d world=%d POST_OUT_PORT=%d",
+                self.lwd_config.path,
+                self.lwd_config.role,
+                self.lwd_config.instance_id,
+                self.lwd_config.dp.dp_idx,
+                self.lwd_config.dp.ranks,
+                self.parallel_config.tensor_parallel_size,
+                self.parallel_config.pipeline_parallel_size,
+                self.parallel_config.world_size,
+                self.lwd_config.post_out_port,
+            )
             assert self.lwd_config.topology is not None
             features = self.lwd_config.topology.feature_ctrl
             if features.enable_early_recv or features.enable_scramble:

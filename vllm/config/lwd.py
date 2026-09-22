@@ -232,6 +232,7 @@ class LwdConfig:
     def __repr__(self) -> str:
         return (
             f"[LWD] config(enabled={self.enabled}, role={self.role!r}, "
-            f"mode={self.mode!r}, "
+            f"mode={self.mode!r}, path={self.path!r}, "
+            f"instance_id={self.instance_id}, "
             f"edge_head_tail_layers={list(self.edge_head_tail_layers)})"
         )

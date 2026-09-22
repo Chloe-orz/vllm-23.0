@@ -101,8 +101,25 @@ vllm serve /weight/Qwen3.8-27B \
 
 ## 上板验收
 
-1. 确认配置：边 role=edge、TP=1，云 role=cloud、TP=8；双方 PP=1、world=9，
-   POST_OUT_PORT 均为 6454。完整参数来自同内容 YAML 和各自的 role/instance_id。
+启动时保持 INFO 级别（不要设置 `VLLM_LOGGING_LEVEL=ERROR`），搜索
+`[LWD][config]`。新增日志按以下阶段区分，打印的是解析后保存/实际返回的对象，
+不是重新打开 YAML，也不打印其他插件的 additional_config 内容：
+
+| 日志标记 | 能确认什么 | 参数保存位置 |
+| --- | --- | --- |
+| `[LWD][config][parsed]` | 文件读取、schema 校验和实例查找已成功；完整保留五块拓扑、所有 DP、缺省 feature 值及过渡 POST_OUT 端口 | `vllm_config.lwd_config`，完整 YAML 在其 `.topology` |
+| `[LWD][config][selected]` | 当前 role/instance_id 选中的实例及其全部 DP | `vllm_config.lwd_config.instance` |
+| `[LWD][config] path=... TP=...` | 已通过当前单 DP 运行限制及 TP 一致性检查，并已映射并行参数 | `vllm_config.parallel_config` 及其 `.lwd_config` |
+| `[LWD][config][transport]` | 实际适配出的 pre_out_host/port、post_out_host/port、wire_store_port、超时等所有传输值 | `LwdConfig.from_vllm_config()` 返回的控制面配置对象 |
+
+`parsed`/`selected` 在运行限制检查之前打印，所以多 DP 文件也能看到完整解析结果，
+随后才报运行时暂不支持；不能把这两条日志当成启动成功。
+`transport` 在每个进程里对相同配置只打印一次，不在每个请求里重复打印。
+原始入口仍在 `vllm_config.additional_config["lwd_config"]`，仅包含 path/role/instance_id。
+feature 为 true 仍只是保留参数，不代表对应功能已经启用。
+
+1. 配置日志 `[LWD][config]`：边 role=edge、ranks=(0,)、TP=1、PP=1、world=9；
+   云 role=cloud、ranks=(1,...,8)、TP=8、PP=1、world=9；POST_OUT_PORT 均为 6454。
 2. 两侧 `[LWD] distributed init method from lwd_config` 都是边 IP:29600。
    并行组日志应显示云内 8 卡 TP、PP 单 rank 组；这只能说明初始化，不代表请求已成功。
 3. 边侧 `cloud discovered via HELLO` 的 PRE_OUT 与 YAML 云 IP:ctrl_port 一致；
