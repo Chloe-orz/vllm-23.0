@@ -28,8 +28,8 @@ def entry(role="edge", instance_id=0, dps=1):
 
 
 @pytest.fixture(autouse=True)
-def stable_post_out(monkeypatch):
-    monkeypatch.setenv("VLLM_ASCEND_LWD_POST_OUT_PORT", "6454")
+def clear_retired_post_out(monkeypatch):
+    monkeypatch.delenv("VLLM_ASCEND_LWD_POST_OUT_PORT", raising=False)
 
 
 @pytest.mark.parametrize("dps", [1, 2])

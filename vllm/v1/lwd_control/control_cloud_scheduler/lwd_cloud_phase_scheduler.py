@@ -114,6 +114,11 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
         out.lwd_batch = LwdBatch(
             batch_type=LwdBatchType.LWD_EMBED,
             seqno=notify.seqno,
+            connection_key=(
+                notify.edge_id,
+                self.vllm_config.lwd_config.instance_id,
+                notify.dp_idx,
+            ),
             batch_meta=LwdEmbedBatch(
                 req_ids=[notify.request_id],
                 token_ids=[[0] * notify.num_tokens],

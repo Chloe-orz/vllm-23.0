@@ -66,6 +66,9 @@ class LwdBatch:
     batch_type: LwdBatchType
     seqno: int  # every batch has a unique seqno, increasing by 1 on every dispatch.
     batch_meta: LwdEmbedBatch | LwdUnembedBatch | None
+    # Same (edge_id, cloud_id, dp_idx) as the control-plane connection.
+    # Reserved for other layouts; current execution accepts only S1/1DP.
+    connection_key: tuple[int, int, int] | None = None
 
 
 @dataclass

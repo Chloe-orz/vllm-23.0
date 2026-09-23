@@ -38,6 +38,7 @@ def parallel(tp):
         data_parallel_backend="mp",
         data_parallel_size_local=1,
         data_parallel_rank=0,
+        data_parallel_index=0,
         data_parallel_external_lb=False,
         data_parallel_hybrid_lb=False,
         nnodes=1,
@@ -75,7 +76,7 @@ def test_single_dp_projection_and_transport(monkeypatch, role, tp, ranks):
     with monkeypatch.context() as patch:
         patch.setattr(Path, "open", lambda *a, **kw: pytest.fail("YAML was reopened"))
         transport = TransportConfig.from_vllm_config(
-            SimpleNamespace(lwd_config=config)
+            SimpleNamespace(lwd_config=config, parallel_config=pc)
         )
     assert transport.my_links == ((0, 0, 0),)
     assert transport.wire_store_init_method == "tcp://76.76.26.18:29600"
@@ -203,7 +204,9 @@ def test_transport_log_contains_the_returned_config(monkeypatch):
     config = LwdConfig.from_dict(entry("cloud"))
     log = Mock()
     monkeypatch.setattr(lwd_edge_assemble.logger, "info_once", log)
-    transport = TransportConfig.from_vllm_config(SimpleNamespace(lwd_config=config))
+    transport = TransportConfig.from_vllm_config(
+        SimpleNamespace(lwd_config=config, parallel_config=parallel(8))
+    )
     message = log.call_args.args[0]
     assert "[LWD][config][transport]" in message
     payload = json.loads(log.call_args.args[-1])

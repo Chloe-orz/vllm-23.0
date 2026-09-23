@@ -194,14 +194,18 @@ class LwdEdgeEngineCore(EngineCoreProc):
         消息体,数据与唤醒分离,多投无害(空 drain 一步即返回)。
         其余帧(坏帧已被 IO 循环丢弃后仍不认识的类型)告警丢弃。"""
         if isinstance(msg, LwdRegisterAckNotify):
-            if msg.wire_version != LWD_WIRE_VERSION:
-                # ack 版本不符:置错唤醒构造线程 fail-fast(回调内 raise
+            if (
+                link not in self._lwd_ack
+                or (msg.cloud_id, msg.dp_idx) != (link[1], link[2])
+                or msg.wire_version != LWD_WIRE_VERSION
+            ):
+                # ack 身份/版本不符:置错唤醒构造线程 fail-fast(回调内 raise
                 # 只杀 IO 线程,构不成快败);计数/digest 校验在云侧
-                # register 入口已做,ack 只核版本
+                # register 入口已做,ack 核对当前连接身份及版本
                 error = (
-                    f"[Lwd] edge engine init failed: register-ack wire "
-                    f"version mismatch (cloud={msg.wire_version}, "
-                    f"edge={LWD_WIRE_VERSION})"
+                    f"[Lwd] edge engine init failed: register-ack mismatch "
+                    f"link={link}, cloud={msg.cloud_id}, dp={msg.dp_idx}, "
+                    f"wire={msg.wire_version}, expected_wire={LWD_WIRE_VERSION}"
                 )
                 logger.error("[Lwd] %s", error)
                 self._lwd_ack_error = error
@@ -213,6 +217,18 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 expected.set()
             return
         if isinstance(msg, LwdC2eNotify):
+            if (
+                link not in self._lwd_ack
+                or (msg.edge_id, msg.dp_idx) != (link[0], link[2])
+            ):
+                logger.error(
+                    "[Lwd] C2e connection mismatch: link=%s edge=%s dp=%s",
+                    link, msg.edge_id, msg.dp_idx,
+                )
+                self.input_queue.put_nowait(
+                    (EngineCoreRequestType.EXECUTOR_FAILED, b"")
+                )
+                return
             logger.info(
                 "[Lwd][edge-ctrl] C2eNotify reqs=%d down_seqno=%s edge=%s dp=%s",
                 len(getattr(msg, "req_ids", []) or []),
@@ -396,7 +412,9 @@ class LwdEdgeEngineCore(EngineCoreProc):
 
         c2e_wait(到达→派发)是消费滞后读数:持续偏大说明边引擎步
         循环被收割/派发占住,c2e 在积压,云侧 publisher 队满小睡在即。"""
-        unembed_batch = lwd_build_unembed_batch(notify)
+        unembed_batch = lwd_build_unembed_batch(
+            notify, self.scheduler.lwd_edge_link
+        )
         n_emb, n_unemb = self._lwd_queue_mix()
         logger.info(
             "[Lwd][sched] edge dispatch-unembed seqno=%s reqs=%d rows=%d "

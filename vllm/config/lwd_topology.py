@@ -295,9 +295,14 @@ class LwdTopology:
                 "[LWD] Single-instance topology requires link edge=0, cloud=0"
             )
         edge, cloud = self.edges[0].dp[0], self.clouds[0].dp[0]
+        if len(edge.ranks) != 1:
+            raise ValueError(
+                "[LWD] Single-instance runtime requires exactly one edge rank"
+            )
         if any(ip_address(dp.addr).version != 4 for dp in (edge, cloud)):
             raise ValueError(
-                "[LWD] The current PUSH/PULL runtime requires IPv4 addresses"
+                "[LWD] The current control/data endpoint formatting "
+                "requires IPv4 addresses"
             )
         if edge.addr == cloud.addr:
             raise ValueError("[LWD] Edge and cloud must have different addresses")

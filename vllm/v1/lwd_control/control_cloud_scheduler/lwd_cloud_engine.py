@@ -175,6 +175,15 @@ class LwdCloudEngineCore(EngineCoreProc):
         """注册入口:cloud_id 连对端口 + 公共互校(版本/卡数/digest);
         通过即登记对端并定向回 ack(队满丢弃可接受——边侧周期重发,幂等)。"""
         config = self._lwd_config
+        link = (msg.edge_id, msg.cloud_id, msg.dp_idx)
+        expected_identity = f"edge-{msg.edge_id}-{msg.dp_idx}".encode()
+        if link not in config.my_links or identity != expected_identity:
+            logger.error(
+                "[Lwd] register rejected: identity=%r link=%s is not bound "
+                "to this cloud control endpoint",
+                identity, link,
+            )
+            return
         if msg.cloud_id != config.instance_id:
             logger.error(
                 "[Lwd] register from edge %d targets cloud %d but reached "
@@ -382,7 +391,7 @@ class LwdCloudEngineCore(EngineCoreProc):
         # 覆写):开始执行→执行结束,不含无请求的空等。
         carrier = getattr(model_output, "lwd_down_carrier", None)
         if carrier is not None:
-            pinned, req_ids, hidden_numel, seqno = carrier
+            pinned, req_ids, hidden_numel, seqno, connection_key = carrier
             n_req = len(req_ids)
             vals = pinned.tolist()
             counts = vals[-2 * n_req : -n_req]
@@ -401,6 +410,7 @@ class LwdCloudEngineCore(EngineCoreProc):
                 num_accepted_tokens=list(counts),
                 req_ids=list(req_ids),
                 down_seqno=seqno,
+                connection_key=connection_key,
             )
             logger.info(
                 "[Lwd][cloud-ctrl] publish c2e(rank-replay): reqs=%s "
@@ -446,7 +456,17 @@ class LwdCloudEngineCore(EngineCoreProc):
         每组定向发所属边;组级重试(成功的组不再重发——重复 C2e 会让
         边侧对同一 down_seqno 二次派发 unembed),队满小睡,关停退出。"""
         pending: list[tuple[bytes, LwdC2eNotify]] = []
-        for (edge_id, dp_idx), indexes in self._lwd_c2e_split(meta).items():
+        groups = self._lwd_c2e_split(meta)
+        key = meta.connection_key
+        if (
+            key not in self._lwd_config.my_links
+            or set(groups) != {(key[0], key[2])}
+        ):
+            raise ValueError(
+                "[LWD] C2e metadata must describe one matching DOWN packet; "
+                "cloud reuse requires splitting hidden rows before sending"
+            )
+        for (edge_id, dp_idx), indexes in groups.items():
             identity = self._lwd_peer_ids.get((edge_id, dp_idx))
             if identity is None:
                 # 对端未注册(重启窗口):本组丢弃,由边侧超时兜底;

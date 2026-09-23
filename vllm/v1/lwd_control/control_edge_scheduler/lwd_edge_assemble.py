@@ -64,9 +64,8 @@ class LwdConfig:
         if effective is None or not effective.enabled or effective.topology is None:
             raise ValueError("[Lwd] Transport requires a resolved lwd_config.path")
         topology = effective.topology
-        topology.validate_single_dp_runtime()
         role, instance_id = effective.role, effective.instance_id
-        dp_idx = 0  # 单 dp 运行门内的唯一取值;多 dp 执行随入口字段放开
+        dp_idx = effective.dp_for_parallel(vllm_config.parallel_config).dp_idx
         links = tuple(
             (link.edge, link.cloud, dp_idx)
             for link in topology.instance_links
@@ -97,7 +96,7 @@ class LwdConfig:
             wire_store_init_method=f"tcp://{edge0.addr}:{LWD_WIRE_STORE_PORT_DEFAULT}",
             topology_digest=topology.digest,
             edge_npu_count=len(edge0.ranks),
-            cloud_npu_count=len(topology.clouds[0].dp[0].ranks),
+            cloud_npu_count=len(next(iter(cloud_dps.values())).ranks),
         )
         # 该投影被多个引擎/executor 入口调用:每进程报一次实际取值。
         # info_once 底层 lru_cache 按参数去重,参数必须可哈希——links

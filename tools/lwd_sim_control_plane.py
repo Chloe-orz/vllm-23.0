@@ -7,7 +7,7 @@ handle_model_output/C2e 拆发)、云调度器(分队列/轮转/点名)、通信
 (ROUTER/DEALER/loop)——用真实 ZMQ TCP 跑起来,覆盖:
   S1 单请求全链(register→Request→gate→registry→调度→C2e 还原)
   S2 多请求并发   S3 重复 RangeNotify 幂等   S4 abort 双时点
-  S5 双边 fan-in(轮转不插队/同号 seqno 不撞/C2e 拆组定向/identity 归属)
+  S5 控制层来源隔离 + 拒绝混边 DOWN carrier（不验证多实例运行）
   S6 未注册来源拒收   S7 digest 互校拒绝
   S8 真调度点名行(_lwd_schedule_for_visible_reqs 的 requests[rid_key])
 
@@ -16,8 +16,9 @@ handle_model_output/C2e 拆发)、云调度器(分队列/轮转/点名)、通信
 上板暴露的 KeyError/publish 改名一类问题,此模拟均可拦截。"""
 import sys, types, logging, queue, time, enum
 from types import SimpleNamespace
+from pathlib import Path
 
-REPO = "/Users/wangwei/prefill_only_v0.1/vllm"
+REPO = str(Path(__file__).resolve().parents[1])
 PORT = 15700
 
 # ---------------- stub 重依赖(全部与被测逻辑无关) ----------------
@@ -97,7 +98,9 @@ from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_engine import (
 def make_cloud_engine():
     eng = object.__new__(LwdCloudEngineCore)
     eng._lwd_config = SimpleNamespace(instance_id=0, edge_npu_count=1,
-                                      cloud_npu_count=8, topology_digest="dig0001")
+                                      cloud_npu_count=8, topology_digest="dig0001",
+                                      my_links=((0, 0, 0), (1, 0, 0), (9, 0, 0)))
+    # Synthetic control-only fixture, not a runnable multi-instance topology.
     eng._lwd_peers = {}; eng._lwd_peer_ids = {}
     eng._lwd_gate_pending = {}; eng._lwd_seqno_registry = {}
     eng.input_queue = queue.Queue(); eng.aborts_queue = queue.Queue()
@@ -156,10 +159,10 @@ def take_adds(eng):
 class _Pinned(list):
     def tolist(self): return list(self)
 
-def make_carrier(req_ids, seqno, numel=64):
+def make_carrier(req_ids, seqno, numel=64, connection_key=(0, 0, 0)):
     n = len(req_ids)
     pinned = _Pinned(list(range(n)) + [1] * n + [1] * n)  # ranks/counts/seg_lens
-    return (pinned, list(req_ids), numel, seqno)
+    return (pinned, list(req_ids), numel, seqno, connection_key)
 
 RESULTS = []
 def check(name, cond, detail=""):
@@ -254,21 +257,18 @@ check("S5 边间不插队(排空一边再换)", owners == [("0",0),("0",1),("1",
 # 同号 seqno 两边不撞(registry 隔离)
 check("S5 两边同号 seqno 不撞",
       eng._lwd_seqno_registry["0#0#e0-a"] == [0] and eng._lwd_seqno_registry["1#0#e1-a"] == [0])
-# fan-in C2e:同批混两边的行,拆两条定向
+# 混边 hidden 未拆包时禁止仅拆控制通知。多实例执行仍不在本轮范围。
 ebox["c2e"].clear(); ebox2["c2e"].clear()
-eng.lwd_handle_model_output(
-    SimpleNamespace(lwd_down_carrier=make_carrier(
-        ["0#0#e0-a", "1#0#e1-a", "0#0#e0-b", "1#0#e1-b"], 9)),
-    {0: SimpleNamespace(outputs=[], finished_requests=None)})
-deadline = time.time() + 5
-while time.time() < deadline and (len(ebox["c2e"]) < 1 or len(ebox2["c2e"]) < 1):
-    time.sleep(0.02)
-c0 = [c for _, c in ebox["c2e"]]; c1 = [c for _, c in ebox2["c2e"]]
-check("S5 C2e 按边拆组定向", c0 and c1 and
-      sorted(c0[-1].req_ids) == ["e0-a", "e0-b"] and
-      sorted(c1[-1].req_ids) == ["e1-a", "e1-b"],
-      f"edge0={c0[-1].req_ids if c0 else []} edge1={c1[-1].req_ids if c1 else []}")
-check("S5 两边各归各 identity", (not c0 or c0[-1].edge_id == 0) and (not c1 or c1[-1].edge_id == 1))
+try:
+    eng.lwd_handle_model_output(
+        SimpleNamespace(lwd_down_carrier=make_carrier(
+            ["0#0#e0-a", "1#0#e1-a", "0#0#e0-b", "1#0#e1-b"], 9)),
+        {0: SimpleNamespace(outputs=[], finished_requests=None)})
+except ValueError as exc:
+    check("S5 拒绝未拆张量的混边通知", "matching DOWN packet" in str(exc))
+else:
+    check("S5 拒绝未拆张量的混边通知", False)
+check("S5 未发送混边 C2e", not ebox["c2e"] and not ebox2["c2e"])
 
 # ================= S6 未注册来源拒收 =================
 ghost_loop, gbox = boot_edge(b"ghost-7-7", [(7, 0, 0)])

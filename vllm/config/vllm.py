@@ -881,19 +881,19 @@ class VllmConfig:
                 self.lwd_config.instance_id,
                 json.dumps(asdict(self.lwd_config.instance), ensure_ascii=False),
             )
+            logger.info(
+                "[LWD][config][connections] role=%s instance_id=%d connections=%s",
+                self.lwd_config.role,
+                self.lwd_config.instance_id,
+                json.dumps(
+                    [asdict(link) for link in self.lwd_config.connections],
+                    ensure_ascii=False,
+                ),
+            )
             if self.lwd_config.topology is not None and (
                 len(self.lwd_config.topology.edges) > 1
                 or len(self.lwd_config.topology.clouds) > 1
             ):
-                logger.info(
-                    "[LWD][config][connections] role=%s instance_id=%d connections=%s",
-                    self.lwd_config.role,
-                    self.lwd_config.instance_id,
-                    json.dumps(
-                        [asdict(link) for link in self.lwd_config.connections],
-                        ensure_ascii=False,
-                    ),
-                )
                 logger.info(
                     "[LWD][config][api] %s (configuration only; routing not implemented)",
                     json.dumps(asdict(self.lwd_api_config or LwdAPIConfig())),

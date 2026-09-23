@@ -302,6 +302,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             scheduler_output.lwd_batch = LwdBatch(
                 batch_type=LwdBatchType.LWD_EMBED,
                 seqno=seqno,
+                connection_key=link,
                 batch_meta=LwdEmbedBatch(
                     req_ids=[request_id],
                     token_ids=[
@@ -536,21 +537,27 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 "edge->cloud wire, cloud would silently sample without them"
             )
 
-def lwd_build_unembed_batch(notify: LwdC2eNotify) -> SchedulerOutput:
+def lwd_build_unembed_batch(
+    notify: LwdC2eNotify,
+    connection_key: tuple[int, int, int],
+) -> SchedulerOutput:
     """组 UNEMBED 批(引擎步内调用,云载荷派发给边 worker 做 lm_head)。
 
     云结果不经过原生 schedule,无原生排程产物可用——以 make_empty
     为骨架:
     - lwd_batch 携带 LwdUnembedBatch:req_ids(隐藏行序)/
-      num_accept_tokens/top_id_ths 逐请求透传自 c2e;批序号将随 c2e
-      通告携带(规划),当前占位 0;recv_num_elements
-      (DOWN 通道每请求接收元素数)与 out_token_idxs(生成序号)控制面
-      不可知,留空由数据面按 DOWN 张量实收推导;
+      num_accept_tokens/top_id_ths 逐请求透传自 c2e;批序号与整包
+      recv_num_elements 直接取通知中的 down_seqno/hidden_num_elements;
+      connection_key 取已核对的控制连接,out_token_idxs 留给 worker;
     - 请求集合同步镜像到 num_scheduled_tokens:值 = 该请求本步
       hidden 行数(num_accepted_tokens 对位,spec 步可 >1),保持
       原生管道字段语义一致,不作 token 预算解释。
     """
     scheduler_output = SchedulerOutput.make_empty()
+    if (notify.edge_id, notify.dp_idx) != (
+        connection_key[0], connection_key[2]
+    ):
+        raise ValueError("[LWD] DOWN notification does not match its connection")
     # 每请求本步还原的 token 数 = hidden 行数 = num_accepted_tokens
     # (spec 步一请求可多行,非 spec 恒 1);与 req_ids 按位对齐,错配
     # fail-fast
@@ -564,6 +571,7 @@ def lwd_build_unembed_batch(notify: LwdC2eNotify) -> SchedulerOutput:
     scheduler_output.lwd_batch = LwdBatch(
         batch_type=LwdBatchType.LWD_UNEMBED,
         seqno=notify.down_seqno,
+        connection_key=connection_key,
         batch_meta=LwdUnembedBatch(
             req_ids=list(notify.req_ids),
             num_accept_tokens=list(notify.num_accepted_tokens),

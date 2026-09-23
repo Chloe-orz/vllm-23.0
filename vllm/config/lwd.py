@@ -118,6 +118,20 @@ class LwdConfig:
             raise ValueError("[LWD] Multiple DPs configured; select a DP explicitly")
         return self.instance.dp[0]
 
+    def dp_for_parallel(self, parallel: Any) -> LwdDP:
+        """Resolve the EngineCore DP assigned by the native process launcher.
+
+        data_parallel_index survives the per-engine DP=1 normalization;
+        data_parallel_rank does not. It is not another public CLI field.
+        Nonzero indices are for static configuration inspection only until
+        the separate runtime capability gate supports multi-DP execution.
+        """
+        assert self.topology is not None
+        dp_idx = parallel.data_parallel_index
+        if type(dp_idx) is not int or dp_idx < 0:
+            raise ValueError("[LWD] EngineCore must have a non-negative DP index")
+        return self.topology.dp(self.role, self.instance_id, dp_idx)
+
     def apply_to_parallel_config(self, parallel: Any) -> None:
         """Project topology onto the no-PP backend; never overwrite TP."""
         if not self.enabled:

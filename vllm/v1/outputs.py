@@ -257,6 +257,8 @@ class LwdC2eMeta:
     # posts its matching irecv with this exact value — required for
     # pairing on the tag-less HCCL wire.
     down_seqno: int = -1
+    # Identity of the actual HCCL packet, not inferred from physical rank.
+    connection_key: tuple[int, int, int] | None = None
 
 
 # ModelRunnerOutput is serialized and sent to the scheduler process.
