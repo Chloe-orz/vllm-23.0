@@ -25,7 +25,6 @@ from typing import Any
 
 from .lwd_topology import LwdDP, LwdDPConnection, LwdInstance, LwdTopology
 
-LWD_POST_OUT_PORT_DEFAULT = 5559
 LWD_WIRE_STORE_PORT_DEFAULT = 29600
 
 
@@ -75,28 +74,21 @@ class LwdConfig:
     path: str | None = None
     instance_id: int = 0
     topology: LwdTopology | None = None
-    post_out_port: int = LWD_POST_OUT_PORT_DEFAULT
-    """Snapshot of the temporary POST_OUT port environment override."""
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None) -> "LwdConfig":
         if raw is None:
             return cls()
         validate_lwd_entry(raw)
+        retired_port_env = "VLLM_ASCEND_LWD_POST_OUT_PORT"
+        if retired_port_env in os.environ:
+            # ROUTER/DEALER 控制面边侧不 bind、无端口;旧脚本带毒即拦
+            raise ValueError(
+                f"[LWD] {retired_port_env} is retired: the edge side no "
+                "longer binds any control-plane port (cloud ROUTER only)"
+            )
         topology = LwdTopology.from_file(raw["path"])
         topology.instance(raw["role"], raw["instance_id"])
-        port_name = "VLLM_ASCEND_LWD_POST_OUT_PORT"
-        try:
-            port = int(os.environ.get(port_name, str(LWD_POST_OUT_PORT_DEFAULT)))
-        except ValueError as exc:
-            raise ValueError(f"[LWD] {port_name} must be an integer port") from exc
-        if not 1 <= port <= 65535:
-            raise ValueError(f"[LWD] {port_name} must be in [1, 65535]")
-        if port == LWD_WIRE_STORE_PORT_DEFAULT:
-            raise ValueError(
-                f"[LWD] {port_name} conflicts with the no-PP TCPStore "
-                f"({LWD_WIRE_STORE_PORT_DEFAULT})"
-            )
         return cls(
             enabled=True,
             role=raw["role"],
@@ -105,7 +97,6 @@ class LwdConfig:
             path=raw["path"],
             instance_id=raw["instance_id"],
             topology=topology,
-            post_out_port=port,
         )
 
     @property

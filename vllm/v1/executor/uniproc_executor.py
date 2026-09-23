@@ -73,18 +73,13 @@ class UniProcExecutor(Executor):
         parallel_lwd = self.vllm_config.parallel_config.lwd_config
         if parallel_lwd.enable_lwd:
             # LWD 边云共享世界:rendezvous 地址与 multiproc 执行器同源
-            # (lwd_config.post_out_host + wire_store_port),不依赖 env 对齐
+            # (拓扑推导的全局 rank0 机器),不依赖 env 对齐
             from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import (
                 LwdConfig,
             )
 
             lwd_config = LwdConfig.from_vllm_config(self.vllm_config)
-            if not lwd_config.post_out_host:
-                raise ValueError(
-                    "[LWD] edge-cloud shared world requires "
-                    "a YAML edge addr (= edge IP)"
-                )
-            distributed_init_method = lwd_config.lwd_wire_store_init_method()
+            distributed_init_method = lwd_config.wire_store_init_method
         else:
             distributed_init_method = get_distributed_init_method(
                 get_ip(), get_open_port()
