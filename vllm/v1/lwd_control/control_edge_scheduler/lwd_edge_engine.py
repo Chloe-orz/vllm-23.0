@@ -93,6 +93,17 @@ class LwdEdgeEngineCore(EngineCoreProc):
         vllm_config.scheduler_config.scheduler_cls = LwdEdgeScheduler
         super().__init__(*args, **kwargs)
         config = LwdConfig.from_vllm_config(vllm_config)
+        # 云->边唯一载荷队列:生产端 IO 回调,消费端引擎步;数据面经
+        # UNEMBED 批的 lwd_c2e_notifies 拿元数据,不直接读队列
+        # (单消费者语义)。须在 mesh.start() 之前创建:首个 C2e 随时
+        # 可能到达,回调立即写队列
+        self.lwd_c2e_meta_queue = queue.Queue(maxsize=LWD_C2E_META_QUEUE_MAX)
+        # 已派发待收割的批队列 (kind, payload, t_dispatch, future):
+        # kind="unembed" payload=notify;kind="embed" payload=scheduler_output。
+        # 派发不收割,队首 FIFO 收割——必须全局单队列:executor 的 FutureWrapper
+        # 按底层队列序排水,交错收割会连带等错批。t_dispatch 供
+        # [Lwd][sched] harvest wait(派发→收割)度量批在队列里的滞留时长
+        self._lwd_batch_queue: deque = deque()
         # 通信面:边连云——对每条 dp 级连接一条 DEALER connect(端点自
         # 拓扑推导,带稳定 identity),单线程 IO 循环收发;边不 bind 任何端口
         self._edge_mesh = self._lwd_build_mesh(config)
