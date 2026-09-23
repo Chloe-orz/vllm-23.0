@@ -41,51 +41,21 @@ def lwd_entry_from_additional(additional: Any) -> dict[str, Any] | None:
     return raw
 
 
-# 入口白名单:文件形态(path)与内嵌形态(scene 生成参数)二选一
-_FILE_FIELDS = {"path", "role", "instance_id"}
-_INLINE_FIELDS = {
-    "role", "instance_id", "scene", "edge_machines", "cloud_machines",
-    "dp", "port_base", "enable_early_recv", "enable_scramble",
-}
-_INLINE_REQUIRED = {"scene", "edge_machines", "cloud_machines"}
-
-
 def validate_lwd_entry(raw: Any) -> None:
     if not isinstance(raw, dict):
-        raise ValueError("[LWD] lwd_config must contain path or scene parameters")
-    unknown = raw.keys() - _FILE_FIELDS - _INLINE_FIELDS
+        raise ValueError("[LWD] lwd_config must contain path, role and instance_id")
+    if not isinstance(raw.get("path"), str) or not raw["path"].strip():
+        raise ValueError("[LWD] lwd_config.path must be a non-empty string")
+    unknown = raw.keys() - {"path", "role", "instance_id"}
     if unknown:
         raise ValueError(
             f"[LWD] Unknown lwd_config fields: {sorted(map(str, unknown))}; "
-            "use path (file) or scene/edge_machines/... (inline generation)"
+            "use only path, role and instance_id"
         )
     if raw.get("role") not in ("edge", "cloud"):
         raise ValueError("[LWD] lwd_config.role must be 'edge' or 'cloud'")
     if type(raw.get("instance_id")) is not int or raw["instance_id"] < 0:
         raise ValueError("[LWD] lwd_config.instance_id must be a non-negative integer")
-    has_file, has_inline = "path" in raw, bool(_INLINE_REQUIRED & raw.keys())
-    if has_file and has_inline:
-        raise ValueError(
-            "[LWD] lwd_config: path (file) and scene/edge_machines/... "
-            "(inline generation) are mutually exclusive"
-        )
-    if not has_file and not has_inline:
-        raise ValueError(
-            "[LWD] lwd_config requires either path (topology file) or "
-            "scene + edge_machines + cloud_machines (inline generation)"
-        )
-    if has_inline:
-        missing = _INLINE_REQUIRED - raw.keys()
-        if missing:
-            raise ValueError(
-                f"[LWD] inline lwd_config missing fields: {sorted(missing)}"
-            )
-        if not isinstance(raw.get("edge_machines", None), list) or not isinstance(
-            raw.get("cloud_machines", None), list
-        ):
-            raise ValueError(
-                "[LWD] edge_machines/cloud_machines must be lists of address strings"
-            )
 
 
 _VALID_LWD_ROLES = ("edge", "cloud")
@@ -117,27 +87,14 @@ class LwdConfig:
                 f"[LWD] {retired_port_env} is retired: the edge side no "
                 "longer binds any control-plane port (cloud ROUTER only)"
             )
-        if "path" in raw:
-            topology = LwdTopology.from_file(raw["path"])
-        else:
-            # 内嵌形态:进程内按机器参数推导(生成即校验),两侧同参数
-            # 推出同一拓扑,digest 互校与文件形态等价
-            topology = LwdTopology.from_params(
-                scene=raw["scene"],
-                edge_machines=raw["edge_machines"],
-                cloud_machines=raw["cloud_machines"],
-                dp=raw.get("dp", 1),
-                port_base=raw.get("port_base", 5550),
-                enable_early_recv=raw.get("enable_early_recv", False),
-                enable_scramble=raw.get("enable_scramble", False),
-            )
+        topology = LwdTopology.from_file(raw["path"])
         topology.instance(raw["role"], raw["instance_id"])
         return cls(
             enabled=True,
             role=raw["role"],
             mode="prefill_only",
             edge_head_tail_layers=(0, 0),
-            path=raw.get("path"),
+            path=raw["path"],
             instance_id=raw["instance_id"],
             topology=topology,
         )
