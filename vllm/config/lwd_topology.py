@@ -3,6 +3,8 @@
 
 """File schema for LWD, independent of devices and distributed initialization."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from hashlib import sha256
 from ipaddress import ip_address
