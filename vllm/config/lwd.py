@@ -41,21 +41,51 @@ def lwd_entry_from_additional(additional: Any) -> dict[str, Any] | None:
     return raw
 
 
+# 入口白名单:文件形态(path)与内嵌形态(scene 生成参数)二选一
+_FILE_FIELDS = {"path", "role", "instance_id"}
+_INLINE_FIELDS = {
+    "role", "instance_id", "scene", "edge_machines", "cloud_machines",
+    "dp", "port_base", "enable_early_recv", "enable_scramble",
+}
+_INLINE_REQUIRED = {"scene", "edge_machines", "cloud_machines"}
+
+
 def validate_lwd_entry(raw: Any) -> None:
     if not isinstance(raw, dict):
-        raise ValueError("[LWD] lwd_config must contain path, role and instance_id")
-    if not isinstance(raw.get("path"), str) or not raw["path"].strip():
-        raise ValueError("[LWD] lwd_config.path must be a non-empty string")
-    unknown = raw.keys() - {"path", "role", "instance_id"}
+        raise ValueError("[LWD] lwd_config must contain path or scene parameters")
+    unknown = raw.keys() - _FILE_FIELDS - _INLINE_FIELDS
     if unknown:
         raise ValueError(
             f"[LWD] Unknown lwd_config fields: {sorted(map(str, unknown))}; "
-            "use only path, role and instance_id"
+            "use path (file) or scene/edge_machines/... (inline generation)"
         )
     if raw.get("role") not in ("edge", "cloud"):
         raise ValueError("[LWD] lwd_config.role must be 'edge' or 'cloud'")
     if type(raw.get("instance_id")) is not int or raw["instance_id"] < 0:
         raise ValueError("[LWD] lwd_config.instance_id must be a non-negative integer")
+    has_file, has_inline = "path" in raw, bool(_INLINE_REQUIRED & raw.keys())
+    if has_file and has_inline:
+        raise ValueError(
+            "[LWD] lwd_config: path (file) and scene/edge_machines/... "
+            "(inline generation) are mutually exclusive"
+        )
+    if not has_file and not has_inline:
+        raise ValueError(
+            "[LWD] lwd_config requires either path (topology file) or "
+            "scene + edge_machines + cloud_machines (inline generation)"
+        )
+    if has_inline:
+        missing = _INLINE_REQUIRED - raw.keys()
+        if missing:
+            raise ValueError(
+                f"[LWD] inline lwd_config missing fields: {sorted(missing)}"
+            )
+        if not isinstance(raw.get("edge_machines", None), list) or not isinstance(
+            raw.get("cloud_machines", None), list
+        ):
+            raise ValueError(
+                "[LWD] edge_machines/cloud_machines must be lists of address strings"
+            )
 
 
 _VALID_LWD_ROLES = ("edge", "cloud")

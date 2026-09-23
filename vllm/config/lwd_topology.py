@@ -5,7 +5,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import dataclasses
+from dataclasses import dataclass, replace as dataclasses_replace
 from hashlib import sha256
 from ipaddress import ip_address
 from pathlib import Path
@@ -57,6 +58,94 @@ class _UniqueKeyLoader(yaml.SafeLoader):
                 raise ValueError(f"[LWD] duplicate YAML key: {key!r}")
             result[key] = self.construct_object(value_node, deep=deep)
         return result
+
+
+# 场景 -> (边机数, 云机数);机器清单长度必须与之匹配(§4.3)
+_SCENE_SHAPE = {
+    "single_instance": (1, 1),
+    "edge_share": (1, None),
+    "cloud_share": (None, 1),
+    "lwd_cluster": (None, None),
+}
+# 每机卡数当前是常量(边 1 / 云 8,§5.2 第 7 类输入;异构机器时提升为配置)
+EDGE_CARDS = 1
+CLOUD_CARDS = 8
+
+
+def build_topology(scene: str, edge_machines: list, cloud_machines: list,
+                   dp: int = 1, port_base: int = 5550,
+                   enable_early_recv: bool = False,
+                   enable_scramble: bool = False) -> dict:
+    """六类输入 -> 5 大块 dict(设计文档 §5.2;tools/gen_lwd_topology 与
+    additional_config 内嵌形态共用本推导,生成即校验由 from_dict 承担)。"""
+    if scene not in _SCENE_SHAPE:
+        raise ValueError(f"[LWD] unknown scene {scene!r} (known: {sorted(_SCENE_SHAPE)})")
+    if not edge_machines or not cloud_machines:
+        raise ValueError("[LWD] edge_machines/cloud_machines must be non-empty")
+    want_edge, want_cloud = _SCENE_SHAPE[scene]
+    if want_edge is not None and len(edge_machines) != want_edge:
+        raise ValueError(
+            f"[LWD] scene {scene} requires {want_edge} edge machine(s), "
+            f"got {len(edge_machines)}"
+        )
+    if want_cloud is not None and len(cloud_machines) != want_cloud:
+        raise ValueError(
+            f"[LWD] scene {scene} requires {want_cloud} cloud machine(s), "
+            f"got {len(cloud_machines)}"
+        )
+    if dp < 1 or CLOUD_CARDS % dp or (dp > EDGE_CARDS and dp % EDGE_CARDS):
+        raise ValueError(
+            f"[LWD] dp={dp} must divide machine cards "
+            f"(edge {EDGE_CARDS}, cloud {CLOUD_CARDS})"
+        )
+    # 边侧实例:edge_share = 每朵云配一个边实例(共享同一台边机,rank 同为 0);
+    # 其余场景 = 每台边机一个实例(实例 i 持 rank i)。边机 1 卡不可分,
+    # 每个 dp 的 ranks 恒为 [rank](长度 1,各 dp 共用同一 rank,§4.2)
+    edge_instances = len(cloud_machines) if scene == "edge_share" else len(edge_machines)
+    edges = []
+    for i in range(edge_instances):
+        addr = edge_machines[0] if scene == "edge_share" else edge_machines[i]
+        rank = 0 if scene == "edge_share" else i
+        edges.append({
+            "id": i,
+            "dp": [{"dp_idx": d, "addr": addr, "ranks": [rank]}
+                   for d in range(dp)],
+        })
+    # 云侧:每台云机占连续 CLOUD_CARDS 个 rank,机内按 dp_idx 均分
+    cloud_start = len(edge_machines) * EDGE_CARDS
+    clouds = []
+    for i, addr in enumerate(cloud_machines):
+        base = cloud_start + i * CLOUD_CARDS
+        per_dp = CLOUD_CARDS // dp
+        clouds.append({
+            "id": i,
+            "dp": [{"dp_idx": d, "addr": addr,
+                    "ranks": list(range(base + d * per_dp, base + (d + 1) * per_dp)),
+                    "ctrl_port": port_base + d}
+                   for d in range(dp)],
+        })
+    world = cloud_start + len(cloud_machines) * CLOUD_CARDS
+    if scene == "edge_share":
+        links = [{"edge": i, "cloud": i} for i in range(len(cloud_machines))]
+    else:
+        links = [{"edge": e, "cloud": c}
+                 for e in range(len(edges)) for c in range(len(clouds))]
+    return {
+        "deployment": {
+            "mode": 0,
+            "scene": scene,
+            "hccl_world_size": world,
+            "edges_num": len(edges),
+            "clouds_num": len(clouds),
+        },
+        "feature_ctrl": {
+            "enable_early_recv": enable_early_recv,
+            "enable_scramble": enable_scramble,
+        },
+        "edges": edges,
+        "clouds": clouds,
+        "instance_links": links,
+    }
 
 
 @dataclass(frozen=True)
@@ -299,6 +388,25 @@ class LwdTopology:
                 "[LWD] ranks must cover [0, hccl_world_size) in contiguous "
                 "edge-first order without duplicates or gaps"
             )
+
+    @classmethod
+    def from_params(cls, scene: str, edge_machines: list, cloud_machines: list,
+                    dp: int = 1, port_base: int = 5550,
+                    enable_early_recv: bool = False,
+                    enable_scramble: bool = False) -> "LwdTopology":
+        """内嵌形态入口(additional_config 直接给机器参数,无 YAML 文件):
+        build_topology 推导 + from_dict 全量校验。digest 取规范化
+        yaml dump 的 sha256——两侧同参数必得同指纹,register 互校
+        (含 digest)与文件形态完全等价。"""
+        import yaml as _yaml
+
+        raw = build_topology(scene, edge_machines, cloud_machines, dp,
+                             port_base, enable_early_recv, enable_scramble)
+        topology = cls.from_dict(raw)
+        canonical = _yaml.safe_dump(raw, sort_keys=True).encode("utf-8")
+        return dataclasses_replace(
+            topology, digest=sha256(canonical).hexdigest()[:16]
+        )
 
     def instance(self, role: str, instance_id: int) -> LwdInstance:
         if role not in ("edge", "cloud"):
