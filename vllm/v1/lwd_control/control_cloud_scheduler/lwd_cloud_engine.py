@@ -209,9 +209,19 @@ class LwdCloudEngineCore(EngineCoreProc):
             "[Lwd][cloud-ctrl] RangeNotify req=%s num=%s seqno=%s edge=%d dp=%d",
             msg.request_id, msg.num_tokens, msg.seqno, edge_id, dp_idx,
         )
-        # 每条预告都整条入队(重复预告即重复点名,剔除-调度-拼回幂等,
-        # 无副作用;队列按 (edge, dp) 分组,边间不插队)
-        self.scheduler.lwd_cloud_enqueue_range(msg, edge_id, dp_idx)
+        # 入队即换内部键:调度器按 notify.request_id 点名 requests 表
+        # (Request/registry 均为 rid_key 形态),LwdEmbedBatch.req_ids 同
+        # 键下发 worker——云侧全链 rid_key,边侧协议保持原始 id
+        inner = LwdRangeNotify(
+            request_id=rid_key,
+            offset=msg.offset,
+            num_tokens=msg.num_tokens,
+            seqno=msg.seqno,
+            has_mrope=msg.has_mrope,
+            edge_id=edge_id,
+            dp_idx=dp_idx,
+        )
+        self.scheduler.lwd_cloud_enqueue_range(inner, edge_id, dp_idx)
 
     def _lwd_handle_abort(self, edge_id: int, dp_idx: int, msg: LwdAbortNotify) -> None:
         rid_key = _lwd_rid_key(edge_id, dp_idx, msg.request_id)
