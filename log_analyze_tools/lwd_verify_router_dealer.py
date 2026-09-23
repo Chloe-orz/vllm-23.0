@@ -102,9 +102,24 @@ class Side:
     old_sockets: list[str] = field(default_factory=list)
 
 
+def open_log(path: str):
+    """按 BOM 探测编码打开日志:板上经 PowerShell/部分重定向产出的日志
+    是 UTF-16(带 BOM),直接按 utf-8 读会整体乱码、锚点全部失配。
+    无 BOM 默认 utf-8(与原行为一致);解码错误 replace 不中断。"""
+    with open(path, "rb") as probe:
+        head = probe.read(4)
+    if head.startswith(b"\xff\xfe") or head.startswith(b"\xfe\xff"):
+        encoding = "utf-16"  # 解码器按 BOM 区分 LE/BE
+    elif head.startswith(b"\xef\xbb\xbf"):
+        encoding = "utf-8-sig"
+    else:
+        encoding = "utf-8"
+    return open(path, encoding=encoding, errors="replace")
+
+
 def parse_side(name: str, path: str) -> Side:
     side = Side(name=name)
-    with open(path, encoding="utf-8", errors="replace") as stream:
+    with open_log(path) as stream:
         side.lines = stream.readlines()
     for line in side.lines:
         if m := RE_PARSED.search(line):
@@ -153,6 +168,11 @@ def parse_side(name: str, path: str) -> Side:
                 side.negatives[label] = side.negatives.get(label, 0) + 1
         if m := RE_OLD_SOCKET.search(line):
             side.old_sockets.append(m.group(0))
+    # 无 BOM 的 UTF-16 按 utf-8 读会剩大量 NUL:锚点全失配前先提醒
+    nul = sum(1 for line in side.lines[:500] if "\x00" in line)
+    if side.lines and nul > len(side.lines[:500]) // 2:
+        print(f"[WARN] {name} 日志疑似 UTF-16 但无 BOM(过半行含 NUL),"
+              f"请转存为 UTF-8/带 BOM 的 UTF-16 后重试", file=sys.stderr)
     return side
 
 
