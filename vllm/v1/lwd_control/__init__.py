@@ -37,50 +37,25 @@ def lwd_resolve_engine_cls(vllm_config):
 
 
 def lwd_serve_guard(vllm_config) -> None:
-    """serve 入口守卫:云角色经 _lwd_cloud_deploy_guard 校验后注入相位调度器;
-    云引擎类由子进程内 lwd_resolve_engine_cls 解析,边调度器由引擎自注入。"""
+    """serve 入口守卫:注入云相位调度器;云引擎类由子进程内
+    lwd_resolve_engine_cls 解析,边调度器由引擎自注入。
+
+    部署校验已收敛到配置层(lwd_topology 加载期校验含 addr 合法性/
+    ctrl_port 错开/连接关系),云侧 ROUTER 端点由拓扑唯一决定,本守卫
+    不再重复校验端点字段。"""
     from vllm.logger import init_logger
     from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_phase_scheduler import (
         LwdCloudPhaseScheduler,
     )
     from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import (
-        LwdConfig,
         is_lwd_prefill_only,
     )
 
     if not is_lwd_prefill_only(vllm_config):
         return
-    config = LwdConfig.from_vllm_config(vllm_config)
-    if config.is_edge_node:
+    if vllm_config.lwd_config.is_edge:
         return
-    _lwd_cloud_deploy_guard(vllm_config, config)
     vllm_config.scheduler_config.scheduler_cls = LwdCloudPhaseScheduler
     init_logger(__name__).info(
         "[Lwd] prefill_only cloud: phase scheduler injected (construction-time)"
     )
-
-
-def _lwd_cloud_deploy_guard(vllm_config, config) -> None:
-    """Check the YAML-derived control endpoints, without legacy fallback."""
-    from vllm.logger import init_logger
-
-    logger = init_logger(__name__)
-    if not config.post_out_host:
-        raise ValueError(
-            "[Lwd] prefill_only cloud requires YAML edges[0].dp[0].addr"
-        )
-    connect_host = config.post_out_host
-    if config.pre_out_host == "0.0.0.0":
-        raise ValueError(
-            "[Lwd] prefill_only cloud pre_out_host=0.0.0.0 is not announceable; "
-            "set a routable IP in YAML clouds[0].dp[0].addr"
-        )
-    if config.pre_out_host == "127.0.0.1" and connect_host not in (
-        "127.0.0.1",
-        "localhost",
-    ):
-        logger.warning(
-            "[Lwd] cloud announces pre_out_host=127.0.0.1 but edge is remote "
-            "(%s); edge will fail to reach PRE_OUT unless same host",
-            connect_host,
-        )

@@ -3,7 +3,10 @@
 
 """File schema for LWD, independent of devices and distributed initialization."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
+from hashlib import sha256
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Any
@@ -113,13 +116,25 @@ class LwdTopology:
     edges: tuple[LwdInstance, ...]
     clouds: tuple[LwdInstance, ...]
     instance_links: tuple[LwdLink, ...]
+    digest: str = ""
+    """sha256(YAML 原文) 前 16 hex,register 互校用;from_dict 构造
+    (测试)无原文,恒空串 = 跳过比对。"""
 
     @classmethod
     def from_file(cls, path: str) -> "LwdTopology":
         try:
+            file_bytes = Path(path).read_bytes()
             with Path(path).open(encoding="utf-8") as stream:
                 raw = yaml.load(stream, Loader=_UniqueKeyLoader)
-            return cls.from_dict(raw)
+            topology = cls.from_dict(raw)
+            return LwdTopology(
+                deployment=topology.deployment,
+                feature_ctrl=topology.feature_ctrl,
+                edges=topology.edges,
+                clouds=topology.clouds,
+                instance_links=topology.instance_links,
+                digest=sha256(file_bytes).hexdigest()[:16],
+            )
         except (OSError, UnicodeError, yaml.YAMLError, ValueError) as exc:
             raise ValueError(f"[LWD] Invalid topology file {path!r}: {exc}") from exc
 
@@ -194,9 +209,11 @@ class LwdTopology:
         edge_ranks: set[int] = set()
         cloud_ranks: set[int] = set()
         endpoints: set[tuple[str, int | None]] = set()
+        role_addresses: dict[str, set[str]] = {"edges": set(), "clouds": set()}
         for role, instances in (("edges", self.edges), ("clouds", self.clouds)):
             for instance in instances:
                 for dp in instance.dp:
+                    role_addresses[role].add(dp.addr)
                     if len(set(dp.ranks)) != len(dp.ranks):
                         raise ValueError(
                             f"[LWD] {role}[{instance.id}].dp[{dp.dp_idx}]: "
@@ -223,6 +240,26 @@ class LwdTopology:
                         endpoints.add(endpoint)
         if edge_ranks & cloud_ranks:
             raise ValueError("[LWD] Edge and cloud ranks must not overlap")
+        # V5: 同一 addr 不得同时承载边侧与云侧实例(机器=角色)
+        if mixed := role_addresses["edges"] & role_addresses["clouds"]:
+            raise ValueError(
+                f"[LWD] Addresses must not host both roles: {sorted(mixed)}"
+            )
+        # V13: 每个实例至少被一条 link 引用(孤立实例白占 rank)。
+        # edge/cloud 的 id 是各自角色的命名空间,必须分开核对——混在一个
+        # 集合里会被另一角色的同号 id 掩蔽(edge=1 孤立但 cloud=1 在链上)
+        linked_edges = {link.edge for link in self.instance_links}
+        linked_clouds = {link.cloud for link in self.instance_links}
+        for role, instances, linked in (
+            ("edges", self.edges, linked_edges),
+            ("clouds", self.clouds, linked_clouds),
+        ):
+            for instance in instances:
+                if instance.id not in linked:
+                    raise ValueError(
+                        f"[LWD] {role}[{instance.id}] is not referenced by any "
+                        "instance_links entry (isolated instance)"
+                    )
         world = self.deployment.hccl_world_size
         if len(rank_addresses) != world or sorted(rank_addresses) != list(range(world)):
             raise ValueError(

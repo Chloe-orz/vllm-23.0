@@ -20,26 +20,27 @@ from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
 
 logger = init_logger(__name__)
 
-_LWD_PHASE_PREFILL_FIRST = "prefill_first"
-_LWD_PHASE_DECODE_FIRST = "decode_first"
-
 
 class LwdCloudPhaseScheduler(LwdBaseScheduler):
-    """工作纯相位批次策略;相位(prefill_first/decode_first)构造期自解析。
+    """工作纯相位批次策略,prefill_first 固定(旧的 decode_first 相位
+    无配置入口不可达,已随 scheduler_name 死字段一并移除)。
     前置约束:不兼容 spec decode(eagle 会 shift num_computed_tokens,纯度判据失真)。"""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self._lwd_prefill_first = self._lwd_resolve_phase()
         # One-shot 翻转:某相位空步而另一相位有活时,强制下一步走后者;
         # 双标志显式定向,按偏好取反会错翻,造成空步死循环。
         self._force_prefill_once: bool = False
         self._force_decode_once: bool = False
         # 上一个非空步是否为 prefill,驱动 schedule() 的禁连续 prefill 不变量
         self._last_step_was_prefill: bool = False
-        # prefill 通知队列:边侧范围预告(RangeNotify)逐条入队,每步取
-        # 队首点名其 request_id;预告自带 seqno 即本步 UP 链配对号
-        self.prefill_notify_queue: deque[LwdRangeNotify] = deque()
+        # prefill 通知队列:边侧范围预告(RangeNotify)按来源 (edge_id,
+        # dp_idx) 分队列,每步取一条边的队首点名其 request_id;预告自带
+        # seqno 即本步 UP 链配对号。_lwd_rr_cursor 是轮转起点(单调推进):
+        # 边间不插队——排空一条边到批上限再换下一条,保证"一步一
+        # chunk、prefill 批不混边"(数据面云内广播序的前提)
+        self.prefill_notify_queue: dict[tuple[int, int], deque[LwdRangeNotify]] = {}
+        self._lwd_rr_cursor: int = 0
         # [Lwd][sched] 调度批日志步计数(饿死分析:RangeNotify 到达 →
         # PREFILL 步消费的间隔与中间插入的 decode 步数)
         self._lwd_sched_step = 0
@@ -48,24 +49,14 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
             "enforced (edge/cloud chunk stream stays per-request contiguous)"
         )
 
-    def _lwd_resolve_phase(self) -> bool:
-        """返回 True=prefill_first;缺省/未知相位告警回退 prefill_first。"""
-        from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import (
-            LwdConfig,
-        )
-
-        phase = LwdConfig.from_vllm_config(self.vllm_config).scheduler_name
-        if phase == _LWD_PHASE_DECODE_FIRST:
-            return False
-        if phase != _LWD_PHASE_PREFILL_FIRST:
-            logger.warning(
-                "[Lwd] unknown cloud scheduler phase %r "
-                "(known: %s); falling back to %s",
-                phase,
-                [_LWD_PHASE_DECODE_FIRST, _LWD_PHASE_PREFILL_FIRST],
-                _LWD_PHASE_PREFILL_FIRST,
-            )
-        return True
+    def lwd_cloud_enqueue_range(
+        self, notify: LwdRangeNotify, edge_id: int, dp_idx: int
+    ) -> None:
+        """范围预告入队(云引擎 IO 线程调用;deque 单操作原子,
+        调度主线程单独 popleft)。"""
+        self.prefill_notify_queue.setdefault(
+            (edge_id, dp_idx), deque()
+        ).append(notify)
 
     @staticmethod
     def _lwd_is_decode(request) -> bool:
@@ -90,12 +81,27 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
             if self._lwd_is_decode(req)
         ]
 
+    def _lwd_next_range(self) -> LwdRangeNotify | None:
+        """轮转取队首预告:从游标起找第一条非空队列,排空该边到批上限
+        再换下一条(边间不插队);全空返回 None。"""
+        keys = sorted(self.prefill_notify_queue)
+        for offset in range(len(keys)):
+            key = keys[(self._lwd_rr_cursor + offset) % len(keys)]
+            queue = self.prefill_notify_queue[key]
+            if queue:
+                self._lwd_rr_cursor = (self._lwd_rr_cursor + offset) % len(keys)
+                return queue.popleft()
+        return None
+
+    def _lwd_pending_notify_count(self) -> int:
+        return sum(len(q) for q in self.prefill_notify_queue.values())
+
     # ------------------------------------------------------------------ #
     # Phase primitives(容器交换;原生 schedule() 零改动)                  #
     # ------------------------------------------------------------------ #
     def _schedule_pure_prefill(self) -> SchedulerOutput:
-        """纯 prefill 步:取队首预告,按公告量钳制本步预算,照单执行。"""
-        notify = q.popleft() if (q := self.prefill_notify_queue) else None
+        """纯 prefill 步:轮转取队首预告,按公告量钳制本步预算,照单执行。"""
+        notify = self._lwd_next_range()
         if notify is None:
             return self._lwd_schedule_for_visible_reqs([])
         logger.info(
@@ -129,11 +135,8 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
         return out.total_num_scheduled_tokens == 0
 
     def _prefer_prefill(self) -> bool:
-        """相位选择:prefill_first 有等待/尾巴即 prefill;
-        decode_first 只要存在纯 decode 活就优先 decode。"""
-        if self._lwd_prefill_first:
-            return bool(self.waiting) or self._lwd_has_prefill_tails()
-        return not self._lwd_has_decode_ready()
+        """相位选择:prefill_first 固定——有等待/尾巴即 prefill。"""
+        return bool(self.waiting) or self._lwd_has_prefill_tails()
 
     def schedule(self) -> SchedulerOutput:
         # [Lwd][perf] 云侧每步 LWD 税分段之一:相位调度(容器交换)时长
@@ -169,7 +172,7 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
             "[Lwd][sched] cloud step=%d phase=%s seqno=%s reqs=[%s] tokens=%d "
             "pending_notify=%d decode_ready=%d",
             self._lwd_sched_step, phase, seqno, reqs_str,
-            out.total_num_scheduled_tokens, len(self.prefill_notify_queue),
+            out.total_num_scheduled_tokens, self._lwd_pending_notify_count(),
             len(self._lwd_collect_decode_requests()),
         )
 

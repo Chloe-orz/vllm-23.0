@@ -49,8 +49,8 @@ from vllm.v1.request import RequestStatus
 
 if TYPE_CHECKING:
     from vllm.sampling_params import SamplingParams
-    from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
-        LwdControlPublisher,
+    from vllm.v1.lwd_control.control_communication.lwd_control_loop import (
+        LwdControlLoop,
     )
     from vllm.v1.request import Request
 
@@ -67,12 +67,16 @@ class LwdEdgeScheduler(LwdBaseScheduler):
     def __init__(
         self,
         *args,
-        publisher: LwdControlPublisher | None = None,
+        publisher: LwdControlLoop | None = None,
         **kwargs,
     ) -> None:
-        """publisher 经构造注入(与调度器同生命周期)。"""
+        """publisher(IO 循环)与所属 link 经引擎构造后回填(早于任何
+        请求,等价构造注入)。"""
         super().__init__(*args, **kwargs)
         self.lwd_edge_publisher = publisher
+        # 本调度器发帧所走的 dp 级连接 (edge_id, cloud_id, dp_idx):
+        # 多云选路(P4)前恒为唯一 link,由引擎装配期回填
+        self.lwd_edge_link: tuple[int, int, int] | None = None
         self._lwd_seqno = 0
         # 前缀缓存:manager 级关命中,配置级保留使能。两级拆分的原因:
         # - 必须关命中:命中会跳过 token 排程,首条 RangeNotify 的
@@ -255,6 +259,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         派发但进度不回退,该 chunk 永久丢失;重复预告在云侧按
         (request_id, offset) 幂等登记。"""
         publisher = self.lwd_edge_publisher
+        link = self.lwd_edge_link
         scheduled = scheduler_output.num_scheduled_tokens
         for request_id, num_tokens in scheduled.items():
             request = self.requests.get(request_id)
@@ -265,14 +270,17 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             seqno = self._lwd_seqno
             positions = self._lwd_mrope_positions_dict.get(request_id)
             has_mrope = positions is not None
-            if not publisher.publish(
+            if not publisher.send(
+                link,
                 LwdRangeNotify(
                     request_id=request_id,
                     offset=offset,
                     num_tokens=num_tokens,
                     seqno=seqno,
                     has_mrope=has_mrope,
-                )
+                    edge_id=link[0],
+                    dp_idx=link[2],
+                ),
             ):
                 return False
             self._lwd_seqno = seqno + 1
@@ -333,6 +341,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         publisher = self.lwd_edge_publisher
         if publisher is None:
             return
+        link = self.lwd_edge_link
         sp = sampling_params
         message = LwdRequestNotify(
             request_id=request_id,
@@ -355,9 +364,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             ),
             min_tokens=sp.min_tokens if sp is not None else 0,
             eos_token_id=sp.eos_token_id if sp is not None else None,
+            edge_id=link[0],
+            dp_idx=link[2],
         )
         for attempt in range(_LWD_ADD_RETRY_STEPS):
-            if publisher.publish(message):
+            if publisher.send(link, message):
                 logger.info(
                     "[Lwd][edge-notify] request meta announced: req=%s "
                     "prompt=%d",
@@ -377,12 +388,18 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         awaiting 请求已不在调度器视野(嵌入完结时清出),原生
         finish_requests 触不到它,须在此显式摘除,防迟到云结果被误认领。"""
         publisher = self.lwd_edge_publisher
+        link = self.lwd_edge_link
         for request_id in request_ids:
             self._lwd_awaiting.pop(request_id, None)
             self._lwd_mrope_positions_dict.pop(request_id, None)
             if publisher is None:
                 continue
-            if not publisher.publish(LwdAbortNotify(request_id=request_id)):
+            if not publisher.send(
+                link,
+                LwdAbortNotify(
+                    request_id=request_id, edge_id=link[0], dp_idx=link[2]
+                ),
+            ):
                 logger.warning(
                     "[Lwd] drop abort signal for %s: publish queue full", request_id
                 )

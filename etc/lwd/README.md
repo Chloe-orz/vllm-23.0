@@ -1,8 +1,13 @@
 # LWD 单实例配置与 NPU 验证
 
-本次只迁移配置，保留现有 no-PP（PP=1）、P2P + 云内 TP broadcast、
-PUSH/PULL 通信。没有实现 ROUTER/DEALER、多 DP 调度或共享卡执行。
-本轮按用户要求不运行测试，以下是待上板验证的步骤，不是验证通过记录。
+控制面已按设计切换为边连云 ROUTER/DEALER：云侧 ROUTER bind
+`ctrl_port`（唯一 bind 方），边侧 DEALER connect + 稳定 identity
+（`edge-{id}-{dp}`），register/ack 取代旧 HELLO 首拍发现；消息携带
+`edge_id/dp_idx`，云侧按 `"{edge}#{dp}#{rid}"` 前缀隔离请求（fan-in
+拆发已就绪，多边场景的选路/策略未做）。数据面不变（no-PP、P2P +
+云内 TP broadcast）；多 DP 调度或共享卡执行仍未实现。
+本机已通过 ROUTER/DEALER 闭环自测（register/ack、定向回包、背压、
+关停），以下是待上板验证的步骤，不是验证通过记录。
 
 ## 文件与支持范围
 
@@ -41,27 +46,19 @@ vllm-ascend（本次基线 `11b6a1d54`）。不能只更新一个仓或只更新
 正确字段名为 `scene`、`enable_early_recv`。
 两个 feature 开关默认 false，仅解析下发；设置 true 会提示尚未接入执行功能。
 
-## 过渡端口：不是单端口双向协议
+## 端口：云侧单端口双向（边侧零端口）
 
-| 用途 | 当前来源 | 示例 |
+| 用途 | 来源 | 示例 |
 | --- | --- | --- |
-| PRE_OUT（边 → 云控制） | 云 `dp.addr:ctrl_port` | 76.76.26.234:6453 |
-| POST_OUT（云 → 边控制/HELLO） | 边 `dp.addr` + 暂留的 POST_OUT export | 76.76.26.18:6454 |
+| 控制面 ROUTER（云 bind、边 DEALER connect；register/ack、Request/Range/Abort、C2e 全走这一个端口，双向） | 云 `dp.addr:ctrl_port` | 76.76.26.234:6453 |
 | no-PP 共享世界 TCPStore | 边 `dp.addr` + 默认端口 29600 | 76.76.26.18:29600 |
 
-双方暂时都保留这一行（不设置时默认 5559）：
-
-```bash
-export VLLM_ASCEND_LWD_POST_OUT_PORT=6454
-```
-
-除此之外，旧传输配置的 PRE_OUT_HOST/PRE_OUT_PORT/POST_OUT_HOST/POST_OUT_BIND/
-WIRE_STORE_PORT/HELLO_TIMEOUT_S/DEBUG 环境覆盖链已移除，不再决定传输参数。
-不要靠旧 export 改地址或端口；PRE_OUT 改 YAML，TCPStore 本版固定 29600，
-HELLO 超时保持 600 秒。其他模块原有的性能、日志和 NPU 环境变量不在本次清理范围。
-确认云 6453、边 6454 和边 29600 可达且未被占用。
-当前 YAML 已沿用 PRE_OUT=6453，双方使用同一文件。
-POST_OUT 不得与边 TCPStore 的 29600 冲突。
+边侧不再 bind 任何控制面端口。`VLLM_ASCEND_LWD_POST_OUT_PORT` 已退役：
+**设置它会在启动时报错**（防旧脚本带毒），确认两侧脚本里已删除该 export。
+旧传输配置的 PRE_OUT_HOST/PRE_OUT_PORT/POST_OUT_HOST/POST_OUT_BIND/
+WIRE_STORE_PORT/HELLO_TIMEOUT_S/DEBUG 环境覆盖链均已移除。
+控制端口只改 YAML 的 `ctrl_port`；TCPStore 固定 29600；register 等待
+预算沿用 600 秒。确认云 6453 和边 29600 可达且未被占用。
 
 ## 边 1 卡 / 云 8 卡启动示例
 
@@ -73,7 +70,6 @@ POST_OUT 不得与边 TCPStore 的 29600 冲突。
 
 ```bash
 export ASCEND_RT_VISIBLE_DEVICES=0
-export VLLM_ASCEND_LWD_POST_OUT_PORT=6454
 vllm serve /weight/Qwen3.8-27B \
     --host 0.0.0.0 --port 8060 \
     --served-model-name qwen3.8 \
@@ -89,7 +85,6 @@ vllm serve /weight/Qwen3.8-27B \
 
 ```bash
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-export VLLM_ASCEND_LWD_POST_OUT_PORT=6454
 vllm serve /weight/Qwen3.8-27B \
     --served-model-name qwen3.8 \
     --trust-remote-code \
@@ -109,10 +104,10 @@ vllm serve /weight/Qwen3.8-27B \
 
 | 日志标记 | 能确认什么 | 参数保存位置 |
 | --- | --- | --- |
-| `[LWD][config][parsed]` | 文件读取、schema 校验和实例查找已成功；完整保留五块拓扑、所有 DP、缺省 feature 值及过渡 POST_OUT 端口 | `vllm_config.lwd_config`，完整 YAML 在其 `.topology` |
+| `[LWD][config][parsed]` | 文件读取、schema 校验和实例查找已成功；完整保留五块拓扑、所有 DP、缺省 feature 值及拓扑指纹 digest | `vllm_config.lwd_config`，完整 YAML 在其 `.topology` |
 | `[LWD][config][selected]` | 当前 role/instance_id 选中的实例及其全部 DP | `vllm_config.lwd_config.instance` |
 | `[LWD][config] path=... TP=...` | 已通过当前单 DP 运行限制及 TP 一致性检查，并已映射并行参数 | `vllm_config.parallel_config` 及其 `.lwd_config` |
-| `[LWD][config][transport]` | 实际适配出的 pre_out_host/port、post_out_host/port、wire_store_port、超时等所有传输值 | `LwdConfig.from_vllm_config()` 返回的控制面配置对象 |
+| `[LWD][config][transport]` | 实际适配出的 ROUTER bind 端点、per-link DEALER 端点、identity、wire_store、超时等所有传输值 | `LwdConfig.from_vllm_config()` 返回的控制面配置对象 |
 
 `parsed`/`selected` 在运行限制检查之前打印，所以多 DP 文件也能看到完整解析结果，
 随后才报运行时暂不支持；不能把这两条日志当成启动成功。
@@ -121,11 +116,13 @@ vllm serve /weight/Qwen3.8-27B \
 feature 为 true 仍只是保留参数，不代表对应功能已经启用。
 
 1. 配置日志 `[LWD][config]`：边 role=edge、ranks=(0,)、TP=1、PP=1、world=9；
-   云 role=cloud、ranks=(1,...,8)、TP=8、PP=1、world=9；POST_OUT_PORT 均为 6454。
+   云 role=cloud、ranks=(1,...,8)、TP=8、PP=1、world=9；两侧 digest 一致。
 2. 两侧 `[LWD] distributed init method from lwd_config` 都是边 IP:29600。
    并行组日志应显示云内 8 卡 TP、PP 单 rank 组；这只能说明初始化，不代表请求已成功。
-3. 边侧 `cloud discovered via HELLO` 的 PRE_OUT 与 YAML 云 IP:ctrl_port 一致；
-   `edge engine assembled` 后向边 API 发送请求。若两侧端点配置不同会明确报错。
+3. 云侧日志出现 `edge registered`（报 identity 与 edge/dp），边侧出现
+   `edge engine assembled`（报 DEALER 条数与 identity）；register 互校
+   （版本/卡数/digest）不符会拒绝注册并使边侧 fail-fast，两侧拓扑文件
+   不一致在这一步拦截。
 4. 先完成一次请求的 prefill/decode 和正常返回，再运行已有 bench。
    使用与原可运行基线相同的模型、输入和 bench 设置进行对照。
    无 AttributeError/KeyError、无通信挂起、bench 正常结束才算全流程通过。

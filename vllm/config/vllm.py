@@ -901,7 +901,7 @@ class VllmConfig:
             self.lwd_config.apply_to_parallel_config(self.parallel_config)
             logger.info(
                 "[LWD][config] path=%s role=%s instance_id=%d dp_idx=%d "
-                "ranks=%s TP=%d PP=%d world=%d POST_OUT_PORT=%d",
+                "ranks=%s TP=%d PP=%d world=%d digest=%s",
                 self.lwd_config.path,
                 self.lwd_config.role,
                 self.lwd_config.instance_id,
@@ -910,7 +910,7 @@ class VllmConfig:
                 self.parallel_config.tensor_parallel_size,
                 self.parallel_config.pipeline_parallel_size,
                 self.parallel_config.world_size,
-                self.lwd_config.post_out_port,
+                self.lwd_config.topology.digest or "-",
             )
             assert self.lwd_config.topology is not None
             features = self.lwd_config.topology.feature_ctrl
