@@ -23,7 +23,7 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
-from .lwd_topology import LwdDP, LwdInstance, LwdTopology
+from .lwd_topology import LwdDP, LwdDPConnection, LwdInstance, LwdTopology
 
 LWD_WIRE_STORE_PORT_DEFAULT = 29600
 
@@ -104,6 +104,13 @@ class LwdConfig:
         if self.topology is None:
             raise ValueError("[LWD] No topology is configured")
         return self.topology.instance(self.role, self.instance_id)
+
+    @property
+    def connections(self) -> tuple[LwdDPConnection, ...]:
+        """All explicit peer/DP connections of the selected LWD instance."""
+        if self.topology is None:
+            raise ValueError("[LWD] No topology is configured")
+        return self.topology.connections(self.role, self.instance_id)
 
     @property
     def dp(self) -> LwdDP:

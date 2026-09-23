@@ -320,3 +320,93 @@ def test_lora_target_modules_default_none(serve_parser):
     """Test that lora-target-modules defaults to None"""
     args = serve_parser.parse_args(args=[])
     assert args.lora_target_modules is None
+
+
+@pytest.mark.parametrize("api_count", [1, 2])
+@pytest.mark.parametrize("instance_id", [0, 1])
+def test_lwd_api_options_reach_engine_args_without_yaml_io(
+    serve_parser, monkeypatch, api_count, instance_id
+):
+    from pathlib import Path
+
+    from vllm.engine.arg_utils import AsyncEngineArgs
+
+    flag = "--api-server-rpc-port" if instance_id == 0 else "--api-server-attach"
+    additional = {
+        "enable_cpu_binding": True,
+        "lwd_config": {
+            "path": "/does/not/exist/lwd_config.yaml",
+            "role": "edge",
+            "instance_id": instance_id,
+        },
+    }
+    args = serve_parser.parse_args(
+        [
+            "--api-server-count",
+            str(api_count),
+            "--additional-config",
+            json.dumps(additional),
+            flag,
+            "10.0.0.1:29550",
+        ]
+    )
+    validate_parsed_serve_args(args)
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "open", lambda *a, **kw: pytest.fail("early YAML read"))
+        engine_args = AsyncEngineArgs.from_cli_args(args)
+    api = engine_args.lwd_api_config
+    assert api is not None
+    assert getattr(api, flag[2:].replace("-", "_")) == "10.0.0.1:29550"
+    assert engine_args.additional_config == additional
+    assert args.api_server_count == api_count
+    assert args.data_parallel_size == 1
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--api-server-rpc-port", "bad"],
+        ["--api-server-attach", "10.0.0.1:29550"],  # primary cannot attach
+        ["--api-server-rpc-port", "10.0.0.1:29550", "--headless"],
+        ["--api-server-rpc-port", "10.0.0.1:29550", "--grpc"],
+        [
+            "--api-server-rpc-port",
+            "10.0.0.1:29550",
+            "--api-server-attach",
+            "10.0.0.1:29550",
+        ],
+    ],
+)
+def test_lwd_api_invalid_cli_options(serve_parser, extra):
+    args = serve_parser.parse_args(
+        [
+            "--additional-config",
+            json.dumps(
+                {"lwd_config": {
+                    "path": "/unused.yaml",
+                    "role": "edge",
+                    "instance_id": 0,
+                }}
+            ),
+            *extra,
+        ]
+    )
+    with pytest.raises(ValueError, match="LWD"):
+        validate_parsed_serve_args(args)
+
+
+def test_lwd_api_options_without_lwd(serve_parser):
+    args = serve_parser.parse_args(["--api-server-rpc-port", "10.0.0.1:29550"])
+    with pytest.raises(ValueError, match="require lwd_config.path"):
+        validate_parsed_serve_args(args)
+
+
+def test_lwd_api_absent_preserves_normal_frontend(serve_parser):
+    from vllm.engine.arg_utils import AsyncEngineArgs
+
+    args = serve_parser.parse_args([])
+    validate_parsed_serve_args(args)
+    engine_args = AsyncEngineArgs.from_cli_args(args)
+    assert engine_args.lwd_api_config is not None
+    assert not engine_args.lwd_api_config.requested
+    assert args.api_server_count is None
