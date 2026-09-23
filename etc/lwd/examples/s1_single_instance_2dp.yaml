@@ -1,0 +1,54 @@
+# =============================================================================
+# LWD prefill_only 拓扑 · 场景 single_instance · 由 tools/gen_lwd_topology.py 生成
+# -----------------------------------------------------------------------------
+#   scene        = single_instance(机器 1 边 × 1 云,配对规则:全连接)
+#   world        = 9       dp 数 = 2(边机 1 卡 / 云机 8 卡,
+#                               dp 只切分/共享本机卡,不新增 rank)
+#   控制面       云 dp ctrl_port: c0.dp0=5550 c0.dp1=5551
+#               (同设备多 dp 错开 = port_base+dp_idx,异设备可重新从 5550 开始)
+#   生成命令     --scene single_instance --edge-machines 10.0.0.1 --cloud-machines 10.1.0.1 --dp 1,2 -o etc/lwd/examples/s1_single_instance.yaml
+#   校验         生成器已按 LwdTopology.from_dict 全量校验(结构/rank 铺满/
+#               端口错开/配对一致);两侧使用内容必须完全一致
+# =============================================================================
+deployment:
+  mode: 0
+  scene: single_instance
+  hccl_world_size: 9
+  edges_num: 1
+  clouds_num: 1
+feature_ctrl:
+  enable_early_recv: false
+  enable_scramble: false
+edges:
+- id: 0
+  dp:
+  - dp_idx: 0
+    addr: 10.0.0.1
+    ranks:
+    - 0
+  - dp_idx: 1
+    addr: 10.0.0.1
+    ranks:
+    - 0
+clouds:
+- id: 0
+  dp:
+  - dp_idx: 0
+    addr: 10.1.0.1
+    ranks:
+    - 1
+    - 2
+    - 3
+    - 4
+    ctrl_port: 5550
+  - dp_idx: 1
+    addr: 10.1.0.1
+    ranks:
+    - 5
+    - 6
+    - 7
+    - 8
+    ctrl_port: 5551
+instance_links:
+- edge: 0
+  cloud: 0
