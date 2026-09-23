@@ -47,11 +47,15 @@ def parallel(tp):
     )
 
 
+def _clear_retired_port_env(monkeypatch):
+    monkeypatch.delenv("VLLM_ASCEND_LWD_POST_OUT_PORT", raising=False)
+
+
 @pytest.mark.parametrize(
     "role,tp,ranks", [("edge", 1, (0,)), ("cloud", 8, tuple(range(1, 9)))]
 )
 def test_single_dp_projection_and_transport(monkeypatch, role, tp, ranks):
-    monkeypatch.setenv("VLLM_ASCEND_LWD_POST_OUT_PORT", "6454")
+    _clear_retired_port_env(monkeypatch)
     config = LwdConfig.from_dict(entry(role))
     pc = parallel(tp)
     config.apply_to_parallel_config(pc)
@@ -65,19 +69,30 @@ def test_single_dp_projection_and_transport(monkeypatch, role, tp, ranks):
     assert pc.lwd_config.cloud_npu_count == 8
     assert pickle.loads(pickle.dumps(config)) == config
 
-    # Transport uses the captured config, not subsequent env/JSON overrides.
-    monkeypatch.setenv("VLLM_ASCEND_LWD_POST_OUT_PORT", "6500")
+    # Transport is derived from the resolved topology only: endpoints are
+    # computed without reopening the YAML and cannot drift via env overrides.
     monkeypatch.setenv("VLLM_ASCEND_LWD_PRE_OUT_PORT", "6501")
     with monkeypatch.context() as patch:
         patch.setattr(Path, "open", lambda *a, **kw: pytest.fail("YAML was reopened"))
-        transport = TransportConfig.from_vllm_config(SimpleNamespace(lwd_config=config))
-    assert transport.lwd_pre_out_endpoint() == "tcp://76.76.26.234:6453"
-    assert transport.lwd_post_out_connect_endpoint() == "tcp://76.76.26.18:6454"
-    assert transport.lwd_wire_store_init_method() == "tcp://76.76.26.18:29600"
+        transport = TransportConfig.from_vllm_config(
+            SimpleNamespace(lwd_config=config)
+        )
+    assert transport.my_links == ((0, 0, 0),)
+    assert transport.wire_store_init_method == "tcp://76.76.26.18:29600"
+    if role == "cloud":
+        assert transport.router_bind_endpoint == "tcp://*:6453"
+        assert not transport.dealer_endpoints
+        assert transport.dealer_identity is None
+    else:
+        assert transport.router_bind_endpoint is None
+        assert transport.dealer_endpoints == {(0, 0, 0): "tcp://76.76.26.234:6453"}
+        assert transport.dealer_identity == b"edge-0-0"
+    assert transport.edge_npu_count == 1 and transport.cloud_npu_count == 8
+    assert transport.topology_digest  # from_file computes it
 
 
 def test_multi_dp_parses_but_cannot_execute(monkeypatch):
-    monkeypatch.delenv("VLLM_ASCEND_LWD_POST_OUT_PORT", raising=False)
+    _clear_retired_port_env(monkeypatch)
     config = LwdConfig.from_dict(entry(filename="lwd_config_2dp.yaml"))
     assert len(config.instance.dp) == 2
     assert config.topology.deployment.hccl_world_size == 9
@@ -90,7 +105,7 @@ def test_multi_dp_parses_but_cannot_execute(monkeypatch):
 
 
 def test_tp_mismatch_does_not_overwrite(monkeypatch):
-    monkeypatch.delenv("VLLM_ASCEND_LWD_POST_OUT_PORT", raising=False)
+    _clear_retired_port_env(monkeypatch)
     pc = parallel(1)
     with pytest.raises(
         ValueError, match="CLI tensor_parallel_size=1.*YAML ranks count=8"
@@ -134,10 +149,11 @@ def test_invalid_public_fields(key, value):
         lwd_entry_from_additional({"lwd_config": raw})
 
 
-@pytest.mark.parametrize("port", ["bad", "", "0", "65536", "29600"])
-def test_invalid_post_out_port(monkeypatch, port):
+@pytest.mark.parametrize("port", ["6454", "5559"])
+def test_retired_post_out_port_env_rejected(monkeypatch, port):
+    # ROUTER/DEALER 控制面边侧无端口;旧脚本带着该 env 一律 fail-fast
     monkeypatch.setenv("VLLM_ASCEND_LWD_POST_OUT_PORT", port)
-    with pytest.raises(ValueError, match="POST_OUT_PORT"):
+    with pytest.raises(ValueError, match="POST_OUT_PORT.*retired"):
         LwdConfig.from_dict(entry())
 
 
@@ -171,20 +187,33 @@ def test_feature_defaults_and_rank_validation():
         LwdTopology.from_dict(raw)
 
 
+def test_topology_digest_stable_and_file_bound():
+    path = EXAMPLES / "lwd_config.yaml"
+    first = LwdTopology.from_file(str(path))
+    second = LwdTopology.from_file(str(path))
+    assert first.digest and first.digest == second.digest
+    assert len(first.digest) == 16
+    assert LwdTopology.from_dict(
+        yaml.safe_load(path.read_text())
+    ).digest == ""  # from_dict has no raw bytes
+
+
 def test_transport_log_contains_the_returned_config(monkeypatch):
-    monkeypatch.setenv("VLLM_ASCEND_LWD_POST_OUT_PORT", "6454")
+    _clear_retired_port_env(monkeypatch)
     config = LwdConfig.from_dict(entry("cloud"))
     log = Mock()
     monkeypatch.setattr(lwd_edge_assemble.logger, "info_once", log)
     transport = TransportConfig.from_vllm_config(SimpleNamespace(lwd_config=config))
-    message, role, instance_id, payload = log.call_args.args
+    message = log.call_args.args[0]
     assert "[LWD][config][transport]" in message
-    assert (role, instance_id) == ("cloud", 0)
-    assert json.loads(payload) == asdict(transport)
+    payload = json.loads(log.call_args.args[-1])
+    assert payload["router_bind"] == "tcp://*:6453"
+    assert payload["wire_store"] == "tcp://76.76.26.18:29600"
+    assert asdict(transport)["my_links"] == ((0, 0, 0),)
 
 
 def test_parsed_log_payload_preserves_all_dps(monkeypatch):
-    monkeypatch.delenv("VLLM_ASCEND_LWD_POST_OUT_PORT", raising=False)
+    _clear_retired_port_env(monkeypatch)
     config = LwdConfig.from_dict(entry(filename="lwd_config_2dp.yaml"))
     payload = json.loads(json.dumps(asdict(config)))
     assert payload["path"] == entry(filename="lwd_config_2dp.yaml")["path"]

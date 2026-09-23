@@ -1,22 +1,22 @@
 """边侧引擎子类:run_engine_core 类选择点注入的边 EngineCore。
 
-边引擎职责:通信面装配(POST_OUT bind/接收线程/PRE_OUT 延迟连接)、
+边引擎职责:通信面装配(边连云 DEALER mesh + 单线程 IO 循环)、
 调度器注入(LwdEdgeScheduler)、请求入口/步进/关停的引擎接口覆写。
 全部状态收进子类字段,不外挂引擎属性。
 
 构造约束:
-  ① 引擎主体先行(super() 最先调):接收线程 WAKEUP 敲门的
-     self.input_queue 由 super 创建,后启动线程即无构造期竞态;代价是
+  ① 引擎主体先行(super() 最先调):IO 循环回调 WAKEUP 敲门的
+     self.input_queue 由 super 创建,后启动循环即无构造期竞态;代价是
      云缺失时引擎主体启动白费,超时路径只清理通信面,主体随进程退出
-     兜底回收。通信面随后构建:bind POST_OUT、建云载荷队列与接收线程,
-     阻塞等云首拍 HELLO——HELLO 在云引擎全量初始化(权重/KV/图编译)
-     完成后才发出,等到了它才允许边侧对外就绪;超时(hello_timeout_s,
-     默认 600s,须覆盖云全量启动时长)fail-fast。
-     HELLO 首拍一次、无周期重发,不考虑任一侧重启自愈:重启即整组重拉,
-     构造期等待是边侧唯一的发现窗口。
+     兜底回收。通信面随后构建:对每条 dp 级连接开一条 DEALER(带稳定
+     identity,端点自拓扑推导)并立即发 register;ack 在云引擎全量初始
+     化(权重/KV/图编译)完成后才回——等齐全部连接的 ack 才允许边侧
+     对外就绪;超时(hello_timeout_s,默认 600s,须覆盖云全量启动时长)
+     fail-fast,未齐的连接逐条报出。register 未确认期间周期重发
+     (连接级自愈);云引擎级重启丢调度状态,仍需整组重拉(与现状一致)。
   ② 调度器经 scheduler_cls 注入裸类,须在 super() 之前设值——super 内
      构建调度器时一次性消费该配置,后设无效;引擎构造完成后回填
-     publisher(早于任何请求,等价构造注入)。
+     IO 循环与 link(早于任何请求,等价构造注入)。
 
 步进编排(embed 优先):步首收割在飞批(unembed 交付 token/请求终结,
 embed 登记进度)-> prefill 编排(单请求组批 -> 范围预告 -> executor
@@ -30,6 +30,8 @@ import threading
 import time
 from collections import deque
 
+import zmq
+
 from vllm.logger import init_logger
 from vllm.v1.engine import (
     EngineCoreOutput,
@@ -38,19 +40,21 @@ from vllm.v1.engine import (
     FinishReason,
 )
 from vllm.v1.engine.core import EngineCoreProc
-from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
-    LwdControlPublisher,
+from vllm.v1.lwd_control.control_communication.lwd_control_communicator import (
+    LwdControlCommunicator,
 )
-from vllm.v1.lwd_control.control_communication.lwd_control_subscriber import (
-    LwdControlSubscriber,
+from vllm.v1.lwd_control.control_communication.lwd_control_loop import (
+    LwdControlLoop,
 )
-from vllm.v1.lwd_debug import LwdDebug, LwdLogBase
+from vllm.v1.lwd_debug import LwdDebug
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LWD_NOT_FINISHED,
     LWD_WIRE_VERSION,
     LwdC2eNotify,
-    LwdHelloNotify,
+    LwdRegisterAckNotify,
+    LwdRegisterNotify,
     lwd_decode_cloud_notify,
+    lwd_encode_notify,
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import (
     LwdConfig,
@@ -63,7 +67,7 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler import (
 logger = init_logger(__name__)
 
 
-# 云->边载荷队列容量:队满时接收线程阻塞在 put,背压沿 ZMQ 直达云侧
+# 云->边载荷队列容量:队满时 IO 循环出站阻塞,背压沿 ZMQ 直达云侧
 # 步发送循环(载荷不可丢)
 LWD_C2E_META_QUEUE_MAX = 1000
 
@@ -71,9 +75,16 @@ LWD_C2E_META_QUEUE_MAX = 1000
 # 突发积压时连续派发喂饱 worker(参照仓经验 >=4 才能维持流水对齐)
 LWD_EDGE_BATCH_QUEUE_DEPTH = 4
 
+# register 未确认期间的重发间隔(幂等;云未起或互校拒绝均由重发覆盖)。
+# 注意 DEALER 与旧 PUSH 的行为差异:connect 到无人 bind 的端口时,
+# DEALER 的 send 静默丢帧(zmq 无可用 pipe)而非排队——本侧靠 register
+# 周期重发覆盖"云未起"窗口;请求/预告只在 ack 后发送,连接已建立,
+# 帧进入已建 pipe 排队/投递,不丢。
+_LWD_REGISTER_RETRY_S = 5.0
+
 
 class LwdEdgeEngineCore(EngineCoreProc):
-    """边 PO 引擎:通信面装配 + 调度器注入 + step/add/abort/shutdown 覆写。"""
+    """边 PO 引擎:DEALER mesh 装配 + 调度器注入 + step/add/abort/shutdown 覆写。"""
 
     def __init__(self, *args, **kwargs) -> None:
         vllm_config = kwargs["vllm_config"]
@@ -82,167 +93,134 @@ class LwdEdgeEngineCore(EngineCoreProc):
         vllm_config.scheduler_config.scheduler_cls = LwdEdgeScheduler
         super().__init__(*args, **kwargs)
         config = LwdConfig.from_vllm_config(vllm_config)
-        # 层日志总开关:env 已开则不动,config 段开则补开(仅本进程)
-        LwdLogBase.set_debug(config.debug)
-        # 通信面:bind POST_OUT 订阅面 + 延迟连接的 PRE_OUT 发布面;
-        # 云端点由 HELLO 通告，并与本侧 YAML 校验一致后才连接。
-        self._edge_receiver = self._lwd_build_post_out(config)
-        self._edge_sender = LwdControlPublisher(
-            None, bind=False, queue_max=config.publish_queue_max
-        )
-        # 云->边唯一载荷队列:生产端接收线程,消费端引擎步;数据面经
-        # UNEMBED 批的 lwd_c2e_notifies 拿元数据,不直接读队列
-        # (单消费者语义)
-        self.lwd_c2e_meta_queue = queue.Queue(maxsize=LWD_C2E_META_QUEUE_MAX)
-        # 已派发待收割的批队列 (kind, payload, t_dispatch, future):
-        # kind="unembed" payload=notify;kind="embed" payload=scheduler_output。
-        # 派发不收割,队首 FIFO 收割——必须全局单队列:executor 的 FutureWrapper
-        # 按底层队列序排水,交错收割会连带等错批。t_dispatch 供
-        # [Lwd][sched] harvest wait(派发→收割)度量批在队列里的滞留时长
-        self._lwd_batch_queue: deque = deque()
-        hello_event = threading.Event()
-        # HELLO 拓扑互校失败信息:接收线程写入(置位 hello_event 唤醒构造
-        # 线程),构造线程据此 fail-fast;None = 未发现不一致
-        self._lwd_hello_error: str | None = None
-        discovery = threading.Thread(
-            target=self._receive_thread,
-            args=(hello_event,),
-            name="lwd-post-in",
-            daemon=True,
-        )
-        discovery.start()
-        if not hello_event.wait(config.hello_timeout_s):
-            self._lwd_shutdown_planes()
-            raise RuntimeError(
-                f"[Lwd] edge engine init failed: no cloud HELLO within "
-                f"{config.hello_timeout_s}s on POST_OUT "
-                f"(bind {config.lwd_post_out_bind_endpoint()}; check cloud "
-                f"post_out_host connectivity and POST_OUT port)"
-            )
-        if self._lwd_hello_error is not None:
-            self._lwd_shutdown_planes()
-            raise RuntimeError(self._lwd_hello_error)
-
-        self.scheduler.lwd_edge_publisher = self._edge_sender
+        # 通信面:边连云——对每条 dp 级连接一条 DEALER connect(端点自
+        # 拓扑推导,带稳定 identity),单线程 IO 循环收发;边不 bind 任何端口
+        self._edge_mesh = self._lwd_build_mesh(config)
+        # 每条连接的 register-ack 事件:全齐 = 对外就绪;error = 互校失败
+        self._lwd_ack: dict[tuple, threading.Event] = {
+            link: threading.Event() for link in config.my_links
+        }
+        self._lwd_ack_error: str | None = None
+        self._edge_mesh.start()
+        self._lwd_await_registers(config)
+        self.scheduler.lwd_edge_publisher = self._edge_mesh
+        self.scheduler.lwd_edge_link = config.my_links[0]
         logger.info(
-            "[Lwd] edge engine assembled: POST_OUT bind %s, PRE_OUT discovered",
-            config.lwd_post_out_bind_endpoint(),
+            "[Lwd] edge engine assembled: %d DEALER link(s) registered, "
+            "identity=%r",
+            len(config.my_links), config.dealer_identity,
         )
 
     # ------------------------------------------------------------------ #
     # 通信面                                                              #
     # ------------------------------------------------------------------ #
-    def _lwd_build_post_out(self, config: LwdConfig) -> LwdControlSubscriber:
-        """bind POST_OUT 订阅面;云经 YAML edge addr 主动来连。"""
-        return LwdControlSubscriber(
-            config.lwd_post_out_bind_endpoint(),
-            bind=True,
+    def _lwd_build_mesh(self, config: LwdConfig) -> LwdControlLoop:
+        """边侧 DEALER mesh:per-link 一条 DEALER connect(identity 稳定,
+        断线重连后云侧按 identity 认回),单线程 IO 循环驱动收发。"""
+        dealers = {
+            link: LwdControlCommunicator(
+                endpoint, zmq.DEALER, bind=False, identity=config.dealer_identity
+            )
+            for link, endpoint in config.dealer_endpoints.items()
+        }
+        return LwdControlLoop(
+            dealers,
             decoder=lwd_decode_cloud_notify,
+            encoder=lwd_encode_notify,
+            on_msg=self._lwd_on_cloud_msg,
         )
 
-    def _receive_thread(self, hello_event: threading.Event) -> None:
-        """POST_OUT 接收线程体,按消息类型分发。
+    def _lwd_await_registers(self, config: LwdConfig) -> None:
+        """发 register 并等齐全部连接的 ack:互校失败或超时 fail-fast,
+        报出未确认的连接(三元组)而非笼统超时。"""
+        registers = {
+            link: LwdRegisterNotify(
+                edge_id=link[0],
+                cloud_id=link[1],
+                dp_idx=link[2],
+                wire_version=LWD_WIRE_VERSION,
+                edge_npu_count=config.edge_npu_count,
+                cloud_npu_count=config.cloud_npu_count,
+                topology_digest=config.topology_digest,
+            )
+            for link in config.my_links
+        }
+        deadline = time.monotonic() + config.hello_timeout_s
+        next_retry = 0.0
+        while True:
+            if self._lwd_ack_error is not None:
+                self._lwd_shutdown_planes()
+                raise RuntimeError(self._lwd_ack_error)
+            unacked = [link for link, event in self._lwd_ack.items()
+                       if not event.is_set()]
+            if not unacked:
+                return
+            now = time.monotonic()
+            if now >= deadline:
+                self._lwd_shutdown_planes()
+                raise RuntimeError(
+                    f"[Lwd] edge engine init failed: no register-ack within "
+                    f"{config.hello_timeout_s}s for links {unacked} "
+                    f"(identity={config.dealer_identity!r}; check cloud "
+                    "ctrl_port reachability and topology identity on both "
+                    "sides)"
+                )
+            if now >= next_retry:
+                for link in unacked:
+                    self._edge_mesh.send(link, registers[link])
+                next_retry = now + _LWD_REGISTER_RETRY_S
+            threading.Event().wait(0.05)
 
-        HELLO -> retarget PRE_OUT:云端点唯一事实源,首拍一次通告;
-        retarget 队满时无下条 HELLO 可等,须本线程自旋重试到成功
-        (构造期发布队列必空,该路径仅防御性保活)。
+    def _lwd_on_cloud_msg(self, link, _identity, msg) -> None:
+        """云->边入站分发(IO 线程回调)。
+
+        RegisterAck -> 置对应连接的就绪事件(ack 在云引擎全量初始化
+        完成后回,时序语义等价旧 HELLO 首拍)。
         LwdC2eNotify(云->边唯一载荷)-> 载荷队列(阻塞 put,不可丢)
         + WAKEUP 唤醒主循环:prefill 全部完成后请求转入 awaiting,
         引擎无排程工作、阻塞在 input_queue.get(),载荷只进队列不会
         唤醒任何线程,必须向 input_queue 敲门;WAKEUP 原生语义即丢弃
         消息体,数据与唤醒分离,多投无害(空 drain 一步即返回)。
-        其余帧(坏帧已被订阅层丢弃后仍不认识的类型)告警丢弃。
-        """
-        receiver = self._edge_receiver
-        publisher = self._edge_sender
-        while not receiver.closed:
-            msg = receiver.recv(timeout_ms=5000)
-            if msg is None:
-                continue
-            if isinstance(msg, LwdHelloNotify):
-                endpoint = f"tcp://{msg.pre_out_host}:{msg.pre_out_port}"
-                if not hello_event.is_set():
-                    logger.info(
-                        "[Lwd] cloud discovered via HELLO: PRE_OUT -> %s", endpoint
-                    )
-                    hello_error = self._lwd_check_hello_topology(msg)
-                    if hello_error is not None:
-                        # 拓扑互校失败:不 retarget,置错误并唤醒构造线程
-                        # fail-fast(接收线程自 raise 只杀线程,构不成快败)
-                        logger.error("[Lwd] %s", hello_error)
-                        self._lwd_hello_error = hello_error
-                        hello_event.set()
-                        continue
-                while not publisher.retarget(endpoint):
-                    if receiver.closed:
-                        break
-                    logger.warning(
-                        "[Lwd] PRE_OUT retarget deferred (queue full), retrying"
-                    )
-                    threading.Event().wait(0.05)
-                hello_event.set()
-            elif isinstance(msg, LwdC2eNotify):
-                logger.info(
-                    "[Lwd][edge-ctrl] C2eNotify reqs=%d down_seqno=%s",
-                    len(getattr(msg, "req_ids", []) or []),
-                    getattr(msg, "down_seqno", None),
+        其余帧(坏帧已被 IO 循环丢弃后仍不认识的类型)告警丢弃。"""
+        if isinstance(msg, LwdRegisterAckNotify):
+            if msg.wire_version != LWD_WIRE_VERSION:
+                # ack 版本不符:置错唤醒构造线程 fail-fast(回调内 raise
+                # 只杀 IO 线程,构不成快败);计数/digest 校验在云侧
+                # register 入口已做,ack 只核版本
+                error = (
+                    f"[Lwd] edge engine init failed: register-ack wire "
+                    f"version mismatch (cloud={msg.wire_version}, "
+                    f"edge={LWD_WIRE_VERSION})"
                 )
-                # 队列元素带到达时间戳:消费滞后(c2e_wait=到达→派发)
-                # 是"边消费不动 → 云 publisher 队满小睡"闭环的前置指标
-                self.lwd_c2e_meta_queue.put((msg, time.monotonic()))
-                self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
-            else:
-                logger.warning("[Lwd] drop unexpected POST_OUT frame %r", type(msg))
-
-    def _lwd_check_hello_topology(self, msg: LwdHelloNotify) -> str | None:
-        """HELLO 拓扑互校:返回 None = 通过;否则返回失败描述(由构造线程
-        raise fail-fast,报出两侧各自取值)。
-
-        wire_version==0 = 旧版云侧(不携带互校字段),仅告警不拒绝;
-        版本不符或 edge/cloud NPU 计数与本侧配置不符即拒绝(计数取自
-        vllm_config.parallel_config.lwd_config,不新增配置段)。"""
-        config = LwdConfig.from_vllm_config(self.vllm_config)
-        if (msg.pre_out_host, msg.pre_out_port) != (
-            config.pre_out_host,
-            config.pre_out_port,
-        ):
-            return (
-                "[Lwd] edge engine init failed: cloud HELLO endpoint "
-                f"{msg.pre_out_host}:{msg.pre_out_port} differs from YAML "
-                f"{config.pre_out_host}:{config.pre_out_port}; "
-                "use identical topology contents on both sides"
+                logger.error("[Lwd] %s", error)
+                self._lwd_ack_error = error
+                for event in self._lwd_ack.values():
+                    event.set()
+                return
+            expected = self._lwd_ack.get(link)
+            if expected is not None:
+                expected.set()
+            return
+        if isinstance(msg, LwdC2eNotify):
+            logger.info(
+                "[Lwd][edge-ctrl] C2eNotify reqs=%d down_seqno=%s edge=%s dp=%s",
+                len(getattr(msg, "req_ids", []) or []),
+                getattr(msg, "down_seqno", None),
+                getattr(msg, "edge_id", None),
+                getattr(msg, "dp_idx", None),
             )
-        if msg.wire_version == 0:
-            logger.warning(
-                "[Lwd] cloud HELLO carries no wire version (legacy cloud); "
-                "topology cross-check skipped"
-            )
-            return None
-        if msg.wire_version != LWD_WIRE_VERSION:
-            return (
-                f"[Lwd] edge engine init failed: cloud HELLO wire version "
-                f"mismatch (cloud={msg.wire_version}, edge={LWD_WIRE_VERSION})"
-            )
-        lwd = self.vllm_config.parallel_config.lwd_config
-        if (msg.edge_npu_count != lwd.edge_npu_count
-                or msg.cloud_npu_count != lwd.cloud_npu_count):
-            return (
-                f"[Lwd] edge engine init failed: topology mismatch with cloud "
-                f"HELLO (cloud announces edge_npu_count={msg.edge_npu_count}, "
-                f"cloud_npu_count={msg.cloud_npu_count}; edge configured "
-                f"edge_npu_count={lwd.edge_npu_count}, "
-                f"cloud_npu_count={lwd.cloud_npu_count})"
-            )
-        return None
+            # 队列元素带到达时间戳:消费滞后(c2e_wait=到达→派发)
+            # 是"边消费不动 → 云出站队满小睡"闭环的前置指标
+            self.lwd_c2e_meta_queue.put((msg, time.monotonic()))
+            self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
+            return
+        logger.warning("[Lwd] drop unexpected cloud frame %r", type(msg))
 
     def _lwd_shutdown_planes(self) -> None:
-        """两面关停(幂等):receiver 先关断输入,publisher 收尾。"""
-        receiver = getattr(self, "_edge_receiver", None)
-        if receiver is not None:
-            receiver.shutdown()
-        publisher = getattr(self, "_edge_sender", None)
-        if publisher is not None:
-            publisher.shutdown()
+        """通信面关停(幂等):IO 循环收尾(其内统一关闭 DEALER/唤醒管道)。"""
+        mesh = getattr(self, "_edge_mesh", None)
+        if mesh is not None:
+            mesh.stop()
 
     # ------------------------------------------------------------------ #
     # 引擎接口覆写                                                        #

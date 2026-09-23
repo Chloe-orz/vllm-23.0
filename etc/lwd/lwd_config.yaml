@@ -6,8 +6,9 @@
 # Ranks are logical global ranks, not physical NPU IDs.
 # Both sides must use identical topology contents; role and instance_id are
 # supplied separately through additional_config.lwd_config.
-# Current no-PP/PUSH-PULL runtime: ctrl_port maps to PRE_OUT.
-# Keep VLLM_ASCEND_LWD_POST_OUT_PORT=6454 on BOTH sides during transition.
+# ROUTER/DEALER control plane: cloud binds ROUTER on ctrl_port (edge connects
+# in with DEALER + identity edge-0-0); the edge side binds no port at all.
+# VLLM_ASCEND_LWD_POST_OUT_PORT is retired; setting it is an error.
 # Shared TCPStore binds the edge address on port 29600.
 
 deployment:

@@ -125,9 +125,9 @@ class MultiprocExecutor(Executor):
 
         set_multiprocessing_worker_envs()
 
-        # LWD edge-cloud: 边云共享世界的 rendezvous 地址由 lwd_config 派生
-        # (post_out_host = 边 IP,边 rank0 为 store master;两侧同值),
-        # 不依赖 VLLM_LOOPBACK_IP/VLLM_PORT 环境变量对齐。
+        # LWD edge-cloud: 边云共享世界的 rendezvous 地址由拓扑推导
+        # (全局 rank0 机器 = edges[0].dp[0],边 rank0 为 store master;
+        # 两侧同值),不依赖 VLLM_LOOPBACK_IP/VLLM_PORT 环境变量对齐。
         parallel_lwd = self.vllm_config.parallel_config.lwd_config
         if parallel_lwd.enable_lwd:
             from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import (
@@ -135,14 +135,7 @@ class MultiprocExecutor(Executor):
             )
 
             lwd_config = LwdConfig.from_vllm_config(self.vllm_config)
-            if not lwd_config.post_out_host:
-                raise ValueError(
-                    "[LWD] edge-cloud shared world requires "
-                    "a YAML edge addr (= edge IP, same value on "
-                    "both sides; the edge rank-0 worker binds the "
-                    "rendezvous store there)"
-                )
-            distributed_init_method = lwd_config.lwd_wire_store_init_method()
+            distributed_init_method = lwd_config.wire_store_init_method
             logger.info(
                 "[LWD] distributed init method from lwd_config: %s",
                 distributed_init_method,

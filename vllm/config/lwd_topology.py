@@ -4,6 +4,7 @@
 """File schema for LWD, independent of devices and distributed initialization."""
 
 from dataclasses import dataclass
+from hashlib import sha256
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Any
@@ -98,13 +99,25 @@ class LwdTopology:
     edges: tuple[LwdInstance, ...]
     clouds: tuple[LwdInstance, ...]
     instance_links: tuple[LwdLink, ...]
+    digest: str = ""
+    """sha256(YAML 原文) 前 16 hex,register 互校用;from_dict 构造
+    (测试)无原文,恒空串 = 跳过比对。"""
 
     @classmethod
     def from_file(cls, path: str) -> "LwdTopology":
         try:
+            file_bytes = Path(path).read_bytes()
             with Path(path).open(encoding="utf-8") as stream:
                 raw = yaml.load(stream, Loader=_UniqueKeyLoader)
-            return cls.from_dict(raw)
+            topology = cls.from_dict(raw)
+            return LwdTopology(
+                deployment=topology.deployment,
+                feature_ctrl=topology.feature_ctrl,
+                edges=topology.edges,
+                clouds=topology.clouds,
+                instance_links=topology.instance_links,
+                digest=sha256(file_bytes).hexdigest()[:16],
+            )
         except (OSError, UnicodeError, yaml.YAMLError, ValueError) as exc:
             raise ValueError(f"[LWD] Invalid topology file {path!r}: {exc}") from exc
 
