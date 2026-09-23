@@ -99,17 +99,19 @@ class LwdConfig:
             edge_npu_count=len(edge0.ranks),
             cloud_npu_count=len(topology.clouds[0].dp[0].ranks),
         )
-        # 该投影被多个引擎/executor 入口调用:每进程报一次实际取值
+        # 该投影被多个引擎/executor 入口调用:每进程报一次实际取值。
+        # info_once 底层 lru_cache 按参数去重,参数必须可哈希——links
+        # 一并序列化进 values,不单独传 list
         logger.info_once(
-            "[Lwd][config][transport] role=%s instance_id=%d wire=%d digest=%s "
-            "links=%s values=%s",
+            "[LWD][config][transport] role=%s instance_id=%d wire=%d digest=%s "
+            "values=%s",
             role,
             instance_id,
             LWD_WIRE_VERSION,
             config.topology_digest or "-",
-            [list(link) for link in config.my_links],
             json.dumps(
                 {
+                    "links": [list(link) for link in config.my_links],
                     "router_bind": config.router_bind_endpoint,
                     "dealers": {str(k): v for k, v in config.dealer_endpoints.items()},
                     "identity": (config.dealer_identity or b"").decode(),
