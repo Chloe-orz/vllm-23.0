@@ -270,7 +270,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             seqno = self._lwd_seqno
             positions = self._lwd_mrope_positions_dict.get(request_id)
             has_mrope = positions is not None
-            if not publisher.publish(
+            if not publisher.send(
                 link,
                 LwdRangeNotify(
                     request_id=request_id,
@@ -368,7 +368,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             dp_idx=link[2],
         )
         for attempt in range(_LWD_ADD_RETRY_STEPS):
-            if publisher.publish(link, message):
+            if publisher.send(link, message):
                 logger.info(
                     "[Lwd][edge-notify] request meta announced: req=%s "
                     "prompt=%d",
@@ -394,7 +394,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             self._lwd_mrope_positions_dict.pop(request_id, None)
             if publisher is None:
                 continue
-            if not publisher.publish(
+            if not publisher.send(
                 link,
                 LwdAbortNotify(
                     request_id=request_id, edge_id=link[0], dp_idx=link[2]
