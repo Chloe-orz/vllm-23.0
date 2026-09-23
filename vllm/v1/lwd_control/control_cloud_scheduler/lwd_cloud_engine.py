@@ -149,6 +149,19 @@ class LwdCloudEngineCore(EngineCoreProc):
             )
             return
         edge_id, dp_idx = peer
+        # 信封/载荷交叉校验(§3.3.4):消息冗余携带的 edge_id/dp_idx 必须
+        # 与 identity 注册值一致——不一致即 identity 配错或串线,fail-fast
+        # 优于静默按错误归属处理
+        msg_edge, msg_dp = getattr(msg, "edge_id", None), getattr(msg, "dp_idx", None)
+        if (msg_edge is not None and msg_edge >= 0 and msg_edge != edge_id) or (
+            msg_dp is not None and msg_dp >= 0 and msg_dp != dp_idx
+        ):
+            logger.error(
+                "[Lwd] identity/payload mismatch from %r: registered "
+                "(edge=%d, dp=%d) but frame claims (edge=%s, dp=%s); drop",
+                identity, edge_id, dp_idx, msg_edge, msg_dp,
+            )
+            return
         if isinstance(msg, LwdRangeNotify):
             self._lwd_handle_range(edge_id, dp_idx, msg)
         elif isinstance(msg, LwdAbortNotify):
