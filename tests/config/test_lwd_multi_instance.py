@@ -163,6 +163,34 @@ def test_api_flags_require_multi_instance_lwd():
         api.validate_topology(LwdConfig.from_dict(raw))
 
 
+def test_config_boundary_logs_before_runtime_rejection(monkeypatch):
+    from unittest.mock import Mock
+
+    import vllm.config.vllm as config_module
+
+    log = Mock()
+    monkeypatch.setattr(config_module.logger, "info", log)
+    api = LwdAPIConfig(api_server_attach="10.0.0.1:29550")
+    # Exercise the real boundary without constructing a model or any workers.
+    target = SimpleNamespace(
+        additional_config={"lwd_config": entry(instance_id=1, dps=2)},
+        lwd_api_config=api,
+        parallel_config=SimpleNamespace(),
+    )
+    with pytest.raises(ValueError, match="Multi-instance topology was parsed"):
+        config_module.VllmConfig.__post_init__(target)
+    assert target.lwd_api_config == api
+    calls = {call.args[0]: call.args[1:] for call in log.call_args_list}
+    api_call = next(args for msg, args in calls.items() if "[config][api]" in msg)
+    assert json.loads(api_call[0])["api_server_attach"] == "10.0.0.1:29550"
+    links_call = next(
+        args for msg, args in calls.items() if "[config][connections]" in msg
+    )
+    links = json.loads(links_call[-1])
+    assert len(links) == 2
+    assert all(link["edge_id"] == link["cloud_id"] == 1 for link in links)
+
+
 def test_config_boundary_validates_api_before_execution_gate():
     from vllm.config.vllm import VllmConfig
 
