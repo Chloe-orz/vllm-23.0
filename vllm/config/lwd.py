@@ -117,14 +117,27 @@ class LwdConfig:
                 f"[LWD] {retired_port_env} is retired: the edge side no "
                 "longer binds any control-plane port (cloud ROUTER only)"
             )
-        topology = LwdTopology.from_file(raw["path"])
+        if "path" in raw:
+            topology = LwdTopology.from_file(raw["path"])
+        else:
+            # 内嵌形态:进程内按机器参数推导(生成即校验),两侧同参数
+            # 推出同一拓扑,digest 互校与文件形态等价
+            topology = LwdTopology.from_params(
+                scene=raw["scene"],
+                edge_machines=raw["edge_machines"],
+                cloud_machines=raw["cloud_machines"],
+                dp=raw.get("dp", 1),
+                port_base=raw.get("port_base", 5550),
+                enable_early_recv=raw.get("enable_early_recv", False),
+                enable_scramble=raw.get("enable_scramble", False),
+            )
         topology.instance(raw["role"], raw["instance_id"])
         return cls(
             enabled=True,
             role=raw["role"],
             mode="prefill_only",
             edge_head_tail_layers=(0, 0),
-            path=raw["path"],
+            path=raw.get("path"),
             instance_id=raw["instance_id"],
             topology=topology,
         )
