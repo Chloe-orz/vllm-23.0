@@ -73,6 +73,7 @@ from vllm.config.cache import (
 from vllm.config.device import Device
 from vllm.config.kernel import IrOpPriorityConfig, LinearBackend, MoEBackend
 from vllm.config.lora import MaxLoRARanks
+from vllm.config.lwd_api import LwdAPIConfig
 from vllm.config.mamba import MambaBackendEnum
 from vllm.config.model import (
     ConvertOption,
@@ -683,6 +684,8 @@ class EngineArgs:
     mamba_cache_philox_rounds: int = MambaConfig.stochastic_rounding_philox_rounds
 
     additional_config: dict[str, Any] = get_field(VllmConfig, "additional_config")
+    lwd_api_config: LwdAPIConfig | None = None
+    """Internal carrier of frontend LWD API options; not a separate CLI flag."""
 
     use_tqdm_on_load: bool = LoadConfig.use_tqdm_on_load
     pt_load_map_location: str | dict[str, str] = LoadConfig.pt_load_map_location
@@ -1546,6 +1549,10 @@ class EngineArgs:
         engine_args = cls(
             **{attr: getattr(args, attr) for attr in attrs if hasattr(args, attr)}
         )
+        # Frontend flags are not EngineArgs fields. Preserve them explicitly
+        # for both single-API and multi-API paths, without reading YAML here.
+        if hasattr(args, "api_server_rpc_port") or hasattr(args, "api_server_attach"):
+            engine_args.lwd_api_config = LwdAPIConfig.from_namespace(args)
         return engine_args
 
     def create_model_config(self) -> ModelConfig:
@@ -2260,6 +2267,7 @@ class EngineArgs:
             reasoning_config=self.reasoning_config,
             profiler_config=self.profiler_config,
             additional_config=self.additional_config,
+            lwd_api_config=self.lwd_api_config,
             optimization_level=self.optimization_level,
             performance_mode=self.performance_mode,
             weight_transfer_config=self.weight_transfer_config,

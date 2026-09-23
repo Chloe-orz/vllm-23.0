@@ -15,6 +15,7 @@ from typing import Any, Literal
 
 import vllm.envs as envs
 from vllm.config import config
+from vllm.config.lwd_api import LwdAPIConfig
 from vllm.engine.arg_utils import AsyncEngineArgs, optional_type
 from vllm.entrypoints.chat_utils import (
     ChatTemplateContentFormatOption,
@@ -225,6 +226,12 @@ class BaseFrontendArgs:
 class FrontendArgs(BaseFrontendArgs):
     """Arguments for the OpenAI-compatible frontend server."""
 
+    api_server_rpc_port: str | None = None
+    """LWD IaaS primary edge instance API endpoint (IP:port).
+    Configuration only; multi-instance API routing is not implemented."""
+    api_server_attach: str | None = None
+    """LWD IaaS non-primary edge instance's primary API endpoint (IP:port).
+    Configuration only; no attachment connection is created."""
     host: str | None = None
     """Host name."""
     port: int = 8000
@@ -388,6 +395,8 @@ def validate_parsed_serve_args(args: argparse.Namespace):
     """Quick checks for model serve args that raise prior to loading."""
     if hasattr(args, "subparser") and args.subparser != "serve":
         return
+
+    LwdAPIConfig.from_namespace(args)
 
     # Ensure that the chat template is valid; raises if it likely isn't
     validate_chat_template(args.chat_template)

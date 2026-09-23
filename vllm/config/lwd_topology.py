@@ -92,6 +92,21 @@ class LwdLink:
 
 
 @dataclass(frozen=True)
+class LwdDPConnection:
+    """One explicit instance link expanded at matching DP indices."""
+
+    edge_id: int
+    cloud_id: int
+    dp_idx: int
+    edge: LwdDP
+    cloud: LwdDP
+
+    @property
+    def cloud_leader_rank(self) -> int:
+        return self.cloud.ranks[0]
+
+
+@dataclass(frozen=True)
 class LwdTopology:
     deployment: LwdDeployment
     feature_ctrl: LwdFeatures
@@ -228,7 +243,9 @@ class LwdTopology:
         """Gate execution separately from parsing the future multi-DP schema."""
         if len(self.edges) != 1 or len(self.clouds) != 1:
             raise ValueError(
-                "[LWD] Only one edge and one cloud instance are supported yet"
+                "[LWD] Multi-instance topology was parsed, but the current no-PP "
+                "runtime supports one edge and one cloud instance only; "
+                "multi-instance execution and API routing are not implemented."
             )
         if len(self.edges[0].dp) != 1 or len(self.clouds[0].dp) != 1:
             raise ValueError(
@@ -262,6 +279,44 @@ class LwdTopology:
                 "[LWD] ranks must cover [0, hccl_world_size) in contiguous "
                 "edge-first order without duplicates or gaps"
             )
+
+    def downstream_clouds(self, edge_id: int) -> tuple[LwdInstance, ...]:
+        """Return only clouds explicitly linked to this edge instance."""
+        self.instance("edge", edge_id)
+        return tuple(
+            self.instance("cloud", link.cloud)
+            for link in self.instance_links
+            if link.edge == edge_id
+        )
+
+    def upstream_edges(self, cloud_id: int) -> tuple[LwdInstance, ...]:
+        """Return only edges explicitly linked to this cloud instance."""
+        self.instance("cloud", cloud_id)
+        return tuple(
+            self.instance("edge", link.edge)
+            for link in self.instance_links
+            if link.cloud == cloud_id
+        )
+
+    def connections(self, role: str, instance_id: int) -> tuple[LwdDPConnection, ...]:
+        """Describe every DP connection for an instance without opening sockets."""
+        self.instance(role, instance_id)
+        result = []
+        for link in self.instance_links:
+            local_id = link.edge if role == "edge" else link.cloud
+            if local_id != instance_id:
+                continue
+            for edge_dp in self.instance("edge", link.edge).dp:
+                result.append(
+                    LwdDPConnection(
+                        link.edge,
+                        link.cloud,
+                        edge_dp.dp_idx,
+                        edge_dp,
+                        self.dp("cloud", link.cloud, edge_dp.dp_idx),
+                    )
+                )
+        return tuple(result)
 
     def instance(self, role: str, instance_id: int) -> LwdInstance:
         if role not in ("edge", "cloud"):

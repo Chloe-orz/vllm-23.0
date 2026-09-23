@@ -40,6 +40,7 @@ from .kv_transfer import KVTransferConfig
 from .load import LoadConfig
 from .lora import LoRAConfig
 from .lwd import LwdConfig, lwd_entry_from_additional
+from .lwd_api import LwdAPIConfig
 from .mamba import MambaConfig
 from .model import ModelConfig
 from .observability import ObservabilityConfig
@@ -367,6 +368,9 @@ class VllmConfig:
     ``additional_config["lwd_config"]`` in ``__post_init__``. Holds the
     LWD behavior settings; the parallel-topology knobs live in the
     aggregated ``parallel_config.lwd_config`` (LwdParallelConfig)."""
+    lwd_api_config: LwdAPIConfig | None = None
+    """Configuration-only frontend IaaS API options, separate from YAML topology.
+    Retained for future consumers; not part of model computation or its hash."""
     instance_id: str = ""
     """The ID of the vLLM instance."""
     optimization_level: OptimizationLevel = OptimizationLevel.O2
@@ -861,6 +865,8 @@ class VllmConfig:
         self.lwd_config = LwdConfig.from_dict(
             lwd_entry_from_additional(self.additional_config)
         )
+        if self.lwd_api_config is not None:
+            self.lwd_api_config.validate_topology(self.lwd_config)
         if self.lwd_config.enabled:
             # Log the retained snapshot, not the raw file or all additional
             # plugin settings. Defaults and all DP entries are visible here,
