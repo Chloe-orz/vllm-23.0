@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from hashlib import sha256
 from ipaddress import ip_address
@@ -12,6 +13,8 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 
 def _mapping(
@@ -176,8 +179,10 @@ class LwdTopology:
         for name, value in features.items():
             if type(value) is not bool:
                 raise ValueError(f"[LWD] feature_ctrl.{name} must be a boolean")
-        edges = _instances(raw["edges"], "edges")
-        clouds = _instances(raw["clouds"], "clouds")
+        # Cloud reuse validates machine rank allocation in declaration order.
+        preserve_order = scene in ("cloud_share", "lwd_cluster")
+        edges = _instances(raw["edges"], "edges", preserve_order=preserve_order)
+        clouds = _instances(raw["clouds"], "clouds", preserve_order=preserve_order)
         if deployment.edges_num != len(edges) or deployment.clouds_num != len(clouds):
             raise ValueError(
                 "[LWD] deployment instance counts do not match edges/clouds"
@@ -275,6 +280,127 @@ class LwdTopology:
                     f"[LWD] Linked edge={link.edge}, cloud={link.cloud} "
                     "must have matching DP indices"
                 )
+        if self.deployment.scene in ("cloud_share", "lwd_cluster"):
+            self._validate_cloud_reuse_layout()
+        self._warn_layout_recommendations(role_addresses)
+
+    def _warn_layout_recommendations(
+        self, role_addresses: dict[str, set[str]]
+    ) -> None:
+        """Report V10/V14 deviations without rewriting or rejecting the YAML."""
+        edge_count = len(role_addresses["edges"])
+        cloud_count = len(role_addresses["clouds"])
+        if edge_count == 1:
+            expected_scene = "single_instance" if cloud_count == 1 else "edge_share"
+        else:
+            expected_scene = "cloud_share" if cloud_count == 1 else "lwd_cluster"
+        if self.deployment.scene != expected_scene:
+            logger.warning(
+                "[LWD][config] scene=%s does not match machine counts "
+                "(edges=%d, clouds=%d); expected scene=%s. "
+                "Keeping the declared scene and explicit links.",
+                self.deployment.scene, edge_count, cloud_count, expected_scene,
+            )
+
+        machines: dict[str, list[LwdDP]] = {}
+        for cloud in self.clouds:
+            for dp in cloud.dp:
+                machines.setdefault(dp.addr, []).append(dp)
+        for addr, dps in machines.items():
+            ordered = sorted(dps, key=lambda dp: dp.dp_idx)
+            first = ordered[0]
+            assert first.ctrl_port is not None
+            # port_base is a generator input, not a YAML field. Infer a local
+            # base from this machine's first DP; never assume port 5550 or
+            # compare different machines (a remote DP may restart at 5550).
+            base = first.ctrl_port - first.dp_idx
+            if any(dp.ctrl_port != base + dp.dp_idx for dp in ordered):
+                logger.warning(
+                    "[LWD][config] Cloud machine %s ctrl_port values %s deviate "
+                    "from port_base + dp_idx (inferred port_base=%d). "
+                    "Keeping the configured ports.",
+                    addr, [(dp.dp_idx, dp.ctrl_port) for dp in ordered], base,
+                )
+
+    def _validate_cloud_reuse_layout(self) -> None:
+        """Validate HTML sections 4.2/4.4 without starting shared execution.
+
+        Connections remain explicit: reject missing pairs, never add them.
+        Group by machine address, not instance ID, so DP entries may reside
+        on different machines as allowed by the file schema.
+        """
+        expected_links = {
+            LwdLink(edge.id, cloud.id)
+            for edge in self.edges
+            for cloud in self.clouds
+        }
+        if set(self.instance_links) != expected_links:
+            raise ValueError(
+                "[LWD] Cloud reuse requires explicit full-mesh instance_links "
+                "(every edge instance paired with every cloud instance)"
+            )
+
+        edge_machines: dict[str, tuple[int, ...]] = {}
+        for edge in self.edges:
+            for dp in edge.dp:
+                if len(dp.ranks) != 1:
+                    raise ValueError(
+                        "[LWD] Cloud reuse requires one rank per edge machine"
+                    )
+                previous = edge_machines.setdefault(dp.addr, dp.ranks)
+                if previous != dp.ranks:
+                    raise ValueError(
+                        "[LWD] All edge DPs on the same address must share "
+                        "the same rank"
+                    )
+        for expected_rank, (addr, ranks) in enumerate(edge_machines.items()):
+            if ranks != (expected_rank,):
+                raise ValueError(
+                    f"[LWD] Edge machine {addr} ranks must follow machine "
+                    f"declaration order: expected [{expected_rank}], got {ranks}"
+                )
+
+        cloud_machines: dict[str, list[LwdDP]] = {}
+        for cloud in self.clouds:
+            for dp in cloud.dp:
+                cloud_machines.setdefault(dp.addr, []).append(dp)
+        cloud_cards = 8  # Current machine model in HTML section 4.2.
+        for machine_index, (addr, dps) in enumerate(cloud_machines.items()):
+            ranks = sorted(rank for dp in dps for rank in dp.ranks)
+            if len(ranks) != cloud_cards or ranks != list(
+                range(ranks[0], ranks[0] + cloud_cards)
+            ):
+                raise ValueError(
+                    f"[LWD] Cloud machine {addr} must own eight contiguous ranks"
+                )
+            expected_start = len(edge_machines) + machine_index * cloud_cards
+            if ranks[0] != expected_start:
+                raise ValueError(
+                    f"[LWD] Cloud machine {addr} ranks must follow machine "
+                    f"declaration order: expected start {expected_start}, "
+                    f"got {ranks[0]}"
+                )
+            if cloud_cards % len(dps) or any(
+                len(dp.ranks) != cloud_cards // len(dps) for dp in dps
+            ):
+                raise ValueError(
+                    f"[LWD] Cloud machine {addr} must split eight ranks "
+                    "equally among its DPs"
+                )
+            # Stable sorting preserves instance declaration order for ties.
+            for index, dp in enumerate(sorted(dps, key=lambda item: item.dp_idx)):
+                start = ranks[0] + index * (cloud_cards // len(dps))
+                if dp.ranks != tuple(range(start, start + len(dp.ranks))):
+                    raise ValueError(
+                        f"[LWD] Cloud machine {addr} DP ranks must be ordered "
+                        "contiguous blocks in DP-index order"
+                    )
+        expected_world = len(edge_machines) + cloud_cards * len(cloud_machines)
+        if self.deployment.hccl_world_size != expected_world:
+            raise ValueError(
+                "[LWD] Cloud reuse hccl_world_size must equal "
+                "edge machine count + 8 * cloud machine count"
+            )
 
     def validate_single_dp_runtime(self) -> None:
         """Gate execution separately from parsing the future multi-DP schema."""
@@ -382,7 +508,9 @@ class LwdTopology:
         )
 
 
-def _instances(raw: Any, role: str) -> tuple[LwdInstance, ...]:
+def _instances(
+    raw: Any, role: str, *, preserve_order: bool = False
+) -> tuple[LwdInstance, ...]:
     result = []
     for index, value in enumerate(_list(raw, role)):
         field = f"{role}[{index}]"
@@ -421,7 +549,8 @@ def _instances(raw: Any, role: str) -> tuple[LwdInstance, ...]:
                 f"[LWD] {field}.dp_idx must be unique and contiguous from 0"
             )
         result.append(LwdInstance(instance_id, tuple(dps)))
-    result.sort(key=lambda instance: instance.id)
-    if [instance.id for instance in result] != list(range(len(result))):
+    if sorted(instance.id for instance in result) != list(range(len(result))):
         raise ValueError(f"[LWD] {role}.id must be unique and contiguous from 0")
+    if not preserve_order:
+        result.sort(key=lambda instance: instance.id)
     return tuple(result)
